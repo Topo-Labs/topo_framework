@@ -1,12 +1,12 @@
 ---
-id: Aptos-framework
-title: Aptos Framework
-custom_edit_url: https://github.com/aptos-labs/aptos-core/edit/main/Aptos-move/Aptos-framework/README.md
+id: topo-framework
+title: Topo Framework
+custom_edit_url: https://github.com/Topo-Labs/topo_framework
 ---
 
-## The Aptos Framework
+## The Topo Framework
 
-The Aptos Framework defines the standard actions that can be performed on-chain
+The Topo Framework defines the standard actions that can be performed on-chain
 both by the Aptos VM---through the various prologue/epilogue functions---and by
 users of the blockchain---through the allowed set of transactions. This
 directory contains different directories that hold the source Move
@@ -16,14 +16,14 @@ files. See the [Layout](#layout) section for a more detailed overview of the str
 
 ## Documentation
 
-Each of the main components of the Aptos Framework and contributing guidelines are documented separately. See them by version below:
+Each of the main components of the Topo Framework and contributing guidelines are documented separately. See them by version below:
 
-* *Aptos tokens* - [main](https://github.com/aptos-labs/aptos-core/blob/main/aptos-move/framework/aptos-token/doc/overview.md), [testnet](https://github.com/aptos-labs/aptos-core/blob/testnet/aptos-move/framework/aptos-token/doc/overview.md), [devnet](https://github.com/aptos-labs/aptos-core/blob/devnet/aptos-move/framework/aptos-token/doc/overview.md)
-* *Aptos framework* - [main](https://github.com/aptos-labs/aptos-core/blob/main/aptos-move/framework/topo-framework/doc/overview.md), [testnet](https://github.com/aptos-labs/aptos-core/blob/testnet/aptos-move/framework/topo-framework/doc/overview.md), [devnet](https://github.com/aptos-labs/aptos-core/blob/devnet/aptos-move/framework/topo-framework/doc/overview.md)
-* *Aptos stdlib* - [main](https://github.com/aptos-labs/aptos-core/blob/main/aptos-move/framework/aptos-stdlib/doc/overview.md), [testnet](https://github.com/aptos-labs/aptos-core/blob/testnet/aptos-move/framework/aptos-stdlib/doc/overview.md), [devnet](https://github.com/aptos-labs/aptos-core/blob/devnet/aptos-move/framework/aptos-stdlib/doc/overview.md)
-* *Move stdlib* - [main](https://github.com/aptos-labs/aptos-core/blob/main/aptos-move/framework/move-stdlib/doc/overview.md), [testnet](https://github.com/aptos-labs/aptos-core/blob/testnet/aptos-move/framework/move-stdlib/doc/overview.md), [devnet](https://github.com/aptos-labs/aptos-core/blob/devnet/aptos-move/framework/move-stdlib/doc/overview.md)
+* *Topo tokens* - [main](https://github.com/Topo-Labs/topo-chain/blob/main/aptos-move/framework/topo-token/doc/overview.md), [testnet](https://github.com/Topo-Labs/topo-chain/blob/testnet/aptos-move/framework/topo-token/doc/overview.md), [devnet](https://github.com/Topo-Labs/topo-chain/blob/devnet/aptos-move/framework/topo-token/doc/overview.md)
+* *Topo framework* - [main](https://github.com/Topo-Labs/topo-chain/blob/main/aptos-move/framework/topo-framework/doc/overview.md), [testnet](https://github.com/Topo-Labs/topo-chain/blob/testnet/aptos-move/framework/topo-framework/doc/overview.md), [devnet](https://github.com/Topo-Labs/topo-chain/blob/devnet/aptos-move/framework/topo-framework/doc/overview.md)
+* *Aptos stdlib* - [main](https://github.com/Topo-Labs/topo-chain/blob/main/aptos-move/framework/aptos-stdlib/doc/overview.md), [testnet](https://github.com/Topo-Labs/topo-chain/blob/testnet/aptos-move/framework/aptos-stdlib/doc/overview.md), [devnet](https://github.com/Topo-Labs/topo-chain/blob/devnet/aptos-move/framework/aptos-stdlib/doc/overview.md)
+* *Move stdlib* - [main](https://github.com/Topo-Labs/topo-chain/blob/main/aptos-move/framework/move-stdlib/doc/overview.md), [testnet](https://github.com/Topo-Labs/topo-chain/blob/testnet/aptos-move/framework/move-stdlib/doc/overview.md), [devnet](https://github.com/Topo-Labs/topo-chain/blob/devnet/aptos-move/framework/move-stdlib/doc/overview.md)
 
-Follow our [contributing guidelines](CONTRIBUTING.md) and basic coding standards for the Aptos Framework.
+Follow our [contributing guidelines](CONTRIBUTING.md) and basic coding standards for the Topo Framework.
 
 ## Compilation and Generation
 
@@ -36,7 +36,7 @@ The documentation process is also integrated into the framework building process
 
 ## Running Move tests
 
-To test our Move code while developing the Aptos Framework, run `cargo test` inside this directory:
+To test our Move code while developing the Topo Framework, run `cargo test` inside this directory:
 
 ```
 cargo test
@@ -89,15 +89,15 @@ cargo test --release -- --skip prover
 ```
 
 ## Layout
-The overall structure of the Aptos Framework is as follows:
+The overall structure of the Topo Framework is as follows:
 
 ```
-├── topo-framework                                 # Sources, testing and generated documentation for Aptos framework component
-├── aptos-token                                 # Sources, testing and generated documentation for Aptos token component
+├── topo-framework                                 # Sources, testing and generated documentation for Topo framework component
+├── topo-token                                 # Sources, testing and generated documentation for Topo token component
 ├── aptos-stdlib                                 # Sources, testing and generated documentation for Aptos stdlib component
 ├── move-stdlib                                 # Sources, testing and generated documentation for Move stdlib component
 ├── cached-packages                                 # Tooling to generate SDK from move sources.
-├── src                                     # Compilation and generation of information from Move source files in the Aptos Framework. Not designed to be used as a Rust library
+├── src                                     # Compilation and generation of information from Move source files in the Topo Framework. Not designed to be used as a Rust library
 ├── releases                                    # Move release bundles
 └── tests
 ```
