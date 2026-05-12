@@ -23,10 +23,10 @@ Follow our [contributing guidelines](CONTRIBUTING.md) and basic coding standards
 
 ## Compilation and Generation
 
-The documents above were created by the Move documentation generator for Aptos. It is available as part of the Aptos CLI. To see its options, run:
+The documents above were created by the Move documentation generator for Topo Framework. It is available as part of the Topo CLI. To see its options, run:
 
 ```shell
-aptos move document --help
+topo move document --help
 ```
 
 The documentation process is also integrated into the framework building process and will be automatically triggered like other derived artifacts, via `cached-packages` or explicit release building.
