@@ -1,10 +1,5 @@
 ***
 
-id: topo-framework
-title: Topo Framework
-custom\_edit\_url: <https://github.com/Topo-Labs/topo_framework>
-----------------------------------------------------------------
-
 ## The Topo Framework
 
 The Topo Framework defines the standard actions that can be performed on-chain
