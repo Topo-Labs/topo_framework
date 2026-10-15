@@ -93,11 +93,6 @@ module std::features {
 
     #[deprecated]
     /// Deprecated feature
-    /// Lifetime: transient
-    const COLLECT_AND_DISTRIBUTE_GAS_FEES: u64 = 6;
-
-    #[deprecated]
-    /// Deprecated feature
     public fun get_collect_and_distribute_gas_fees_feature(): u64 {
         abort error::invalid_argument(EINVALID_FEATURE)
     }
@@ -170,7 +165,7 @@ module std::features {
 
     /// Whether generic algebra basic operation support in `crypto_algebra.move` are enabled.
     ///
-    /// Lifetime: transient
+    /// Lifetime: permanent
     const CRYPTOGRAPHY_ALGEBRA_NATIVES: u64 = 12;
 
     public fun get_cryptography_algebra_natives_feature(): u64 {
@@ -323,12 +318,6 @@ module std::features {
         abort error::invalid_argument(EINVALID_FEATURE)
     }
 
-    const SAFER_RESOURCE_GROUPS: u64 = 31;
-
-    const SAFER_METADATA: u64 = 32;
-
-    const SINGLE_SENDER_AUTHENTICATOR: u64 = 33;
-
     /// Whether the automatic creation of accounts is enabled for sponsored transactions.
     /// Lifetime: transient
     const SPONSORED_AUTOMATIC_ACCOUNT_CREATION: u64 = 34;
@@ -361,8 +350,6 @@ module std::features {
         abort error::invalid_argument(EFEATURE_CANNOT_BE_DISABLED)
     }
 
-    const LIMIT_MAX_IDENTIFIER_LENGTH: u64 = 38;
-
     /// Whether allow changing beneficiaries for operators.
     /// Lifetime: transient
     const OPERATOR_BENEFICIARY_CHANGE: u64 = 39;
@@ -374,10 +361,6 @@ module std::features {
     public fun operator_beneficiary_change_enabled(): bool {
         is_enabled(OPERATOR_BENEFICIARY_CHANGE)
     }
-
-    const VM_BINARY_FORMAT_V7: u64 = 40;
-
-    const RESOURCE_GROUPS_SPLIT_IN_VM_CHANGE_SET: u64 = 41;
 
     /// Whether the operator commission rate change in delegation pool is enabled.
     /// Lifetime: transient
@@ -465,11 +448,9 @@ module std::features {
         is_enabled(CONCURRENT_FUNGIBLE_ASSETS)
     }
 
-    /// Whether deploying to objects is enabled.
-    const OBJECT_CODE_DEPLOYMENT: u64 = 52;
-
+    #[deprecated]
     public fun is_object_code_deployment_enabled(): bool {
-        is_enabled(OBJECT_CODE_DEPLOYMENT)
+        true
     }
 
     /// Whether checking the maximum object nesting is enabled.
@@ -561,8 +542,6 @@ module std::features {
         is_enabled(COIN_TO_FUNGIBLE_ASSET_MIGRATION)
     }
 
-    const PRIMARY_APT_FUNGIBLE_STORE_AT_USER_ADDRESS: u64 = 61;
-
     #[deprecated]
     public fun get_primary_apt_fungible_store_at_user_address_feature(): u64 {
         abort error::invalid_argument(EINVALID_FEATURE)
@@ -573,49 +552,40 @@ module std::features {
         true
     }
 
-    const AGGREGATOR_V2_IS_AT_LEAST_API: u64 = 66;
-
+    #[deprecated]
     public fun aggregator_v2_is_at_least_api_enabled(): bool {
         true
     }
 
-    /// Whether we use more efficient native implementation of computing object derived address
-    const OBJECT_NATIVE_DERIVED_ADDRESS: u64 = 62;
-
+    #[deprecated]
     public fun get_object_native_derived_address_feature(): u64 {
-        OBJECT_NATIVE_DERIVED_ADDRESS
+        abort error::invalid_argument(EINVALID_FEATURE)
     }
 
+    #[deprecated]
     public fun object_native_derived_address_enabled(): bool {
         true
     }
 
-    /// Whether the dispatchable fungible asset standard feature is enabled.
-    ///
-    /// Lifetime: transient
-    const DISPATCHABLE_FUNGIBLE_ASSET: u64 = 63;
-
+    #[deprecated]
     public fun get_dispatchable_fungible_asset_feature(): u64 {
-        DISPATCHABLE_FUNGIBLE_ASSET
+        abort error::invalid_argument(EINVALID_FEATURE)
     }
 
+    #[deprecated]
     public fun dispatchable_fungible_asset_enabled(): bool {
         true
     }
 
-    /// Lifetime: transient
-    const NEW_ACCOUNTS_DEFAULT_TO_FA_APT_STORE: u64 = 64;
-
+    #[deprecated]
     public fun get_new_accounts_default_to_fa_apt_store_feature(): u64 {
-        NEW_ACCOUNTS_DEFAULT_TO_FA_APT_STORE
+        abort error::invalid_argument(EINVALID_FEATURE)
     }
 
+    #[deprecated]
     public fun new_accounts_default_to_fa_apt_store_enabled(): bool {
-        is_enabled(NEW_ACCOUNTS_DEFAULT_TO_FA_APT_STORE)
+        true
     }
-
-    /// Lifetime: transient
-    const OPERATIONS_DEFAULT_TO_FA_APT_STORE: u64 = 65;
 
     #[deprecated]
     public fun get_operations_default_to_fa_apt_store_feature(): u64 {
@@ -701,14 +671,15 @@ module std::features {
         true
     }
 
-    const PERMISSIONED_SIGNER: u64 = 84;
 
+    #[deprecated]
     public fun get_permissioned_signer_feature(): u64 {
-        PERMISSIONED_SIGNER
+        abort error::invalid_argument(EINVALID_FEATURE)
     }
 
+    #[deprecated]
     public fun is_permissioned_signer_enabled(): bool {
-        is_enabled(PERMISSIONED_SIGNER)
+        false
     }
 
     /// Whether the account abstraction is enabled.
@@ -755,12 +726,6 @@ module std::features {
     public fun is_domain_account_abstraction_enabled(): bool {
         false
     }
-
-    /// Whether function values are enabled.
-    /// Lifetime: transient
-    ///
-    /// We do not expect use from Move, so for now only for documentation purposes here
-    const ENABLE_FUNCTION_VALUES: u64 = 89;
 
     /// Whether new accounts default to the Fungible Asset store.
     /// Lifetime: transient
@@ -838,9 +803,6 @@ module std::features {
         is_enabled(DISTRIBUTE_TRANSACTION_FEE)
     }
 
-    /// Whether the monotonically increasing counter native function is enabled.
-    const MONOTONICALLY_INCREASING_COUNTER: u64 = 98;
-
     #[deprecated]
     public fun get_monotonically_increasing_counter_feature(): u64 {
         abort error::invalid_argument(EINVALID_FEATURE)
@@ -885,11 +847,161 @@ module std::features {
         is_enabled(ENCRYPTED_TRANSACTIONS)
     }
 
+    /// Whether multisig script payloads are enabled. Allows multisig accounts to
+    /// propose and execute Move script payloads, not just entry functions.
+    const MULTISIG_SCRIPT: u64 = 110;
+
+    public fun get_multisig_script_feature(): u64 {
+        MULTISIG_SCRIPT
+    }
+
+    public fun is_multisig_script_enabled(): bool {
+        is_enabled(MULTISIG_SCRIPT)
+    }
+
+    /// Whether the transaction limits feature is enabled. Allows transactions
+    /// to request higher execution/IO gas limits backed by staking voting power.
+    const TRANSACTION_LIMITS: u64 = 111;
+
+    public fun get_transaction_limits_feature(): u64 {
+        TRANSACTION_LIMITS
+    }
+
+    public fun is_transaction_limits_enabled(): bool {
+        is_enabled(TRANSACTION_LIMITS)
+    }
+
+    /// Whether the storage slot natives are enabled.
+    const STORAGE_SLOT_NATIVES: u64 = 113;
+
+    public fun is_storage_slot_natives_enabled(): bool {
+        is_enabled(STORAGE_SLOT_NATIVES)
+    }
+
+    /// Whether the multisig timelock feature is enabled.
+    const MULTISIG_TIMELOCK: u64 = 115;
+
+    public fun get_multisig_timelock_feature(): u64 {
+        MULTISIG_TIMELOCK
+    }
+
+    public fun is_multisig_timelock_enabled(): bool {
+        is_enabled(MULTISIG_TIMELOCK)
+    }
+
+    /// When enabled, per-block hot-state promotions are persisted through the block
+    /// epilogue: the promotion set is embedded into the block epilogue transaction
+    /// payload (`BlockEpiloguePayload::V2`), and every transaction output in the block
+    /// uses the V1 write-set format, which encodes hot-state changes in its serialized
+    /// writes.
+    /// Lifetime: permanent
+    const HOTNESS_IN_EPILOGUE: u64 = 116;
+
+    /// When enabled, execution assembles `TransactionInfoV1` instead of `TransactionInfoV0`.
+    /// Lifetime: permanent
+    const TRANSACTION_INFO_V1: u64 = 117;
+
+    /// Umbrella auth flag for the native-trading subsystem; the per-store
+    /// flags below gate the actual writes. Both must be on to write.
+    const TRADING_NATIVE: u64 = 118;
+
+    public fun get_trading_native_feature(): u64 {
+        TRADING_NATIVE
+    }
+
+    public fun is_trading_native_enabled(): bool {
+        is_enabled(TRADING_NATIVE)
+    }
+
+    /// Gates native-position writes.
+    const NATIVE_POSITION: u64 = 119;
+
+    public fun get_native_position_feature(): u64 {
+        NATIVE_POSITION
+    }
+
+    public fun is_native_position_enabled(): bool {
+        is_enabled(NATIVE_POSITION)
+    }
+
+    /// Gates native-orderbook writes.
+    const NATIVE_ORDERBOOK: u64 = 120;
+
+    public fun get_native_orderbook_feature(): u64 {
+        NATIVE_ORDERBOOK
+    }
+
+    public fun is_native_orderbook_enabled(): bool {
+        is_enabled(NATIVE_ORDERBOOK)
+    }
+
+    /// Gates native-collateral writes.
+    const NATIVE_COLLATERAL: u64 = 121;
+
+    public fun get_native_collateral_feature(): u64 {
+        NATIVE_COLLATERAL
+    }
+
+    public fun is_native_collateral_enabled(): bool {
+        is_enabled(NATIVE_COLLATERAL)
+    }
+
+    /// When enabled, execution computes the trading-native state roots and commits them to
+    /// `TransactionInfoV1`, so they are consensus-verified. Requires `TRANSACTION_INFO_V1`.
+    /// Covers the native-position tree today and is intended to cover the other trading-native
+    /// trees as they are added. Enabling it first commits the (empty-tree) roots to transaction
+    /// info; the actual Move-side writes to those trees are gated by separate flags.
+    /// Lifetime: permanent
+    const COMPUTE_TRADING_NATIVE_STATE_ROOTS: u64 = 122;
+
+    /// When enabled together with `TRANSACTION_INFO_V1`, execution populates
+    /// `TransactionInfoV1`'s hot state root hash, so it is committed to the ledger
+    /// accumulator. Requires `TRANSACTION_INFO_V1`.
+    /// Lifetime: permanent
+    const HOT_STATE_ROOT_IN_TXN_INFO: u64 = 123;
+
+    /// When enabled, the gas refund in the epilogue mints APT directly as a fungible asset
+    /// via the paired `MintRef` (stored in `transaction_fee::AptosFAMintCapabilities`), instead
+    /// of minting a coin and converting it. This avoids touching the legacy coin supply
+    /// aggregator (v1), reducing Block-STM contention on refund transactions.
+    /// Lifetime: transient
+    const GAS_REFUND_FA_MINT: u64 = 124;
+
+    public fun gas_refund_fa_mint_enabled(): bool {
+        is_enabled(GAS_REFUND_FA_MINT)
+    }
+
+    /// Whether `FunctionInfo`-based dispatch (dispatchable fungible assets and account
+    /// abstraction) runs via function values from `std::reflect` instead of the legacy
+    /// native dispatch machinery. Requires `FUNCTION_REFLECTION`.
+    /// Lifetime: transient
+    const FUNCTION_VALUE_DISPATCH: u64 = 125;
+
+    public fun get_function_value_dispatch_feature(): u64 {
+        FUNCTION_VALUE_DISPATCH
+    }
+
+    /// Requires function reflection, without which function-value dispatch stays disabled.
+    public fun is_function_value_dispatch_enabled(): bool {
+        is_enabled(FUNCTION_VALUE_DISPATCH) && is_enabled(FUNCTION_REFLECTION)
+    }
+
+    /// Whether lazy module initialization via `topo_framework::init::internal_maybe_initialize`
+    /// is enabled. While disabled, that entry point aborts.
+    /// Lifetime: transient
+    const LAZY_MODULE_INITIALIZATION: u64 = 127;
+
+    public fun is_lazy_module_initialization_enabled(): bool {
+        is_enabled(LAZY_MODULE_INITIALIZATION)
+    }
+
     // ============================================================================================
     // Feature Flag Implementation
 
     /// The provided signer has not a framework address.
     const EFRAMEWORK_SIGNER_NEEDED: u64 = 1;
+    const ERECONFIGURATION_IN_PROGRESS: u64 = 4;
+    const ERECONFIGURATION_NOT_IN_PROGRESS: u64 = 5;
 
     /// The enabled features, represented by a bitset stored on chain.
     struct Features has key {
@@ -900,6 +1012,31 @@ module std::features {
     /// On epoch change, the updates take effect and this buffer is cleared.
     struct PendingFeatures has key {
         features: vector<u8>
+    }
+
+    /// 与框架的冻结换届计划成对存在，避免标准库反向依赖框架模块。
+    struct PendingFeatureFreeze has key {}
+
+    /// 安装功能开关所需的唯一令牌，不可复制或丢弃，由换届计划持有并在提交结束时消耗。
+    struct FeatureFreezeToken has store {}
+
+    /// 查询功能配置是否已随换届计划冻结，不修改任何配置。
+    public fun is_reconfiguration_frozen(): bool {
+        exists<PendingFeatureFreeze>(@std)
+    }
+
+    /// 冻结待生效开关并签发唯一令牌；只有框架 signer 能启动，禁止重复冻结。
+    public fun begin_reconfiguration_freeze(framework: &signer): FeatureFreezeToken {
+        ensure_framework_signer(framework);
+        assert!(!is_reconfiguration_frozen(), error::invalid_state(ERECONFIGURATION_IN_PROGRESS));
+        move_to(framework, PendingFeatureFreeze {});
+        FeatureFreezeToken {}
+    }
+
+    /// 消耗计划持有的令牌并删除冻结标记；仅持有 signer 无法提前解除冻结。
+    public fun end_reconfiguration_freeze(token: FeatureFreezeToken) acquires PendingFeatureFreeze {
+        let FeatureFreezeToken {} = token;
+        let PendingFeatureFreeze {} = move_from<PendingFeatureFreeze>(@std);
     }
 
     /// Deprecated to prevent validator set changes during DKG.
@@ -937,6 +1074,7 @@ module std::features {
     public fun change_feature_flags_for_next_epoch(
         framework: &signer, enable: vector<u64>, disable: vector<u64>
     ) acquires PendingFeatures, Features {
+        assert!(!is_reconfiguration_frozen(), error::invalid_state(ERECONFIGURATION_IN_PROGRESS));
         assert!(
             signer::address_of(framework) == @std,
             error::permission_denied(EFRAMEWORK_SIGNER_NEEDED)
@@ -961,11 +1099,22 @@ module std::features {
         move_to(framework, PendingFeatures { features: new_feature_vec });
     }
 
-    /// Apply all the pending feature flag changes. Should only be used at the end of a reconfiguration with DKG.
-    ///
-    /// While the scope is public, it can only be usd in system transactions like `block_prologue` and governance proposals,
-    /// who have permission to set the flag that's checked in `extract()`.
+    /// 允许框架 signer 在未冻结时安装待生效开关；冻结期间须改用持有计划令牌的专用入口。
     public fun on_new_epoch(framework: &signer) acquires Features, PendingFeatures {
+        assert!(!is_reconfiguration_frozen(), error::invalid_state(ERECONFIGURATION_IN_PROGRESS));
+        apply_pending_features(framework);
+    }
+
+    /// 已校验的换届计划凭令牌安装开关，安装期间仍保持全局冻结。
+    public fun on_new_epoch_with_freeze_token(
+        framework: &signer, _token: &FeatureFreezeToken
+    ) acquires Features, PendingFeatures {
+        assert!(is_reconfiguration_frozen(), error::invalid_state(ERECONFIGURATION_NOT_IN_PROGRESS));
+        apply_pending_features(framework);
+    }
+
+    /// 两种安装入口共用写入逻辑；调用者先完成各自的冻结权限检查。
+    fun apply_pending_features(framework: &signer) acquires Features, PendingFeatures {
         ensure_framework_signer(framework);
         if (exists<PendingFeatures>(@std)) {
             let PendingFeatures { features } = move_from<PendingFeatures>(@std);
@@ -1047,6 +1196,37 @@ module std::features {
         assert!(!contains(&features, 5), 1);
         assert!(!contains(&features, 17), 2);
         assert!(contains(&features, 23), 3);
+    }
+
+    #[test(framework = @std)]
+    fun poc_feature_freeze_commit(framework: signer) {
+        change_feature_flags_internal(&framework, vector[], vector[1]);
+        change_feature_flags_for_next_epoch(&framework, vector[1], vector[]);
+        let token = begin_reconfiguration_freeze(&framework);
+        assert!(!is_enabled(1), 0);
+        on_new_epoch_with_freeze_token(&framework, &token);
+        assert!(is_enabled(1), 0);
+        end_reconfiguration_freeze(token);
+        change_feature_flags_for_next_epoch(&framework, vector[], vector[1]);
+        on_new_epoch(&framework);
+        assert!(!is_enabled(1), 0);
+    }
+
+    #[test(framework = @std)]
+    #[expected_failure(abort_code = 0x30004, location = Self)]
+    fun poc_feature_freeze_rejects_set(framework: signer) {
+        let token = begin_reconfiguration_freeze(&framework);
+        change_feature_flags_for_next_epoch(&framework, vector[1], vector[]);
+        end_reconfiguration_freeze(token);
+    }
+
+    #[test(framework = @std)]
+    #[expected_failure(abort_code = 0x30004, location = Self)]
+    fun poc_feature_freeze_rejects_public_install(framework: signer) {
+        change_feature_flags_for_next_epoch(&framework, vector[1], vector[]);
+        let token = begin_reconfiguration_freeze(&framework);
+        on_new_epoch(&framework);
+        end_reconfiguration_freeze(token);
     }
 
     #[test(fx = @std)]

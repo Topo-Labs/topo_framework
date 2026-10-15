@@ -42,7 +42,7 @@ spec topo_framework::block {
     ///
     spec module {
         use topo_framework::chain_status;
-        pragma verify = false;
+        pragma verify = true;
         // After genesis, `BlockResource` exist.
         invariant [suspendable] chain_status::is_operating() ==> exists<BlockResource>(@topo_framework);
         // After genesis, `CommitHistory` exist.
@@ -59,26 +59,56 @@ spec topo_framework::block {
     }
 
     spec block_prologue_common {
-        pragma verify_duration_estimate = 1000; // TODO: set because of timeout (property proved)
+        pragma opaque;
         include BlockRequirement;
-        aborts_if false;
+        let performance = global<stake::ValidatorPerformance>(@topo_framework).validators;
+        let proposer_index = global<stake::ValidatorConfig>(proposer).validator_index;
+        // 延期期间仍累加旧 Epoch 的 u64 计数器；仅当本次递增会溢出时中止，
+        // 不能再用“一个 Epoch 最多一天”的假设证明不会溢出。
+        aborts_if proposer != @vm_reserved && proposer_index < len(performance)
+            && performance[proposer_index].successful_proposals == MAX_U64
+            with std::error::OUT_OF_RANGE;
+        aborts_if exists i in 0..len(performance): performance[i].failed_proposals
+            + stake::spec_failure_count(failed_proposer_indices, i, len(failed_proposer_indices)) > MAX_U64
+            with std::error::OUT_OF_RANGE;
+
+        modifies global<BlockResource>(@topo_framework);
+        modifies global<CommitHistory>(@topo_framework);
+        modifies global<timestamp::CurrentTimeMicroseconds>(@topo_framework);
+        modifies global<stake::ValidatorPerformance>(@topo_framework);
+        modifies global<state_storage::StateStorageUsage>(@topo_framework);
+
+        ensures result == old(global<BlockResource>(@topo_framework).epoch_interval);
+        ensures global<BlockResource>(@topo_framework).height ==
+            old(global<BlockResource>(@topo_framework).new_block_events.counter);
+        ensures global<BlockResource>(@topo_framework).epoch_interval ==
+            old(global<BlockResource>(@topo_framework).epoch_interval);
+        ensures timestamp::spec_now_microseconds() == timestamp;
     }
 
     spec block_prologue {
-
-        pragma verify_duration_estimate = 1000; // TODO: set because of timeout (property proved)
-        requires timestamp >= reconfiguration::last_reconfiguration_time();
-        include BlockRequirement;
-        aborts_if false;
+        // Body inlines reconfigure(); defer until reconfigure is opaque.
+        pragma verify = false;
     }
 
     spec block_prologue_ext {
-        pragma verify_duration_estimate = 1000; // TODO: set because of timeout (property proved)
-        requires timestamp >= reconfiguration::last_reconfiguration_time();
-        include BlockRequirement;
-        include stake::ResourceRequirement;
-        include stake::GetReconfigStartTimeRequirement;
-        aborts_if false;
+        // Body inlines reconfigure(); defer until reconfigure is opaque.
+        pragma verify = false;
+    }
+
+    spec block_prologue_ext_v2 {
+        // Body inlines reconfigure(); defer until reconfigure is opaque.
+        pragma verify = false;
+    }
+
+    spec block_prologue_ext_v3 {
+        // Body inlines reconfigure(); defer until reconfigure is opaque.
+        pragma verify = false;
+    }
+
+    spec block_epilogue {
+        // Defer until stake::record_fee has an opaque spec.
+        pragma verify = false;
     }
 
     spec emit_genesis_block_event {
@@ -96,6 +126,9 @@ spec topo_framework::block {
         use topo_framework::chain_status;
         let proposer = new_block_event.proposer;
         let timestamp = new_block_event.time_microseconds;
+
+        modifies global<CommitHistory>(@topo_framework);
+        modifies global<timestamp::CurrentTimeMicroseconds>(@topo_framework);
 
         requires chain_status::is_operating();
         requires system_addresses::is_vm(vm);
@@ -124,6 +157,16 @@ spec topo_framework::block {
         aborts_if account.guid_creation_num + 2 >= account::MAX_GUID_CREATION_NUM;
     }
 
+    spec initialize_commit_history(fx: &signer, max_capacity: u32) {
+        use std::signer;
+        let addr = signer::address_of(fx);
+        aborts_if max_capacity == 0;
+        aborts_if exists<CommitHistory>(addr);
+        ensures exists<CommitHistory>(addr);
+        ensures global<CommitHistory>(addr).max_capacity == max_capacity;
+        ensures global<CommitHistory>(addr).next_idx == 0;
+    }
+
     spec schema BlockRequirement {
         use topo_framework::chain_status;
         use topo_framework::coin::CoinInfo;
@@ -143,6 +186,9 @@ spec topo_framework::block {
         requires system_addresses::is_vm(vm);
         /// [high-level-req-4]
         requires proposer == @vm_reserved || stake::spec_is_current_epoch_validator(proposer);
+        // proposer must have a stake pool and validator config.
+        requires proposer == @vm_reserved ||
+            (stake::spec_has_stake_pool(proposer) && stake::spec_has_validator_config(proposer));
         requires (proposer == @vm_reserved) ==> (timestamp::spec_now_microseconds() == timestamp);
         requires (proposer != @vm_reserved) ==> (timestamp::spec_now_microseconds() < timestamp);
         requires exists<CoinInfo<TopoCoin>>(@topo_framework);

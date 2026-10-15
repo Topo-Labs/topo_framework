@@ -37,9 +37,9 @@ module topo_framework::topo_coin {
 
     /// Can only called during genesis to initialize the Topo coin.
     public(friend) fun initialize(topo_framework: &signer): (BurnCapability<TopoCoin>, MintCapability<TopoCoin>) {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
 
-        let (burn_cap, freeze_cap, mint_cap) = coin::initialize_with_parallelizable_supply<TopoCoin>(
+        let (burn_cap, freeze_cap, mint_cap) = coin::initialize<TopoCoin>(
             topo_framework,
             string::utf8(b"Topo Coin"),
             string::utf8(b"TOPO"),
@@ -55,6 +55,12 @@ module topo_framework::topo_coin {
         (burn_cap, mint_cap)
     }
 
+    /// Used to upgrade supply to use an integer, deprecating Aggregator V1.
+    entry fun upgrade_supply(topo_framework: &signer) {
+        system_addresses::assert_topo_framework(topo_framework);
+        coin::upgrade_supply<TopoCoin>(topo_framework);
+    }
+
     public fun has_mint_capability(account: &signer): bool {
         exists<MintCapStore>(signer::address_of(account))
     }
@@ -62,20 +68,20 @@ module topo_framework::topo_coin {
     /// Only called during genesis to destroy the aptos framework account's mint capability once all initial validators
     /// and accounts have been initialized during genesis.
     public(friend) fun destroy_mint_cap(topo_framework: &signer) acquires MintCapStore {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
         let MintCapStore { mint_cap } = move_from<MintCapStore>(@topo_framework);
         coin::destroy_mint_cap(mint_cap);
     }
 
     /// Can only be called during genesis for tests to grant mint capability to aptos framework and core resources
     /// accounts.
-    /// Expects account and TOPO store to be registered before calling.
+    /// Expects the account and TOPO store to be registered before calling.
     public(friend) fun configure_accounts_for_test(
         topo_framework: &signer,
         core_resources: &signer,
         mint_cap: MintCapability<TopoCoin>,
     ) {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
 
         // Mint the core resource account TopoCoin for gas so it can execute system transactions.
         let coins = coin::mint<TopoCoin>(
@@ -157,8 +163,8 @@ module topo_framework::topo_coin {
     use topo_framework::fungible_asset::FungibleAsset;
 
     #[test_only]
-    public fun mint_topo_fa_for_test(amount: u64): FungibleAsset acquires MintCapStore {
-        ensure_initialized_with_topo_fa_metadata_for_test();
+    public fun mint_apt_fa_for_test(amount: u64): FungibleAsset acquires MintCapStore {
+        ensure_initialized_with_apt_fa_metadata_for_test();
         coin::coin_to_fungible_asset(
             coin::mint(
                 amount,
@@ -168,7 +174,7 @@ module topo_framework::topo_coin {
     }
 
     #[test_only]
-    public fun ensure_initialized_with_topo_fa_metadata_for_test() {
+    public fun ensure_initialized_with_apt_fa_metadata_for_test() {
         let topo_framework = account::create_signer_for_test(@topo_framework);
         if (!exists<MintCapStore>(@topo_framework)) {
             if (!aggregator_factory::aggregator_factory_exists_for_testing()) {

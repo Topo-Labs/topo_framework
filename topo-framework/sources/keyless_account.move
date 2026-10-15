@@ -3,12 +3,19 @@
 module topo_framework::keyless_account {
     use std::bn254_algebra;
     use std::config_buffer;
+    use std::error;
     use std::option::Option;
     use std::signer;
     use std::string::String;
     use topo_std::crypto_algebra;
     use topo_std::ed25519;
+    use topo_std::multi_key;
+    use topo_std::single_key;
+    use topo_framework::account;
     use topo_framework::chain_status;
+    use topo_framework::confidential_asset;
+    use topo_framework::fungible_asset;
+    use topo_framework::object::Object;
     use topo_framework::system_addresses;
 
     // The `topo_framework::reconfiguration_with_dkg` module needs to be able to call `on_new_epoch`.
@@ -22,6 +29,17 @@ module topo_framework::keyless_account {
 
     /// A serialized BN254 G2 point is invalid.
     const E_INVALID_BN254_G2_SERIALIZATION: u64 = 3;
+
+    /// A DK has already been backed up for this keyless account. Please call `confidential_asset::register_raw` instead
+    /// with the corresponding EK.
+    const E_KEYLESS_ACCOUNT_DK_ALREADY_BACKED_UP: u64 = 4;
+
+    /// The account's authentication key does not match the multi-key derived from the provided keyless public key
+    /// and Ed25519 backup public key. Indicates this is not a keyless+Ed25519-backup account.
+    const E_NOT_KEYLESS_BACKUP_ACCOUNT: u64 = 5;
+
+    /// The supplied `keyless_public_key` is not a `Keyless` or `FederatedKeyless` single-key variant.
+    const E_NOT_KEYLESS_PUBLIC_KEY: u64 = 6;
 
     #[resource_group(scope = global)]
     struct Group {}
@@ -134,7 +152,7 @@ module topo_framework::keyless_account {
 
     #[test_only]
     public fun initialize_for_test(fx: &signer, vk: Groth16VerificationKey, constants: Configuration) {
-        system_addresses::assert_aptos_framework(fx);
+        system_addresses::assert_topo_framework(fx);
 
         move_to(fx, vk);
         move_to(fx, constants);
@@ -194,7 +212,7 @@ module topo_framework::keyless_account {
     ///
     /// WARNING: See `set_groth16_verification_key_for_next_epoch` for caveats.
     public fun update_groth16_verification_key(fx: &signer, vk: Groth16VerificationKey) {
-        system_addresses::assert_aptos_framework(fx);
+        system_addresses::assert_topo_framework(fx);
         chain_status::assert_genesis();
         // There should not be a previous resource set here.
         move_to(fx, vk);
@@ -205,15 +223,81 @@ module topo_framework::keyless_account {
     ///
     /// WARNING: See `set_configuration_for_next_epoch` for caveats.
     public fun update_configuration(fx: &signer, config: Configuration) {
-        system_addresses::assert_aptos_framework(fx);
+        system_addresses::assert_topo_framework(fx);
         chain_status::assert_genesis();
         // There should not be a previous resource set here.
         move_to(fx, config);
     }
 
+    /// Atomically registers an EK for the specified `asset_type` and stores a DK ciphertext in the `account::EncryptedDK`
+    /// resource. This can only be called once: i.e., when registering an EK for the 1st time. Subsequent EK registrations
+    /// for other asset types should be done via `confidential_asset::register_raw`.
+    ///
+    /// `keyless_public_key` and `backup_public_key` must be the (1-of-2) keyless + Ed25519-backup multi-key currently
+    /// authorizing this account; otherwise the call aborts. This check pins the function to keyless+backup accounts and
+    /// prevents accidentally backing up a DK for an account whose auth key has a different (incompatible) shape.
+    ///
+    /// SECURITY: This function only verifies the ZKPoK for `ek` and *not* that `dk_ciphertext` is a well-formed
+    /// encryption of the DK matching `ek`, nor that the encryption key is one the account's owner actually controls.
+    /// Wallets using this function must be careful to only call this using a `dk_ciphertext` produced from its own
+    /// keyless Ed25519 backup key flow under the user-controlled `backup_public_key`.
+    entry fun register_ek_and_encrypt_dk(
+        owner: &signer,
+        keyless_public_key: vector<u8>,
+        backup_public_key: vector<u8>,
+        asset_type: Object<fungible_asset::Metadata>,
+        ek: vector<u8>,
+        sigma_proto_comm: vector<vector<u8>>,
+        sigma_proto_resp: vector<vector<u8>>,
+        dk_ciphertext: vector<u8>)
+    {
+        let owner_addr = signer::address_of(owner);
+
+        // Step 1: Verify the account is currently authorized by a 1-of-2 multi-key over the supplied keyless PK and
+        // Ed25519 backup PK. This rejects calls on accounts that haven't gone through `upsert_ed25519_backup_key_*`.
+        // The keyless slot must actually be a `Keyless` or `FederatedKeyless` `AnyPublicKey`; without this check, a
+        // 1-of-2 multi-key built from two Ed25519 keys (or any other shape) with a matching auth key would slip past.
+        let keyless_single_key = single_key::new_public_key_from_bytes(keyless_public_key);
+        assert!(
+            single_key::is_keyless_or_federated_keyless_public_key(&keyless_single_key),
+            error::invalid_argument(E_NOT_KEYLESS_PUBLIC_KEY)
+        );
+
+        let expected_auth_key = multi_key::new_multi_key_from_single_keys(
+            vector[
+                keyless_single_key,
+                single_key::from_ed25519_public_key(
+                    ed25519::new_validated_public_key_from_bytes(backup_public_key).extract()
+                )
+            ],
+            1
+        ).to_authentication_key();
+
+        assert!(
+            account::get_authentication_key(owner_addr) == expected_auth_key,
+            error::invalid_argument(E_NOT_KEYLESS_BACKUP_ACCOUNT)
+        );
+
+        // Step 2: We must only use this when first registering an EK. Subsequent EK registrations for other asset types
+        // must be done via `confidential_asset::register_raw` and are assumed to use the same DK backed up in `account::EncryptedDK`.
+        assert!(
+            account::encrypted_dk_exists(owner_addr) == false,
+            error::already_exists(E_KEYLESS_ACCOUNT_DK_ALREADY_BACKED_UP));
+
+        confidential_asset::register_raw(
+            owner,
+            asset_type,
+            ek,
+            sigma_proto_comm,
+            sigma_proto_resp
+        );
+
+        account::upsert_encrypted_dk(owner, dk_ciphertext);
+    }
+
     #[deprecated]
     public fun update_training_wheels(fx: &signer, pk: Option<vector<u8>>) acquires Configuration {
-        system_addresses::assert_aptos_framework(fx);
+        system_addresses::assert_topo_framework(fx);
         chain_status::assert_genesis();
 
         if (pk.is_some()) {
@@ -226,7 +310,7 @@ module topo_framework::keyless_account {
 
     #[deprecated]
     public fun update_max_exp_horizon(fx: &signer, max_exp_horizon_secs: u64) acquires Configuration {
-        system_addresses::assert_aptos_framework(fx);
+        system_addresses::assert_topo_framework(fx);
         chain_status::assert_genesis();
 
         let config = borrow_global_mut<Configuration>(signer::address_of(fx));
@@ -235,7 +319,7 @@ module topo_framework::keyless_account {
 
     #[deprecated]
     public fun remove_all_override_auds(fx: &signer) acquires Configuration {
-        system_addresses::assert_aptos_framework(fx);
+        system_addresses::assert_topo_framework(fx);
         chain_status::assert_genesis();
 
         let config = borrow_global_mut<Configuration>(signer::address_of(fx));
@@ -244,7 +328,7 @@ module topo_framework::keyless_account {
 
     #[deprecated]
     public fun add_override_aud(fx: &signer, aud: String) acquires Configuration {
-        system_addresses::assert_aptos_framework(fx);
+        system_addresses::assert_topo_framework(fx);
         chain_status::assert_genesis();
 
         let config = borrow_global_mut<Configuration>(signer::address_of(fx));
@@ -259,7 +343,7 @@ module topo_framework::keyless_account {
     ///
     /// WARNING: If a malicious key is set, this would lead to stolen funds.
     public fun set_groth16_verification_key_for_next_epoch(fx: &signer, vk: Groth16VerificationKey) {
-        system_addresses::assert_aptos_framework(fx);
+        system_addresses::assert_topo_framework(fx);
         config_buffer::upsert<Groth16VerificationKey>(vk);
     }
 
@@ -270,7 +354,7 @@ module topo_framework::keyless_account {
     /// WARNING: A malicious `Configuration` could lead to DoS attacks, create liveness issues, or enable a malicious
     /// recovery service provider to phish users' accounts.
     public fun set_configuration_for_next_epoch(fx: &signer, config: Configuration) {
-        system_addresses::assert_aptos_framework(fx);
+        system_addresses::assert_topo_framework(fx);
         config_buffer::upsert<Configuration>(config);
     }
 
@@ -279,7 +363,7 @@ module topo_framework::keyless_account {
     ///
     /// WARNING: If a malicious key is set, this *could* lead to stolen funds.
     public fun update_training_wheels_for_next_epoch(fx: &signer, pk: Option<vector<u8>>) acquires Configuration {
-        system_addresses::assert_aptos_framework(fx);
+        system_addresses::assert_topo_framework(fx);
 
         // If a PK is being set, validate it first.
         if (pk.is_some()) {
@@ -302,7 +386,7 @@ module topo_framework::keyless_account {
     /// Convenience method to queues up a change to the max expiration horizon. The change will only be effective after
     /// reconfiguration. Only callable via governance proposal.
     public fun update_max_exp_horizon_for_next_epoch(fx: &signer, max_exp_horizon_secs: u64) acquires Configuration {
-        system_addresses::assert_aptos_framework(fx);
+        system_addresses::assert_topo_framework(fx);
 
         let config = if (config_buffer::does_exist<Configuration>()) {
             config_buffer::extract_v2<Configuration>()
@@ -321,7 +405,7 @@ module topo_framework::keyless_account {
     /// WARNING: When no override `aud` is set, recovery of keyless accounts associated with applications that disappeared
     /// is no longer possible.
     public fun remove_all_override_auds_for_next_epoch(fx: &signer) acquires Configuration {
-        system_addresses::assert_aptos_framework(fx);
+        system_addresses::assert_topo_framework(fx);
 
         let config = if (config_buffer::does_exist<Configuration>()) {
             config_buffer::extract_v2<Configuration>()
@@ -339,7 +423,7 @@ module topo_framework::keyless_account {
     ///
     /// WARNING: If a malicious override `aud` is set, this *could* lead to stolen funds.
     public fun add_override_aud_for_next_epoch(fx: &signer, aud: String) acquires Configuration {
-        system_addresses::assert_aptos_framework(fx);
+        system_addresses::assert_topo_framework(fx);
 
         let config = if (config_buffer::does_exist<Configuration>()) {
             config_buffer::extract_v2<Configuration>()
@@ -354,7 +438,7 @@ module topo_framework::keyless_account {
 
     /// Only used in reconfigurations to apply the queued up configuration changes, if there are any.
     public(friend) fun on_new_epoch(fx: &signer) acquires Groth16VerificationKey, Configuration {
-        system_addresses::assert_aptos_framework(fx);
+        system_addresses::assert_topo_framework(fx);
 
         if (config_buffer::does_exist<Groth16VerificationKey>()) {
             let vk = config_buffer::extract_v2();

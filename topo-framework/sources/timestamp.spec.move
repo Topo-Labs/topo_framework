@@ -11,7 +11,7 @@ spec topo_framework::timestamp {
     /// Requirement: The global wall clock resource should only be owned by the Aptos framework.
     /// Criticality: High
     /// Implementation: The function set_time_has_started ensures that only the topo_framework account can possess the
-    /// CurrentTimeMicroseconds resource using the assert_aptos_framework function.
+    /// CurrentTimeMicroseconds resource using the assert_topo_framework function.
     /// Enforcement: Formally verified via [high-level-req-2](module).
     ///
     /// No.: 3
@@ -36,11 +36,23 @@ spec topo_framework::timestamp {
         invariant [suspendable] chain_status::is_operating() ==> exists<CurrentTimeMicroseconds>(@topo_framework);
     }
 
+    spec set_time_has_started(topo_framework: &signer) {
+        pragma opaque;
+        modifies global<CurrentTimeMicroseconds>(@topo_framework);
+        aborts_if std::signer::address_of(topo_framework) != @topo_framework;
+        aborts_if exists<CurrentTimeMicroseconds>(@topo_framework);
+        ensures exists<CurrentTimeMicroseconds>(@topo_framework);
+        ensures spec_now_microseconds() == 0;
+    }
+
     spec update_global_time {
         use topo_framework::chain_status;
+        pragma opaque;
         requires chain_status::is_operating();
+        modifies global<CurrentTimeMicroseconds>(@topo_framework);
         include UpdateGlobalTimeAbortsIf;
         ensures (proposer != @vm_reserved) ==> (spec_now_microseconds() == timestamp);
+        ensures (proposer == @vm_reserved) ==> (spec_now_microseconds() == old(spec_now_microseconds()));
     }
 
     spec schema UpdateGlobalTimeAbortsIf {
@@ -52,6 +64,18 @@ spec topo_framework::timestamp {
         /// [high-level-req-4]
         aborts_if (proposer == @vm_reserved) && (spec_now_microseconds() != timestamp);
         aborts_if (proposer != @vm_reserved) && (spec_now_microseconds() >= timestamp);
+    }
+
+    spec now_microseconds {
+        pragma opaque;
+        aborts_if !exists<CurrentTimeMicroseconds>(@topo_framework);
+        ensures result == spec_now_microseconds();
+    }
+
+    spec now_seconds {
+        pragma opaque;
+        aborts_if !exists<CurrentTimeMicroseconds>(@topo_framework);
+        ensures result == spec_now_seconds();
     }
 
     spec fun spec_now_microseconds(): u64 {

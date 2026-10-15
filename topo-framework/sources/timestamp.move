@@ -23,7 +23,7 @@ module topo_framework::timestamp {
 
     /// Marks that time has started. This can only be called from genesis and with the aptos framework account.
     public(friend) fun set_time_has_started(topo_framework: &signer) {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
         let timer = CurrentTimeMicroseconds { microseconds: 0 };
         move_to(topo_framework, timer);
     }

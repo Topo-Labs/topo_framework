@@ -49,13 +49,13 @@ spec topo_framework::state_storage {
         invariant [suspendable] chain_status::is_operating() ==> exists<GasParameter>(@topo_framework);
     }
 
-    /// ensure caller is admin.
-    /// aborts if StateStorageUsage already exists.
     spec initialize(topo_framework: &signer) {
         use std::signer;
+        pragma opaque;
+        modifies global<StateStorageUsage>(@topo_framework);
         let addr = signer::address_of(topo_framework);
         /// [high-level-req-4]
-        aborts_if !system_addresses::is_aptos_framework_address(addr);
+        aborts_if !system_addresses::is_topo_framework_address(addr);
         /// [high-level-req-3]
         aborts_if exists<StateStorageUsage>(@topo_framework);
         ensures exists<StateStorageUsage>(@topo_framework);
@@ -66,15 +66,24 @@ spec topo_framework::state_storage {
 
     spec on_new_block(epoch: u64) {
         use topo_framework::chain_status;
+        pragma opaque;
         /// [high-level-req-5.2]
         requires chain_status::is_operating();
+        modifies global<StateStorageUsage>(@topo_framework);
         aborts_if false;
-        ensures epoch == global<StateStorageUsage>(@topo_framework).epoch;
+        let post state_usage = global<StateStorageUsage>(@topo_framework);
+        ensures epoch == state_usage.epoch;
+        ensures epoch == old(global<StateStorageUsage>(@topo_framework).epoch) ==>
+            state_usage == old(global<StateStorageUsage>(@topo_framework));
     }
 
     spec current_items_and_bytes(): (u64, u64) {
+        pragma opaque;
         /// [high-level-req-5.1]
         aborts_if !exists<StateStorageUsage>(@topo_framework);
+        let usage = global<StateStorageUsage>(@topo_framework).usage;
+        ensures result_1 == usage.items;
+        ensures result_2 == usage.bytes;
     }
 
     spec get_state_storage_usage_only_at_epoch_beginning(): Usage {
@@ -83,6 +92,7 @@ spec topo_framework::state_storage {
     }
 
     spec on_reconfig {
+        pragma opaque;
         aborts_if true;
     }
 }

@@ -13,7 +13,7 @@ module topo_framework::chain_id {
     /// Only called during genesis.
     /// Publish the chain ID `id` of this instance under the SystemAddresses address
     public(friend) fun initialize(topo_framework: &signer, id: u8) {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
         move_to(topo_framework, ChainId { id })
     }
 

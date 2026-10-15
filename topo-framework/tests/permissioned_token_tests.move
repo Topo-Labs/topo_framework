@@ -1,15 +1,17 @@
 #[test_only]
-module 0xcafe::permissioned_token_tests {
+module topo_framework::permissioned_token_tests {
     use topo_framework::fungible_asset::{Self, Metadata, TestToken};
     use topo_framework::dispatchable_fungible_asset;
-    use 0xcafe::permissioned_token;
+    use topo_framework::permissioned_token;
+    use std::features;
     use std::option;
 
-    #[test(creator = @0xcafe, aaron = @0xface)]
+    #[test(creator = @topo_framework, aaron = @0xface)]
     fun test_permissioned_e2e_basic_flow(
         creator: &signer,
         aaron: &signer,
     ) {
+        features::change_feature_flags_for_testing(creator, vector[features::get_function_value_dispatch_feature()], vector[]);
         let (creator_ref, token_object) = fungible_asset::create_test_token(creator);
         let (mint, _, _, _) = fungible_asset::init_test_metadata(&creator_ref);
         let metadata = token_object.convert<TestToken, Metadata>();
@@ -39,12 +41,13 @@ module 0xcafe::permissioned_token_tests {
         dispatchable_fungible_asset::deposit(aaron_store, fa);
     }
 
-    #[test(creator = @0xcafe, aaron = @0xface)]
-    #[expected_failure(abort_code = 1, location = 0xcafe::permissioned_token)]
+    #[test(creator = @topo_framework, aaron = @0xface)]
+    #[expected_failure(abort_code = 1, location = topo_framework::permissioned_token)]
     fun test_permissioned_disallowed_sender(
         creator: &signer,
         aaron: &signer,
     ) {
+        features::change_feature_flags_for_testing(creator, vector[features::get_function_value_dispatch_feature()], vector[]);
         let (creator_ref, token_object) = fungible_asset::create_test_token(creator);
         let (mint, _, _, _) = fungible_asset::init_test_metadata(&creator_ref);
         let metadata = token_object.convert<TestToken, Metadata>();
@@ -74,11 +77,12 @@ module 0xcafe::permissioned_token_tests {
         dispatchable_fungible_asset::deposit(creator_store, fa);
     }
 
-    #[test(creator = @0xcafe, aaron = @0xface)]
+    #[test(creator = @topo_framework, aaron = @0xface)]
     fun test_permissioned_update_disallowed_sender(
         creator: &signer,
         aaron: &signer,
     ) {
+        features::change_feature_flags_for_testing(creator, vector[features::get_function_value_dispatch_feature()], vector[]);
         let (creator_ref, token_object) = fungible_asset::create_test_token(creator);
         let (mint, _, _, _) = fungible_asset::init_test_metadata(&creator_ref);
         let metadata = token_object.convert<TestToken, Metadata>();

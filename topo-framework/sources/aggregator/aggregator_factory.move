@@ -30,7 +30,7 @@ module topo_framework::aggregator_factory {
 
     /// Creates a new factory for aggregators. Can only be called during genesis.
     public(friend) fun initialize_aggregator_factory(topo_framework: &signer) {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
         let aggregator_factory = AggregatorFactory {
             phantom_table: table::new()
         };
@@ -55,7 +55,7 @@ module topo_framework::aggregator_factory {
         // deprecated. Currently used only in aptos-move/e2e-move-tests/src/tests/aggregator.data/pack/sources/aggregator_test.move
 
         // Only Aptos Framework (0x1) account can call this for now.
-        system_addresses::assert_aptos_framework(account);
+        system_addresses::assert_topo_framework(account);
         assert!(
             limit == MAX_U128,
             error::invalid_argument(EAGG_V1_LIMIT_DEPRECATED)

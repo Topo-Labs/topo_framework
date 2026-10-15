@@ -3,11 +3,14 @@ module topo_framework::jwk_consensus_config {
     use std::error;
     use std::option;
     use std::string::String;
+    #[test_only]
+    use std::type_info;
     use topo_std::copyable_any;
     use topo_std::copyable_any::Any;
     use topo_std::simple_map;
     use topo_framework::config_buffer;
     use topo_framework::system_addresses;
+    use topo_framework::reconfiguration_state;
     #[test_only]
     use std::string::utf8;
 
@@ -40,7 +43,8 @@ module topo_framework::jwk_consensus_config {
 
     /// Initialize the configuration. Used in genesis or governance.
     public fun initialize(framework: &signer, config: JWKConsensusConfig) {
-        system_addresses::assert_aptos_framework(framework);
+        reconfiguration_state::assert_not_in_progress();
+        system_addresses::assert_topo_framework(framework);
         if (!exists<JWKConsensusConfig>(@topo_framework)) {
             move_to(framework, config);
         }
@@ -57,13 +61,13 @@ module topo_framework::jwk_consensus_config {
     /// topo_governance::reconfigure(&framework_signer);
     /// ```
     public fun set_for_next_epoch(framework: &signer, config: JWKConsensusConfig) {
-        system_addresses::assert_aptos_framework(framework);
+        system_addresses::assert_topo_framework(framework);
         config_buffer::upsert(config);
     }
 
     /// Only used in reconfigurations to apply the pending `JWKConsensusConfig`, if there is any.
     public(friend) fun on_new_epoch(framework: &signer) acquires JWKConsensusConfig {
-        system_addresses::assert_aptos_framework(framework);
+        system_addresses::assert_topo_framework(framework);
         if (config_buffer::does_exist<JWKConsensusConfig>()) {
             let new_config = config_buffer::extract_v2<JWKConsensusConfig>();
             if (exists<JWKConsensusConfig>(@topo_framework)) {
@@ -106,8 +110,7 @@ module topo_framework::jwk_consensus_config {
     #[test_only]
     fun enabled(): bool acquires JWKConsensusConfig {
         let variant= borrow_global<JWKConsensusConfig>(@topo_framework).variant;
-        let variant_type_name = *variant.type_name().bytes();
-        variant_type_name != b"0x1::jwk_consensus_config::ConfigOff"
+        *variant.type_name() != type_info::type_name<ConfigOff>()
     }
 
     #[test_only]

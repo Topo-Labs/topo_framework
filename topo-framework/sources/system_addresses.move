@@ -23,9 +23,9 @@ module topo_framework::system_addresses {
         addr == @core_resources
     }
 
-    public fun assert_aptos_framework(account: &signer) {
+    public fun assert_topo_framework(account: &signer) {
         assert!(
-            is_aptos_framework_address(signer::address_of(account)),
+            is_topo_framework_address(signer::address_of(account)),
             error::permission_denied(ENOT_APTOS_FRAMEWORK_ADDRESS),
         )
     }
@@ -43,7 +43,7 @@ module topo_framework::system_addresses {
 
     /// Return true if `addr` is 0x0 or under the on chain governance's control.
     public fun is_framework_reserved_address(addr: address): bool {
-        is_aptos_framework_address(addr) ||
+        is_topo_framework_address(addr) ||
             addr == @0x2 ||
             addr == @0x3 ||
             addr == @0x4 ||
@@ -56,7 +56,7 @@ module topo_framework::system_addresses {
     }
 
     /// Return true if `addr` is 0x1.
-    public fun is_aptos_framework_address(addr: address): bool {
+    public fun is_topo_framework_address(addr: address): bool {
         addr == @topo_framework
     }
 
@@ -77,6 +77,6 @@ module topo_framework::system_addresses {
 
     /// Return true if `addr` is either the VM address or an Aptos Framework address.
     public fun is_reserved_address(addr: address): bool {
-        is_aptos_framework_address(addr) || is_vm_address(addr)
+        is_topo_framework_address(addr) || is_vm_address(addr)
     }
 }

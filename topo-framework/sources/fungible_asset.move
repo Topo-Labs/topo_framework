@@ -1,12 +1,11 @@
 /// This defines the fungible asset module that can issue fungible asset of any `Metadata` object. The
 /// metadata object can be any object that equipped with `Metadata` resource.
 module topo_framework::fungible_asset {
-    use topo_framework::aggregator_v2::{Self, Aggregator};
+    use topo_framework::aggregator_v2::{Self, Aggregator, AggregatorSnapshot};
     use topo_framework::create_signer;
     use topo_framework::event;
     use topo_framework::function_info::{Self, FunctionInfo};
     use topo_framework::object::{Self, Object, ConstructorRef, DeleteRef, ExtendRef};
-    use topo_framework::permissioned_signer;
     use std::string;
     use std::features;
 
@@ -82,7 +81,7 @@ module topo_framework::fungible_asset {
     const EALREADY_REGISTERED: u64 = 29;
     /// Fungible metadata does not exist on this account.
     const EFUNGIBLE_METADATA_EXISTENCE: u64 = 30;
-    /// Cannot register dispatch hook for TOPO.
+    /// Cannot register dispatch hook for APT.
     const EAPT_NOT_DISPATCHABLE: u64 = 31;
     /// Flag for Concurrent Supply not enabled
     const ECONCURRENT_BALANCE_NOT_ENABLED: u64 = 32;
@@ -93,8 +92,8 @@ module topo_framework::fungible_asset {
     /// The supply ref and the fungible asset do not match.
     const ERAW_SUPPLY_REF_AND_FUNGIBLE_ASSET_MISMATCH: u64 = 35;
 
-    /// signer don't have the permission to perform withdraw operation
-    const EWITHDRAW_PERMISSION_DENIED: u64 = 36;
+    /// The permissioned signer feature has been removed.
+    const EPERMISSIONED_SIGNER_REMOVED: u64 = 37;
     //
     // Constants
     //
@@ -211,6 +210,7 @@ module topo_framework::fungible_asset {
         metadata: Object<Metadata>
     }
 
+    #[deprecated]
     enum WithdrawPermission has copy, drop, store {
         ByStore {
             store_address: address
@@ -487,7 +487,7 @@ module topo_framework::fungible_asset {
     inline fun register_dispatch_function_sanity_check(
         constructor_ref: &ConstructorRef
     ) {
-        // Cannot register hook for TOPO.
+        // Cannot register hook for APT.
         assert!(
             constructor_ref.address_from_constructor_ref()
                 != @aptos_fungible_asset,
@@ -520,6 +520,11 @@ module topo_framework::fungible_asset {
     /// Creates a burn copy ref that can be used to burn fungible assets from the given burn ref.
     public(friend) fun generate_burn_copy_ref(self: &BurnRef): BurnRef {
         BurnRef { metadata: self.metadata }
+    }
+
+    /// Creates a mint copy ref that can be used to mint fungible assets from the given mint ref.
+    public(friend) fun generate_mint_copy_ref(self: &MintRef): MintRef {
+        MintRef { metadata: self.metadata }
     }
 
     /// Creates a transfer ref that can be used to freeze/unfreeze/transfer fungible assets from the given fungible
@@ -656,20 +661,10 @@ module topo_framework::fungible_asset {
         exists<ConcurrentFungibleBalance>(store)
     }
 
-    /// Return the underlying metadata object
-    public fun metadata_from_asset(self: &FungibleAsset): Object<Metadata> {
-        self.metadata
-    }
-
     #[view]
     /// Return the underlying metadata object.
     public fun store_metadata<T: key>(store: Object<T>): Object<Metadata> acquires FungibleStore {
         borrow_store_resource(&store).metadata
-    }
-
-    /// Return the `amount` of a given fungible asset.
-    public fun amount(fa: &FungibleAsset): u64 {
-        fa.amount
     }
 
     #[view]
@@ -679,28 +674,56 @@ module topo_framework::fungible_asset {
     ///       Use `dispatchable_fungible_asset::balance` instead if you intend to work with those FAs.
     public fun balance<T: key>(
         store: Object<T>
-    ): u64 acquires FungibleStore, ConcurrentFungibleBalance, DispatchFunctionStore {
-        let fa_store = borrow_store_resource(&store);
-        assert!(
-            !has_balance_dispatch_function(fa_store.metadata),
-            error::invalid_argument(EINVALID_DISPATCHABLE_OPERATIONS)
-        );
-        balance_impl(store)
+    ): u64 {
+        balance_impl(
+            store,
+            |store| {
+                assert!(
+                    !has_balance_dispatch_function(store.metadata),
+                    error::invalid_argument(EINVALID_DISPATCHABLE_OPERATIONS)
+                );
+            }
+        )
     }
 
-    fun balance_impl<T: key>(store: Object<T>): u64 acquires FungibleStore, ConcurrentFungibleBalance {
+    inline fun balance_impl<T: key>(store: Object<T>, check: |&FungibleStore|): u64 {
         let store_addr = store.object_address();
         if (store_exists_inline(store_addr)) {
-            let store_balance = borrow_store_resource(&store).balance;
+            let store = &FungibleStore[store_addr];
+            check(store);
+            let store_balance = store.balance;
             if (store_balance == 0
                 && concurrent_fungible_balance_exists_inline(store_addr)) {
-                let balance_resource =
-                    borrow_global<ConcurrentFungibleBalance>(store_addr);
-                balance_resource.balance.read()
+                ConcurrentFungibleBalance[store_addr].balance.read()
             } else {
                 store_balance
             }
         } else { 0 }
+    }
+
+    /// Get the balance of a given store, as AggregatorSnapshot.
+    /// Allows us to obtain a balance object, without issuing a read - which would reduce parallelism.
+    ///
+    /// Note: This function will abort on FAs with `derived_balance` hook set up.
+    ///       Use `dispatchable_fungible_asset::derived_balance_snapshot` instead if you intend to work with those FAs.
+    public fun balance_snapshot<T: key>(store: Object<T>): AggregatorSnapshot<u64> {
+        let store_addr = object::object_address(&store);
+        if (store_exists_inline(store_addr)) {
+            let fa_store = &FungibleStore[store_addr];
+            assert!(
+                !has_balance_dispatch_function(fa_store.metadata),
+                error::invalid_argument(EINVALID_DISPATCHABLE_OPERATIONS)
+            );
+
+            let store_balance = fa_store.balance;
+            if (store_balance == 0 && concurrent_fungible_balance_exists_inline(store_addr)) {
+                ConcurrentFungibleBalance[store_addr].balance.snapshot()
+            } else {
+                aggregator_v2::create_snapshot(store_balance)
+            }
+        } else {
+            aggregator_v2::create_snapshot(0)
+        }
     }
 
     #[view]
@@ -749,6 +772,12 @@ module topo_framework::fungible_asset {
         exists<DispatchFunctionStore>(metadata_addr)
     }
 
+    #[view]
+    public fun is_asset_type_dispatchable(metadata: Object<Metadata>): bool {
+        let metadata_addr = metadata.object_address();
+        exists<DispatchFunctionStore>(metadata_addr) || exists<DeriveSupply>(metadata_addr)
+    }
+
     public fun deposit_dispatch_function<T: key>(
         store: Object<T>
     ): Option<FunctionInfo> acquires FungibleStore, DispatchFunctionStore {
@@ -765,7 +794,7 @@ module topo_framework::fungible_asset {
         metadata: Object<Metadata>
     ): bool acquires DispatchFunctionStore {
         let metadata_addr = metadata.object_address();
-        // Short circuit on TOPO for better perf
+        // Short circuit on APT for better perf
         if (metadata_addr != @aptos_fungible_asset
             && exists<DispatchFunctionStore>(metadata_addr)) {
             borrow_global<DispatchFunctionStore>(metadata_addr).deposit_function.is_some()
@@ -788,7 +817,7 @@ module topo_framework::fungible_asset {
         metadata: Object<Metadata>
     ): bool acquires DispatchFunctionStore {
         let metadata_addr = metadata.object_address();
-        // Short circuit on TOPO for better perf
+        // Short circuit on APT for better perf
         if (metadata_addr != @aptos_fungible_asset
             && exists<DispatchFunctionStore>(metadata_addr)) {
             borrow_global<DispatchFunctionStore>(metadata_addr).withdraw_function.is_some()
@@ -799,7 +828,7 @@ module topo_framework::fungible_asset {
         metadata: Object<Metadata>
     ): bool acquires DispatchFunctionStore {
         let metadata_addr = metadata.object_address();
-        // Short circuit on TOPO for better perf
+        // Short circuit on APT for better perf
         if (metadata_addr != @aptos_fungible_asset
             && exists<DispatchFunctionStore>(metadata_addr)) {
             borrow_global<DispatchFunctionStore>(metadata_addr).derived_balance_function.is_some()
@@ -807,7 +836,7 @@ module topo_framework::fungible_asset {
     }
 
     fun has_supply_dispatch_function(metadata_addr: address): bool {
-        // Short circuit on TOPO for better perf
+        // Short circuit on APT for better perf
         if (metadata_addr != @aptos_fungible_asset) {
             exists<DeriveSupply>(metadata_addr)
         } else { false }
@@ -836,6 +865,19 @@ module topo_framework::fungible_asset {
         }
     }
 
+    /// Return the `amount` of a given fungible asset.
+    public fun amount(self: &FungibleAsset): u64 {
+        self.amount
+    }
+
+    #[deprecated]
+    /// Return the underlying metadata object
+    /// Duplicate of `asset_metadata`
+    public fun metadata_from_asset(self: &FungibleAsset): Object<Metadata> {
+        self.metadata
+    }
+
+    /// Return the underlying metadata object from the `FungibleAsset`.
     public fun asset_metadata(self: &FungibleAsset): Object<Metadata> {
         self.metadata
     }
@@ -943,38 +985,7 @@ module topo_framework::fungible_asset {
         owner: &signer, store: Object<T>, amount: u64
     ): FungibleAsset acquires FungibleStore, DispatchFunctionStore, ConcurrentFungibleBalance {
         withdraw_sanity_check(owner, store, true);
-        withdraw_permission_check(owner, store, amount);
         unchecked_withdraw(store.object_address(), amount)
-    }
-
-    /// Check the permission for withdraw operation.
-    public(friend) fun withdraw_permission_check<T: key>(
-        owner: &signer, store: Object<T>, amount: u64
-    ) {
-        assert!(
-            permissioned_signer::check_permission_consume(
-                owner,
-                amount as u256,
-                WithdrawPermission::ByStore {
-                    store_address: store.object_address()
-                }
-            ),
-            error::permission_denied(EWITHDRAW_PERMISSION_DENIED)
-        );
-    }
-
-    /// Check the permission for withdraw operation.
-    public(friend) fun withdraw_permission_check_by_address(
-        owner: &signer, store_address: address, amount: u64
-    ) {
-        assert!(
-            permissioned_signer::check_permission_consume(
-                owner,
-                amount as u256,
-                WithdrawPermission::ByStore { store_address }
-            ),
-            error::permission_denied(EWITHDRAW_PERMISSION_DENIED)
-        );
     }
 
     /// Check the permission for withdraw operation.
@@ -992,7 +1003,7 @@ module topo_framework::fungible_asset {
         owner_address: address, store: Object<T>, abort_on_dispatch: bool
     ) {
         assert!(
-            store.owns(owner_address),
+            object::owns(store, owner_address),
             error::permission_denied(ENOT_STORE_OWNER)
         );
         let fa_store = borrow_store_resource(&store);
@@ -1071,7 +1082,7 @@ module topo_framework::fungible_asset {
     /// Burns a fungible asset
     public fun burn(self: &BurnRef, fa: FungibleAsset) acquires Supply, ConcurrentSupply {
         assert!(
-            self.metadata == fa.metadata_from_asset(),
+            self.metadata == fa.asset_metadata(),
             error::invalid_argument(EBURN_REF_AND_FUNGIBLE_ASSET_MISMATCH)
         );
         fa.burn_internal();
@@ -1137,11 +1148,15 @@ module topo_framework::fungible_asset {
     public fun balance_with_ref<T: key>(
         self: &RawBalanceRef, store: Object<T>
     ): u64 acquires FungibleStore, ConcurrentFungibleBalance {
-        assert!(
-            self.metadata == store_metadata(store),
-            error::invalid_argument(ERAW_BALANCE_REF_AND_FUNGIBLE_ASSET_MISMATCH)
-        );
-        balance_impl(store)
+        balance_impl(
+            store,
+            |store| {
+                assert!(
+                    self.metadata == store.metadata,
+                    error::invalid_argument(ERAW_BALANCE_REF_AND_FUNGIBLE_ASSET_MISMATCH)
+                );
+            }
+        )
     }
 
     /// Access raw supply of a FA using `RawSupplyRef`
@@ -1424,17 +1439,29 @@ module topo_framework::fungible_asset {
         move_to(&metadata_object_signer, supply);
     }
 
+    #[view]
+    public fun is_concurrent<T: key>(store: Object<T>): bool {
+        exists<ConcurrentFungibleBalance>(object::object_address(&store))
+    }
+
+    /// Opts-in the given store into tracking balance in a concurrent manner (through Aggregators),
+    /// This allows witdraw, deposit, transfer, is_balance_at_least and balance_snapshot to
+    /// not create conflicts and maintain parallelism.
     public entry fun upgrade_store_to_concurrent<T: key>(
         owner: &signer, store: Object<T>
     ) acquires FungibleStore {
+        let fungible_store_address = store.object_address();
+        // be graceful if ConcurrentFungibleBalance already exists, but flag is off
+        if (exists<ConcurrentFungibleBalance>(fungible_store_address)) {
+            // skip checks, to make opt-in efficient if done before operation.
+            return;
+        };
+
         assert!(
-            store.owns(signer::address_of(owner)),
+            object::owns(store, signer::address_of(owner)),
             error::permission_denied(ENOT_STORE_OWNER)
         );
         assert!(!is_frozen(store), error::invalid_argument(ESTORE_IS_FROZEN));
-        let fungible_store_address = store.object_address();
-        // be graceful if ConcurrentFungibleBalance already exists, but flag is off
-        if (exists<ConcurrentFungibleBalance>(fungible_store_address)) { return };
         assert!(
             allow_upgrade_to_concurrent_fungible_balance(),
             error::invalid_argument(ECONCURRENT_BALANCE_NOT_ENABLED)
@@ -1455,45 +1482,14 @@ module topo_framework::fungible_asset {
         move_to(&object_signer, ConcurrentFungibleBalance { balance });
     }
 
-    /// Permission management
-    ///
-    /// Master signer grant permissioned signer ability to withdraw a given amount of fungible asset.
+    #[deprecated]
     public fun grant_permission_by_store<T: key>(
-        master: &signer,
-        permissioned: &signer,
-        store: Object<T>,
-        amount: u64
+        _master: &signer,
+        _permissioned: &signer,
+        _store: Object<T>,
+        _amount: u64
     ) {
-        permissioned_signer::authorize_increase(
-            master,
-            permissioned,
-            amount as u256,
-            WithdrawPermission::ByStore { store_address: store.object_address() }
-        )
-    }
-
-    public(friend) fun grant_permission_by_address(
-        master: &signer,
-        permissioned: &signer,
-        store_address: address,
-        amount: u64
-    ) {
-        permissioned_signer::authorize_increase(
-            master,
-            permissioned,
-            amount as u256,
-            WithdrawPermission::ByStore { store_address }
-        )
-    }
-
-    public(friend) fun refill_permission(
-        permissioned: &signer, amount: u64, store_address: address
-    ) {
-        permissioned_signer::increase_limit(
-            permissioned,
-            amount as u256,
-            WithdrawPermission::ByStore { store_address }
-        )
+        abort error::unavailable(EPERMISSIONED_SIGNER_REMOVED)
     }
 
     #[deprecated]
@@ -1562,9 +1558,6 @@ module topo_framework::fungible_asset {
         };
         create_store(&object::create_object_from_account(owner), metadata)
     }
-
-    #[test_only]
-    use topo_framework::timestamp;
 
     #[test(creator = @0xcafe)]
     fun test_metadata_basic_flow(creator: &signer) acquires Metadata, Supply, ConcurrentSupply {
@@ -2033,99 +2026,53 @@ module topo_framework::fungible_asset {
         );
     }
 
-    #[test(creator = @0xcafe, aaron = @0xface)]
-    fun test_e2e_withdraw_limit(
-        creator: &signer, aaron: &signer
+    #[test(creator = @0xcafe)]
+    fun test_balance_snapshot(
+        creator: &signer
     ) acquires FungibleStore, Supply, ConcurrentSupply, DispatchFunctionStore, ConcurrentFungibleBalance {
-        let topo_framework = account::create_signer_for_test(@0x1);
-        timestamp::set_time_has_started_for_testing(&topo_framework);
-
-        let (mint_ref, _, _, _, test_token) = create_fungible_asset(creator);
-        let metadata = mint_ref.metadata;
+        let (mint_ref, _, _, _, metadata) = create_fungible_asset(creator);
         let creator_store = create_test_store(creator, metadata);
-        let aaron_store = create_test_store(aaron, metadata);
 
-        assert!(supply(test_token) == option::some(0), 1);
-        // Mint
+        // Empty (non-concurrent) store yields a snapshot of 0.
+        assert!(!concurrent_fungible_balance_exists_inline(creator_store.object_address()), 1);
+        assert!(aggregator_v2::read_snapshot(&balance_snapshot(creator_store)) == 0, 2);
+
         let fa = mint_ref.mint(100);
-        assert!(supply(test_token) == option::some(100), 2);
-        // Deposit
         deposit(creator_store, fa);
-        // Withdraw
-        let fa = withdraw(creator, creator_store, 80);
-        assert!(supply(test_token) == option::some(100), 3);
-        deposit(aaron_store, fa);
+        assert!(aggregator_v2::read_snapshot(&balance_snapshot(creator_store)) == 100, 3);
 
-        // Create a permissioned signer
-        let aaron_permission_handle =
-            permissioned_signer::create_permissioned_handle(aaron);
-        let aaron_permission_signer =
-            permissioned_signer::signer_from_permissioned_handle(&aaron_permission_handle);
-
-        // Grant aaron_permission_signer permission to withdraw 10 FA
-        grant_permission_by_store(
-            aaron,
-            &aaron_permission_signer,
-            aaron_store,
-            10
-        );
-
-        let fa = withdraw(&aaron_permission_signer, aaron_store, 5);
-        deposit(aaron_store, fa);
-
-        let fa = withdraw(&aaron_permission_signer, aaron_store, 5);
-        deposit(aaron_store, fa);
-
-        // aaron signer don't abide to the same limit
-        let fa = withdraw(aaron, aaron_store, 5);
-        deposit(aaron_store, fa);
-
-        permissioned_signer::destroy_permissioned_handle(aaron_permission_handle);
+        let fa = withdraw(creator, creator_store, 40);
+        assert!(aggregator_v2::read_snapshot(&balance_snapshot(creator_store)) == 60, 4);
+        deposit(creator_store, fa);
+        assert!(aggregator_v2::read_snapshot(&balance_snapshot(creator_store)) == 100, 5);
     }
 
-    #[test(creator = @0xcafe, aaron = @0xface)]
-    #[expected_failure(abort_code = 0x50024, location = Self)]
-    fun test_e2e_withdraw_limit_exceeds(
-        creator: &signer, aaron: &signer
+    #[test(fx = @topo_framework, creator = @0xcafe)]
+    fun test_balance_snapshot_concurrent(
+        fx: &signer, creator: &signer
     ) acquires FungibleStore, Supply, ConcurrentSupply, DispatchFunctionStore, ConcurrentFungibleBalance {
-        let topo_framework = account::create_signer_for_test(@0x1);
-        timestamp::set_time_has_started_for_testing(&topo_framework);
-
-        let (mint_ref, _, _, _, test_token) = create_fungible_asset(creator);
-        let metadata = mint_ref.metadata;
-        let creator_store = create_test_store(creator, metadata);
-        let aaron_store = create_test_store(aaron, metadata);
-
-        assert!(supply(test_token) == option::some(0), 1);
-        // Mint
-        let fa = mint_ref.mint(100);
-        assert!(supply(test_token) == option::some(100), 2);
-        // Deposit
-        deposit(creator_store, fa);
-        // Withdraw
-        let fa = withdraw(creator, creator_store, 80);
-        assert!(supply(test_token) == option::some(100), 3);
-        deposit(aaron_store, fa);
-
-        // Create a permissioned signer
-        let aaron_permission_handle =
-            permissioned_signer::create_permissioned_handle(aaron);
-        let aaron_permission_signer =
-            permissioned_signer::signer_from_permissioned_handle(&aaron_permission_handle);
-
-        // Grant aaron_permission_signer permission to withdraw 10 FA
-        grant_permission_by_store(
-            aaron,
-            &aaron_permission_signer,
-            aaron_store,
-            10
+        let supply_feature = features::get_concurrent_fungible_assets_feature();
+        let balance_feature = features::get_concurrent_fungible_balance_feature();
+        let default_balance_feature =
+            features::get_default_to_concurrent_fungible_balance_feature();
+        features::change_feature_flags_for_testing(
+            fx,
+            vector[supply_feature, balance_feature, default_balance_feature],
+            vector[]
         );
 
-        // Withdrawing more than 10 FA yield an error.
-        let fa = withdraw(&aaron_permission_signer, aaron_store, 11);
-        deposit(aaron_store, fa);
+        let (mint_ref, _, _, _, metadata) = create_fungible_asset(creator);
+        let creator_store = create_test_store(creator, metadata);
 
-        permissioned_signer::destroy_permissioned_handle(aaron_permission_handle);
+        // Balance is tracked in the concurrent aggregator, so the snapshot is
+        // taken directly from it (without issuing a read).
+        assert!(concurrent_fungible_balance_exists_inline(creator_store.object_address()), 1);
+        assert!(aggregator_v2::read_snapshot(&balance_snapshot(creator_store)) == 0, 2);
+
+        let fa = mint_ref.mint(100);
+        deposit(creator_store, fa);
+        assert!(borrow_store_resource(&creator_store).balance == 0, 3);
+        assert!(aggregator_v2::read_snapshot(&balance_snapshot(creator_store)) == 100, 4);
     }
 
     #[deprecated]

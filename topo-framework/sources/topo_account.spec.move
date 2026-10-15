@@ -107,19 +107,19 @@ spec topo_framework::topo_account {
 
     /// Check if the address existed.
     /// Check if the TopoCoin under the address existed.
-    spec assert_account_is_registered_for_topo(addr: address) {
-        pragma aborts_if_is_partial;
-        // aborts_if !account::spec_exists_at(addr);
-        // TODO(fa_migration)
-        //aborts_if !coin::spec_is_account_registered<TopoCoin>(addr);
+    spec assert_account_is_registered_for_apt(addr: address) {
+        aborts_if !account::spec_exists_at(addr);
+        aborts_if !exists<coin::CoinInfo<TopoCoin>>(@topo_framework);
     }
 
     spec set_allow_direct_coin_transfers(account: &signer, allow: bool) {
-        // TODO(fa_migration)
-        pragma verify = false;
-        // let addr = signer::address_of(account);
-        // include !exists<DirectTransferConfig>(addr) ==> account::NewEventHandleAbortsIf;
-        // ensures global<DirectTransferConfig>(addr).allow_arbitrary_coin_transfers == allow;
+        let addr = signer::address_of(account);
+        include !exists<DirectTransferConfig>(addr) ==>
+            account::NewEventHandleAbortsIf { account };
+        modifies global<DirectTransferConfig>(addr);
+        modifies global<account::Account>(addr);
+        ensures exists<DirectTransferConfig>(addr);
+        ensures global<DirectTransferConfig>(addr).allow_arbitrary_coin_transfers == allow;
     }
 
     spec batch_transfer(source: &signer, recipients: vector<address>, amounts: vector<u64>) {
@@ -216,10 +216,6 @@ spec topo_framework::topo_account {
         aborts_if exists i in 0..len(recipients):
             account::spec_exists_at(recipients[i]) && !exists<coin::CoinStore<CoinType>>(recipients[i]) && global<account::Account>(recipients[i]).guid_creation_num + 2 > MAX_U64;
 
-        // register_coin properties
-        // TODO(fa_migration)
-        // aborts_if exists i in 0..len(recipients):
-        //     //!coin::spec_is_account_registered<CoinType>(recipients[i]) && !type_info::spec_is_struct<CoinType>();
     }
 
     spec deposit_coins<CoinType>(to: address, coins: Coin<CoinType>) {
@@ -241,6 +237,10 @@ spec topo_framework::topo_account {
     }
 
     spec deposit_fungible_assets(to: address, fa: FungibleAsset) {
+        pragma verify = false;
+    }
+
+    spec mint_to_fungible_store_for_gas(ref: &MintRef, account: address, amount: u64) {
         pragma verify = false;
     }
 
@@ -269,7 +269,7 @@ spec topo_framework::topo_account {
         ensures exists<topo_framework::coin::CoinStore<CoinType>>(to);
     }
 
-    spec register_topo(account_signer: &signer) {
+    spec register_apt(account_signer: &signer) {
         // TODO: temporary mockup.
         pragma verify = false;
     }

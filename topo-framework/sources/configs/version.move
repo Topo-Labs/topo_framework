@@ -25,7 +25,7 @@ module topo_framework::version {
     /// Only called during genesis.
     /// Publishes the Version config.
     public(friend) fun initialize(topo_framework: &signer, initial_version: u64) {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
 
         move_to(topo_framework, Version { major: initial_version });
         // Give aptos framework account capability to call set version. This allows on chain governance to do it through
@@ -65,7 +65,7 @@ module topo_framework::version {
 
     /// Only used in reconfigurations to apply the pending `Version`, if there is any.
     public(friend) fun on_new_epoch(framework: &signer) acquires Version {
-        system_addresses::assert_aptos_framework(framework);
+        system_addresses::assert_topo_framework(framework);
         if (config_buffer::does_exist<Version>()) {
             let new_value = config_buffer::extract_v2<Version>();
             if (exists<Version>(@topo_framework)) {

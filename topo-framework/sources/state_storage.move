@@ -22,7 +22,7 @@ module topo_framework::state_storage {
     }
 
     public(friend) fun initialize(topo_framework: &signer) {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
         assert!(
             !exists<StateStorageUsage>(@topo_framework),
             error::already_exists(ESTATE_STORAGE_USAGE)

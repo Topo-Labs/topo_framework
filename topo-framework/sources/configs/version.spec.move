@@ -31,8 +31,6 @@ spec topo_framework::version {
         use topo_framework::staking_config;
         use topo_framework::reconfiguration;
 
-        // TODO: set because of timeout (property proved)
-        pragma verify_duration_estimate = 120;
         include staking_config::StakingRewardsConfigRequirement;
         requires chain_status::is_genesis();
         requires timestamp::spec_now_microseconds() >= reconfiguration::last_reconfiguration_time();
@@ -63,16 +61,19 @@ spec topo_framework::version {
     }
 
     spec set_for_next_epoch(account: &signer, major: u64) {
+        aborts_if topo_framework::reconfiguration_state::spec_is_in_progress();
+        pragma opaque;
+        modifies global<config_buffer::PendingConfigs>(@topo_framework);
         aborts_if !exists<SetVersionCapability>(signer::address_of(account));
         aborts_if !exists<Version>(@topo_framework);
         aborts_if global<Version>(@topo_framework).major >= major;
-        aborts_if !exists<config_buffer::PendingConfigs>(@topo_framework);
+        aborts_if aborts_of<config_buffer::upsert<Version>>(Version { major });
+        ensures ensures_of<config_buffer::upsert<Version>>(Version { major });
     }
 
     spec on_new_epoch(framework: &signer) {
-        requires @topo_framework == std::signer::address_of(framework);
-        include config_buffer::OnNewEpochRequirement<Version>;
-        aborts_if false;
+        pragma opaque;
+        include config_buffer::OnNewEpochApply<Version>;
     }
 
     /// This module turns on `aborts_if_is_strict`, so need to add spec for test function `initialize_for_test`.

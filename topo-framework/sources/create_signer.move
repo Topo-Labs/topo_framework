@@ -17,8 +17,10 @@ module topo_framework::create_signer {
     friend topo_framework::account_abstraction;
     friend topo_framework::multisig_account;
     friend topo_framework::object;
-    friend topo_framework::permissioned_signer;
+    friend topo_framework::reconfiguration_with_dkg;
     friend topo_framework::transaction_validation;
+    friend topo_framework::stake;
+    friend topo_framework::init;
 
     public(friend) native fun create_signer(addr: address): signer;
 }

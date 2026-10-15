@@ -1,11 +1,56 @@
 spec topo_framework::randomness_config {
-    spec current {
-        aborts_if false;
+    spec initialize(framework: &signer, config: RandomnessConfig) {
+        aborts_if topo_framework::reconfiguration_state::spec_is_in_progress();
+        pragma opaque;
+        include config_buffer::InitializeResource<RandomnessConfig>;
+    }
+
+    spec set_for_next_epoch(framework: &signer, new_config: RandomnessConfig) {
+        aborts_if topo_framework::reconfiguration_state::spec_is_in_progress();
+        pragma opaque;
+        include config_buffer::SetForNextEpoch<RandomnessConfig>;
     }
 
     spec on_new_epoch(framework: &signer) {
-        requires @topo_framework == std::signer::address_of(framework);
-        include config_buffer::OnNewEpochRequirement<RandomnessConfig>;
+        pragma opaque;
+        include config_buffer::OnNewEpochApply<RandomnessConfig>;
+    }
+
+    spec current {
         aborts_if false;
+        ensures exists<RandomnessConfig>(@topo_framework) ==>
+            result == global<RandomnessConfig>(@topo_framework);
+        ensures !exists<RandomnessConfig>(@topo_framework) ==>
+            result == RandomnessConfig { variant: copyable_any::pack(ConfigOff {}) };
+    }
+
+    spec new_off {
+        pragma opaque;
+        aborts_if false;
+        ensures result == RandomnessConfig { variant: copyable_any::pack(ConfigOff {}) };
+    }
+
+    spec new_v1(secrecy_threshold: FixedPoint64, reconstruction_threshold: FixedPoint64): RandomnessConfig {
+        pragma opaque;
+        aborts_if false;
+        ensures result == RandomnessConfig {
+            variant: copyable_any::pack(ConfigV1 { secrecy_threshold, reconstruction_threshold })
+        };
+    }
+
+    spec new_v2(
+        secrecy_threshold: FixedPoint64,
+        reconstruction_threshold: FixedPoint64,
+        fast_path_secrecy_threshold: FixedPoint64,
+    ): RandomnessConfig {
+        pragma opaque;
+        aborts_if false;
+        ensures result == RandomnessConfig {
+            variant: copyable_any::pack(ConfigV2 {
+                secrecy_threshold,
+                reconstruction_threshold,
+                fast_path_secrecy_threshold,
+            })
+        };
     }
 }

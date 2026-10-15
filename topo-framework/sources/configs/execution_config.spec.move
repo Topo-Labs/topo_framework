@@ -14,27 +14,31 @@ spec topo_framework::execution_config {
         use topo_framework::staking_config;
         use topo_framework::topo_coin;
 
-        // TODO: set because of timeout (property proved)
-        pragma verify_duration_estimate = 600;
         let addr = signer::address_of(account);
         requires chain_status::is_genesis();
         requires exists<staking_config::StakingRewardsConfig>(@topo_framework);
         requires len(config) > 0;
         include features::spec_periodical_reward_rate_decrease_enabled() ==> staking_config::StakingRewardsConfigEnabledRequirement;
         include topo_coin::ExistsTopoCoin;
-        requires system_addresses::is_aptos_framework_address(addr);
+        requires system_addresses::is_topo_framework_address(addr);
         requires timestamp::spec_now_microseconds() >= reconfiguration::last_reconfiguration_time();
 
         ensures exists<ExecutionConfig>(@topo_framework);
     }
 
     spec set_for_next_epoch(account: &signer, config: vector<u8>) {
+        aborts_if topo_framework::reconfiguration_state::spec_is_in_progress();
+        pragma opaque;
+        modifies global<config_buffer::PendingConfigs>(@topo_framework);
         include config_buffer::SetForNextEpochAbortsIf;
+        let key = std::type_info::type_name<ExecutionConfig>();
+        let post configs_post = global<config_buffer::PendingConfigs>(@topo_framework).configs;
+        ensures std::simple_map::spec_contains_key(configs_post, key);
+        ensures std::simple_map::spec_get(configs_post, key) == std::any::pack(ExecutionConfig { config });
     }
 
     spec on_new_epoch(framework: &signer) {
-        requires @topo_framework == std::signer::address_of(framework);
-        include config_buffer::OnNewEpochRequirement<ExecutionConfig>;
-        aborts_if false;
+        pragma opaque;
+        include config_buffer::OnNewEpochApply<ExecutionConfig>;
     }
 }

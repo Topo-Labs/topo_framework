@@ -1,6 +1,7 @@
 #[test_only]
 module topo_framework::account_abstraction_tests {
     use std::signer;
+    use topo_framework::account_abstraction;
     use topo_framework::auth_data::AbstractionAuthData;
     use topo_framework::object;
 
@@ -14,4 +15,10 @@ module topo_framework::account_abstraction_tests {
     }
 
     public fun test_auth(account: signer, _data: AbstractionAuthData): signer { account }
+
+    /// Re-enters `account_abstraction` while its module lock is active; dispatch aborts.
+    public fun reentrant_auth(account: signer, _data: AbstractionAuthData): signer {
+        let _ = account_abstraction::using_dispatchable_authenticator(signer::address_of(&account));
+        account
+    }
 }

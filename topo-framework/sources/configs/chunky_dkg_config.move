@@ -1,10 +1,14 @@
 /// Structs and functions for on-chain chunky DKG configurations.
 module topo_framework::chunky_dkg_config {
+    use std::option;
+    use std::option::Option;
+    use std::type_info;
     use topo_std::copyable_any;
     use topo_std::copyable_any::Any;
     use topo_std::fixed_point64::FixedPoint64;
     use topo_framework::config_buffer;
     use topo_framework::system_addresses;
+    use topo_framework::reconfiguration_state;
 
     friend topo_framework::reconfiguration_with_dkg;
 
@@ -14,6 +18,7 @@ module topo_framework::chunky_dkg_config {
         /// Currently the variant type is one of the following.
         /// - `ConfigOff`
         /// - `ConfigV1`
+        /// - `ConfigShadowV1`
         variant: Any
     }
 
@@ -28,9 +33,18 @@ module topo_framework::chunky_dkg_config {
         reconstruction_threshold: FixedPoint64
     }
 
+    /// A chunky DKG config variant for shadow mode: chunky DKG runs alongside regular DKG,
+    /// but epoch change is forced after `grace_period_secs` if chunky DKG hasn't completed.
+    struct ConfigShadowV1 has copy, drop, store {
+        secrecy_threshold: FixedPoint64,
+        reconstruction_threshold: FixedPoint64,
+        grace_period_secs: u64
+    }
+
     /// Initialize the configuration. Used in genesis or governance.
     public fun initialize(framework: &signer, config: ChunkyDKGConfig) {
-        system_addresses::assert_aptos_framework(framework);
+        reconfiguration_state::assert_not_in_progress();
+        system_addresses::assert_topo_framework(framework);
         if (!exists<ChunkyDKGConfig>(@topo_framework)) {
             move_to(framework, config)
         }
@@ -40,13 +54,13 @@ module topo_framework::chunky_dkg_config {
     public fun set_for_next_epoch(
         framework: &signer, new_config: ChunkyDKGConfig
     ) {
-        system_addresses::assert_aptos_framework(framework);
+        system_addresses::assert_topo_framework(framework);
         config_buffer::upsert(new_config);
     }
 
     /// Only used in reconfigurations to apply the pending `ChunkyDKGConfig`, if there is any.
     public(friend) fun on_new_epoch(framework: &signer) acquires ChunkyDKGConfig {
-        system_addresses::assert_aptos_framework(framework);
+        system_addresses::assert_topo_framework(framework);
         if (config_buffer::does_exist<ChunkyDKGConfig>()) {
             let new_config = config_buffer::extract_v2<ChunkyDKGConfig>();
             if (exists<ChunkyDKGConfig>(@topo_framework)) {
@@ -64,8 +78,7 @@ module topo_framework::chunky_dkg_config {
     public fun enabled(): bool acquires ChunkyDKGConfig {
         if (exists<ChunkyDKGConfig>(@topo_framework)) {
             let config = borrow_global<ChunkyDKGConfig>(@topo_framework);
-            let variant_type_name = *config.variant.type_name().bytes();
-            variant_type_name != b"0x1::chunky_dkg_config::ConfigOff"
+            *config.variant.type_name() != type_info::type_name<ConfigOff>()
         } else { false }
     }
 
@@ -85,6 +98,31 @@ module topo_framework::chunky_dkg_config {
                 ConfigV1 { secrecy_threshold, reconstruction_threshold }
             )
         }
+    }
+
+    /// Create a `ConfigShadowV1` variant for shadow mode.
+    public fun new_shadow_v1(
+        secrecy_threshold: FixedPoint64,
+        reconstruction_threshold: FixedPoint64,
+        grace_period_secs: u64
+    ): ChunkyDKGConfig {
+        ChunkyDKGConfig {
+            variant: copyable_any::pack(
+                ConfigShadowV1 { secrecy_threshold, reconstruction_threshold, grace_period_secs }
+            )
+        }
+    }
+
+    /// Return the grace period in seconds if configured (i.e. shadow mode), or none otherwise.
+    public fun grace_period_secs(): Option<u64> acquires ChunkyDKGConfig {
+        if (exists<ChunkyDKGConfig>(@topo_framework)) {
+            let config = borrow_global<ChunkyDKGConfig>(@topo_framework);
+            if (*config.variant.type_name() == type_info::type_name<ConfigShadowV1>()) {
+                let shadow_v1 = copyable_any::unpack<ConfigShadowV1>(config.variant);
+                return std::option::some(shadow_v1.grace_period_secs)
+            }
+        };
+        option::none()
     }
 
     /// Get the currently effective chunky DKG configuration object.
@@ -123,5 +161,41 @@ module topo_framework::chunky_dkg_config {
         set_for_next_epoch(&framework, new_off());
         on_new_epoch(&framework);
         assert!(!enabled(), 2);
+    }
+
+    #[test(framework = @0x1)]
+    fun shadow_v1_config(framework: signer) acquires ChunkyDKGConfig {
+        initialize_for_testing(&framework);
+
+        // Shadow mode is enabled but has a grace period.
+        let config =
+            new_shadow_v1(
+                fixed_point64::create_from_rational(1, 2),
+                fixed_point64::create_from_rational(2, 3),
+                30
+            );
+        set_for_next_epoch(&framework, config);
+        on_new_epoch(&framework);
+        assert!(enabled(), 1);
+        let gp = grace_period_secs();
+        assert!(gp.is_some(), 2);
+        assert!(*gp.borrow() == 30, 3);
+
+        // ConfigV1 has no grace period.
+        let config =
+            new_v1(
+                fixed_point64::create_from_rational(1, 2),
+                fixed_point64::create_from_rational(2, 3)
+            );
+        set_for_next_epoch(&framework, config);
+        on_new_epoch(&framework);
+        assert!(enabled(), 4);
+        assert!(grace_period_secs().is_none(), 5);
+
+        // ConfigOff has no grace period and is not enabled.
+        set_for_next_epoch(&framework, new_off());
+        on_new_epoch(&framework);
+        assert!(!enabled(), 6);
+        assert!(grace_period_secs().is_none(), 7);
     }
 }

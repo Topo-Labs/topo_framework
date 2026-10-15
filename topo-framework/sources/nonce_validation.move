@@ -1,9 +1,9 @@
 module topo_framework::nonce_validation {
     use topo_std::table::{Self, Table};
-    use topo_framework::timestamp;
-    use topo_framework::big_ordered_map::{Self, BigOrderedMap};
+    use topo_std::timestamp;
+    use topo_std::big_ordered_map::{Self, BigOrderedMap};
     use topo_std::aptos_hash::sip_hash_from_value;
-    use std::error;
+    use topo_std::error;
     use topo_framework::system_addresses;
     friend topo_framework::genesis;
     friend topo_framework::transaction_validation;
@@ -79,7 +79,7 @@ module topo_framework::nonce_validation {
     }
 
     public entry fun initialize_nonce_table(topo_framework: &signer) {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
         if (!exists<NonceHistory>(@topo_framework)) {
             let table = table::new();
             let nonce_history = NonceHistory {

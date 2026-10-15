@@ -1,1 +1,10 @@
 .DS_Store
+
+# Local Move build, test, and prover outputs.
+build/
+Move.lock
+.coverage_map.mvcov
+coverage/
+boogie.bpl
+boogie.bpl.*
+prover_benchmark.*

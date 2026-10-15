@@ -23,7 +23,7 @@ module topo_framework::execution_config {
     ///
     /// TODO: update all the tests that reference this function, then disable this function.
     public fun set(account: &signer, config: vector<u8>) acquires ExecutionConfig {
-        system_addresses::assert_aptos_framework(account);
+        system_addresses::assert_topo_framework(account);
         chain_status::assert_genesis();
 
         assert!(config.length() > 0, error::invalid_argument(EINVALID_CONFIG));
@@ -45,14 +45,14 @@ module topo_framework::execution_config {
     /// topo_framework::topo_governance::reconfigure(&framework_signer);
     /// ```
     public fun set_for_next_epoch(account: &signer, config: vector<u8>) {
-        system_addresses::assert_aptos_framework(account);
+        system_addresses::assert_topo_framework(account);
         assert!(config.length() > 0, error::invalid_argument(EINVALID_CONFIG));
         config_buffer::upsert(ExecutionConfig { config });
     }
 
     /// Only used in reconfigurations to apply the pending `ExecutionConfig`, if there is any.
     public(friend) fun on_new_epoch(framework: &signer) acquires ExecutionConfig {
-        system_addresses::assert_aptos_framework(framework);
+        system_addresses::assert_topo_framework(framework);
         if (config_buffer::does_exist<ExecutionConfig>()) {
             let config = config_buffer::extract_v2<ExecutionConfig>();
             if (exists<ExecutionConfig>(@topo_framework)) {

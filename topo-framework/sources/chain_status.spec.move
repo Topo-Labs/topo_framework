@@ -29,14 +29,29 @@ spec topo_framework::chain_status {
 
     spec set_genesis_end(topo_framework: &signer) {
         use std::signer;
+        pragma opaque;
         pragma verify = true;
         pragma delegate_invariants_to_caller;
+        modifies global<GenesisEndMarker>(@topo_framework);
         let addr = signer::address_of(topo_framework);
         aborts_if addr != @topo_framework;
         /// [high-level-req-3]
         aborts_if exists<GenesisEndMarker>(@topo_framework);
         /// [high-level-req-1]
+        ensures exists<GenesisEndMarker>(@topo_framework);
         ensures global<GenesisEndMarker>(@topo_framework) == GenesisEndMarker {};
+    }
+
+    spec is_genesis {
+        pragma opaque;
+        aborts_if false;
+        ensures result == !exists<GenesisEndMarker>(@topo_framework);
+    }
+
+    spec is_operating {
+        pragma opaque;
+        aborts_if false;
+        ensures result == exists<GenesisEndMarker>(@topo_framework);
     }
 
     spec schema RequiresIsOperating {
@@ -44,10 +59,12 @@ spec topo_framework::chain_status {
     }
 
     spec assert_operating {
+        pragma opaque;
         aborts_if !is_operating();
     }
 
     spec assert_genesis {
+        pragma opaque;
         aborts_if !is_genesis();
     }
 }

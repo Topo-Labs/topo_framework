@@ -43,6 +43,7 @@ and implement the governance voting logic on top.
 
 
 -  [Resource `MultisigAccount`](#0x1_multisig_account_MultisigAccount)
+-  [Enum Resource `MultisigAccountTimeLock`](#0x1_multisig_account_MultisigAccountTimeLock)
 -  [Struct `MultisigTransaction`](#0x1_multisig_account_MultisigTransaction)
 -  [Struct `ExecutionError`](#0x1_multisig_account_ExecutionError)
 -  [Struct `MultisigAccountCreationMessage`](#0x1_multisig_account_MultisigAccountCreationMessage)
@@ -65,8 +66,12 @@ and implement the governance voting logic on top.
 -  [Struct `TransactionExecutionFailed`](#0x1_multisig_account_TransactionExecutionFailed)
 -  [Struct `MetadataUpdatedEvent`](#0x1_multisig_account_MetadataUpdatedEvent)
 -  [Struct `MetadataUpdated`](#0x1_multisig_account_MetadataUpdated)
+-  [Struct `TimelockUpdated`](#0x1_multisig_account_TimelockUpdated)
+-  [Struct `TimelockRemoved`](#0x1_multisig_account_TimelockRemoved)
 -  [Constants](#@Constants_0)
 -  [Function `metadata`](#0x1_multisig_account_metadata)
+-  [Function `timelock_period`](#0x1_multisig_account_timelock_period)
+-  [Function `timelock_override_threshold`](#0x1_multisig_account_timelock_override_threshold)
 -  [Function `num_signatures_required`](#0x1_multisig_account_num_signatures_required)
 -  [Function `owners`](#0x1_multisig_account_owners)
 -  [Function `is_owner`](#0x1_multisig_account_is_owner)
@@ -75,6 +80,7 @@ and implement the governance voting logic on top.
 -  [Function `get_next_transaction_payload`](#0x1_multisig_account_get_next_transaction_payload)
 -  [Function `can_be_executed`](#0x1_multisig_account_can_be_executed)
 -  [Function `can_execute`](#0x1_multisig_account_can_execute)
+-  [Function `can_execute_with_timelock`](#0x1_multisig_account_can_execute_with_timelock)
 -  [Function `can_be_rejected`](#0x1_multisig_account_can_be_rejected)
 -  [Function `can_reject`](#0x1_multisig_account_can_reject)
 -  [Function `get_next_multisig_account_address`](#0x1_multisig_account_get_next_multisig_account_address)
@@ -88,8 +94,12 @@ and implement the governance voting logic on top.
 -  [Function `create_with_existing_account_and_revoke_auth_key`](#0x1_multisig_account_create_with_existing_account_and_revoke_auth_key)
 -  [Function `create`](#0x1_multisig_account_create)
 -  [Function `create_with_owners`](#0x1_multisig_account_create_with_owners)
+-  [Function `create_with_owners_and_timelock`](#0x1_multisig_account_create_with_owners_and_timelock)
 -  [Function `create_with_owners_then_remove_bootstrapper`](#0x1_multisig_account_create_with_owners_then_remove_bootstrapper)
 -  [Function `create_with_owners_internal`](#0x1_multisig_account_create_with_owners_internal)
+-  [Function `upsert_timelock`](#0x1_multisig_account_upsert_timelock)
+-  [Function `upsert_timelock_internal`](#0x1_multisig_account_upsert_timelock_internal)
+-  [Function `remove_timelock`](#0x1_multisig_account_remove_timelock)
 -  [Function `add_owner`](#0x1_multisig_account_add_owner)
 -  [Function `add_owners`](#0x1_multisig_account_add_owners)
 -  [Function `add_owners_and_update_signatures_required`](#0x1_multisig_account_add_owners_and_update_signatures_required)
@@ -133,34 +143,51 @@ and implement the governance voting logic on top.
     -  [High-level Requirements](#high-level-req)
     -  [Module-level Specification](#module-level-spec)
     -  [Function `metadata`](#@Specification_1_metadata)
+    -  [Function `timelock_period`](#@Specification_1_timelock_period)
+    -  [Function `timelock_override_threshold`](#@Specification_1_timelock_override_threshold)
     -  [Function `num_signatures_required`](#@Specification_1_num_signatures_required)
     -  [Function `owners`](#@Specification_1_owners)
+    -  [Function `is_owner`](#@Specification_1_is_owner)
     -  [Function `get_transaction`](#@Specification_1_get_transaction)
     -  [Function `get_next_transaction_payload`](#@Specification_1_get_next_transaction_payload)
     -  [Function `get_next_multisig_account_address`](#@Specification_1_get_next_multisig_account_address)
     -  [Function `last_resolved_sequence_number`](#@Specification_1_last_resolved_sequence_number)
     -  [Function `next_sequence_number`](#@Specification_1_next_sequence_number)
     -  [Function `vote`](#@Specification_1_vote)
+    -  [Function `create_with_owners_and_timelock`](#@Specification_1_create_with_owners_and_timelock)
+    -  [Function `create_with_owners_internal`](#@Specification_1_create_with_owners_internal)
+    -  [Function `upsert_timelock`](#@Specification_1_upsert_timelock)
+    -  [Function `remove_timelock`](#@Specification_1_remove_timelock)
+    -  [Function `create_transaction`](#@Specification_1_create_transaction)
+    -  [Function `create_transaction_with_hash`](#@Specification_1_create_transaction_with_hash)
+    -  [Function `approve_transaction`](#@Specification_1_approve_transaction)
+    -  [Function `reject_transaction`](#@Specification_1_reject_transaction)
+    -  [Function `vote_transanction`](#@Specification_1_vote_transanction)
+    -  [Function `vote_transaction`](#@Specification_1_vote_transaction)
+    -  [Function `execute_rejected_transaction`](#@Specification_1_execute_rejected_transaction)
+    -  [Function `remove_executed_transaction`](#@Specification_1_remove_executed_transaction)
+    -  [Function `validate_owners`](#@Specification_1_validate_owners)
 
 
 <pre><code><b>use</b> <a href="account.md#0x1_account">0x1::account</a>;
-<b>use</b> <a href="../../move-stdlib/doc/bcs.md#0x1_bcs">0x1::bcs</a>;
+<b>use</b> <a href="topo_coin.md#0x1_topo_coin">0x1::topo_coin</a>;
+<b>use</b> <a href="../../topo-stdlib/../move-stdlib/doc/bcs.md#0x1_bcs">0x1::bcs</a>;
 <b>use</b> <a href="chain_id.md#0x1_chain_id">0x1::chain_id</a>;
+<b>use</b> <a href="../../topo-stdlib/../move-stdlib/doc/cmp.md#0x1_cmp">0x1::cmp</a>;
 <b>use</b> <a href="coin.md#0x1_coin">0x1::coin</a>;
 <b>use</b> <a href="create_signer.md#0x1_create_signer">0x1::create_signer</a>;
-<b>use</b> <a href="../../move-stdlib/doc/error.md#0x1_error">0x1::error</a>;
+<b>use</b> <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error">0x1::error</a>;
 <b>use</b> <a href="event.md#0x1_event">0x1::event</a>;
-<b>use</b> <a href="../../move-stdlib/doc/features.md#0x1_features">0x1::features</a>;
+<b>use</b> <a href="../../topo-stdlib/../move-stdlib/doc/features.md#0x1_features">0x1::features</a>;
 <b>use</b> <a href="../../topo-stdlib/doc/from_bcs.md#0x1_from_bcs">0x1::from_bcs</a>;
-<b>use</b> <a href="../../move-stdlib/doc/hash.md#0x1_hash">0x1::hash</a>;
-<b>use</b> <a href="../../move-stdlib/doc/option.md#0x1_option">0x1::option</a>;
-<b>use</b> <a href="../../move-stdlib/doc/signer.md#0x1_signer">0x1::signer</a>;
+<b>use</b> <a href="../../topo-stdlib/../move-stdlib/doc/hash.md#0x1_hash">0x1::hash</a>;
+<b>use</b> <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option">0x1::option</a>;
+<b>use</b> <a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">0x1::signer</a>;
 <b>use</b> <a href="../../topo-stdlib/doc/simple_map.md#0x1_simple_map">0x1::simple_map</a>;
-<b>use</b> <a href="../../move-stdlib/doc/string.md#0x1_string">0x1::string</a>;
+<b>use</b> <a href="../../topo-stdlib/../move-stdlib/doc/string.md#0x1_string">0x1::string</a>;
 <b>use</b> <a href="../../topo-stdlib/doc/table.md#0x1_table">0x1::table</a>;
 <b>use</b> <a href="timestamp.md#0x1_timestamp">0x1::timestamp</a>;
-<b>use</b> <a href="topo_coin.md#0x1_topo_coin">0x1::topo_coin</a>;
-<b>use</b> <a href="../../move-stdlib/doc/vector.md#0x1_vector">0x1::vector</a>;
+<b>use</b> <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">0x1::vector</a>;
 </code></pre>
 
 
@@ -184,7 +211,7 @@ This will be stored in the multisig account (created as a resource account separ
 
 <dl>
 <dt>
-<code>owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;</code>
+<code>owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;</code>
 </dt>
 <dd>
 
@@ -214,13 +241,13 @@ This will be stored in the multisig account (created as a resource account separ
 
 </dd>
 <dt>
-<code>signer_cap: <a href="../../move-stdlib/doc/option.md#0x1_option_Option">option::Option</a>&lt;<a href="account.md#0x1_account_SignerCapability">account::SignerCapability</a>&gt;</code>
+<code>signer_cap: <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_Option">option::Option</a>&lt;<a href="account.md#0x1_account_SignerCapability">account::SignerCapability</a>&gt;</code>
 </dt>
 <dd>
 
 </dd>
 <dt>
-<code>metadata: <a href="../../topo-stdlib/doc/simple_map.md#0x1_simple_map_SimpleMap">simple_map::SimpleMap</a>&lt;<a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>, <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;</code>
+<code>metadata: <a href="../../topo-stdlib/doc/simple_map.md#0x1_simple_map_SimpleMap">simple_map::SimpleMap</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/string.md#0x1_string_String">string::String</a>, <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;</code>
 </dt>
 <dd>
 
@@ -284,6 +311,59 @@ This will be stored in the multisig account (created as a resource account separ
 
 </details>
 
+<a id="0x1_multisig_account_MultisigAccountTimeLock"></a>
+
+## Enum Resource `MultisigAccountTimeLock`
+
+Support for Multisig TimeLock.
+<code>drop</code> is safe here because this resource holds only primitives (no capabilities, no
+event handles). It's used so that <code>remove_timelock</code> can <code><b>move_from</b></code> without destructuring.
+Note that because on-chain transactions cannot realistically be executed in less than a
+second, the resolution of <code>creation_time_secs</code> is at-second granularity — setting/removing
+a timelock within the same on-chain second as a pending transaction's creation is not a
+concern in practice.
+
+
+<pre><code>enum <a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a> <b>has</b> drop, key
+</code></pre>
+
+
+
+<details>
+<summary>Variants</summary>
+
+
+<details>
+<summary>V1</summary>
+
+
+<details>
+<summary>Fields</summary>
+
+
+<dl>
+<dt>
+<code>timelock_period: u64</code>
+</dt>
+<dd>
+ The time lock period in seconds after the creation of the multisig transaction.
+</dd>
+<dt>
+<code>override_threshold: <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_Option">option::Option</a>&lt;u64&gt;</code>
+</dt>
+<dd>
+ The number of approvals required to bypass the timelock and execute immediately.
+ Must be greater than the number of signatures required normally and less than or equal to the number of owners.
+</dd>
+</dl>
+
+
+</details>
+
+</details>
+
+</details>
+
 <a id="0x1_multisig_account_MultisigTransaction"></a>
 
 ## Struct `MultisigTransaction`
@@ -303,13 +383,13 @@ This must contain either the full transaction payload or its hash (stored as byt
 
 <dl>
 <dt>
-<code>payload: <a href="../../move-stdlib/doc/option.md#0x1_option_Option">option::Option</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;</code>
+<code>payload: <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_Option">option::Option</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;</code>
 </dt>
 <dd>
 
 </dd>
 <dt>
-<code>payload_hash: <a href="../../move-stdlib/doc/option.md#0x1_option_Option">option::Option</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;</code>
+<code>payload_hash: <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_Option">option::Option</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;</code>
 </dt>
 <dd>
 
@@ -355,13 +435,13 @@ Contains information about execution failure.
 
 <dl>
 <dt>
-<code>abort_location: <a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a></code>
+<code>abort_location: <a href="../../topo-stdlib/../move-stdlib/doc/string.md#0x1_string_String">string::String</a></code>
 </dt>
 <dd>
 
 </dd>
 <dt>
-<code>error_type: <a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a></code>
+<code>error_type: <a href="../../topo-stdlib/../move-stdlib/doc/string.md#0x1_string_String">string::String</a></code>
 </dt>
 <dd>
 
@@ -413,7 +493,7 @@ Used only for verifying multisig account creation on top of existing accounts.
 
 </dd>
 <dt>
-<code>owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;</code>
+<code>owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;</code>
 </dt>
 <dd>
 
@@ -465,7 +545,7 @@ Used only for verifying multisig account creation on top of existing accounts an
 
 </dd>
 <dt>
-<code>owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;</code>
+<code>owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;</code>
 </dt>
 <dd>
 
@@ -499,7 +579,7 @@ Event emitted when new owners are added to the multisig account.
 
 <dl>
 <dt>
-<code>owners_added: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;</code>
+<code>owners_added: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;</code>
 </dt>
 <dd>
 
@@ -533,7 +613,7 @@ Event emitted when new owners are added to the multisig account.
 
 </dd>
 <dt>
-<code>owners_added: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;</code>
+<code>owners_added: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;</code>
 </dt>
 <dd>
 
@@ -561,7 +641,7 @@ Event emitted when new owners are removed from the multisig account.
 
 <dl>
 <dt>
-<code>owners_removed: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;</code>
+<code>owners_removed: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;</code>
 </dt>
 <dd>
 
@@ -595,7 +675,7 @@ Event emitted when new owners are removed from the multisig account.
 
 </dd>
 <dt>
-<code>owners_removed: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;</code>
+<code>owners_removed: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;</code>
 </dt>
 <dd>
 
@@ -968,7 +1048,7 @@ Event emitted when a transaction is executed.
 
 </dd>
 <dt>
-<code>transaction_payload: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;</code>
+<code>transaction_payload: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;</code>
 </dt>
 <dd>
 
@@ -1020,7 +1100,7 @@ Event emitted when a transaction is executed.
 
 </dd>
 <dt>
-<code>transaction_payload: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;</code>
+<code>transaction_payload: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;</code>
 </dt>
 <dd>
 
@@ -1066,7 +1146,7 @@ Event emitted when a transaction's execution failed.
 
 </dd>
 <dt>
-<code>transaction_payload: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;</code>
+<code>transaction_payload: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;</code>
 </dt>
 <dd>
 
@@ -1124,7 +1204,7 @@ Event emitted when a transaction's execution failed.
 
 </dd>
 <dt>
-<code>transaction_payload: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;</code>
+<code>transaction_payload: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;</code>
 </dt>
 <dd>
 
@@ -1164,13 +1244,13 @@ Event emitted when a transaction's metadata is updated.
 
 <dl>
 <dt>
-<code>old_metadata: <a href="../../topo-stdlib/doc/simple_map.md#0x1_simple_map_SimpleMap">simple_map::SimpleMap</a>&lt;<a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>, <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;</code>
+<code>old_metadata: <a href="../../topo-stdlib/doc/simple_map.md#0x1_simple_map_SimpleMap">simple_map::SimpleMap</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/string.md#0x1_string_String">string::String</a>, <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;</code>
 </dt>
 <dd>
 
 </dd>
 <dt>
-<code>new_metadata: <a href="../../topo-stdlib/doc/simple_map.md#0x1_simple_map_SimpleMap">simple_map::SimpleMap</a>&lt;<a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>, <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;</code>
+<code>new_metadata: <a href="../../topo-stdlib/doc/simple_map.md#0x1_simple_map_SimpleMap">simple_map::SimpleMap</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/string.md#0x1_string_String">string::String</a>, <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;</code>
 </dt>
 <dd>
 
@@ -1204,13 +1284,81 @@ Event emitted when a transaction's metadata is updated.
 
 </dd>
 <dt>
-<code>old_metadata: <a href="../../topo-stdlib/doc/simple_map.md#0x1_simple_map_SimpleMap">simple_map::SimpleMap</a>&lt;<a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>, <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;</code>
+<code>old_metadata: <a href="../../topo-stdlib/doc/simple_map.md#0x1_simple_map_SimpleMap">simple_map::SimpleMap</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/string.md#0x1_string_String">string::String</a>, <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;</code>
 </dt>
 <dd>
 
 </dd>
 <dt>
-<code>new_metadata: <a href="../../topo-stdlib/doc/simple_map.md#0x1_simple_map_SimpleMap">simple_map::SimpleMap</a>&lt;<a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>, <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;</code>
+<code>new_metadata: <a href="../../topo-stdlib/doc/simple_map.md#0x1_simple_map_SimpleMap">simple_map::SimpleMap</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/string.md#0x1_string_String">string::String</a>, <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;</code>
+</dt>
+<dd>
+
+</dd>
+</dl>
+
+
+</details>
+
+<a id="0x1_multisig_account_TimelockUpdated"></a>
+
+## Struct `TimelockUpdated`
+
+
+
+<pre><code>#[<a href="event.md#0x1_event">event</a>]
+<b>struct</b> <a href="multisig_account.md#0x1_multisig_account_TimelockUpdated">TimelockUpdated</a> <b>has</b> drop, store
+</code></pre>
+
+
+
+<details>
+<summary>Fields</summary>
+
+
+<dl>
+<dt>
+<code><a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b></code>
+</dt>
+<dd>
+
+</dd>
+<dt>
+<code>timelock_period: u64</code>
+</dt>
+<dd>
+
+</dd>
+<dt>
+<code>override_threshold: <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_Option">option::Option</a>&lt;u64&gt;</code>
+</dt>
+<dd>
+
+</dd>
+</dl>
+
+
+</details>
+
+<a id="0x1_multisig_account_TimelockRemoved"></a>
+
+## Struct `TimelockRemoved`
+
+
+
+<pre><code>#[<a href="event.md#0x1_event">event</a>]
+<b>struct</b> <a href="multisig_account.md#0x1_multisig_account_TimelockRemoved">TimelockRemoved</a> <b>has</b> drop, store
+</code></pre>
+
+
+
+<details>
+<summary>Fields</summary>
+
+
+<dl>
+<dt>
+<code><a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b></code>
 </dt>
 <dd>
 
@@ -1229,7 +1377,7 @@ Event emitted when a transaction's metadata is updated.
 
 
 
-<pre><code><b>const</b> <a href="multisig_account.md#0x1_multisig_account_ZERO_AUTH_KEY">ZERO_AUTH_KEY</a>: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt; = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+<pre><code><b>const</b> <a href="multisig_account.md#0x1_multisig_account_ZERO_AUTH_KEY">ZERO_AUTH_KEY</a>: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt; = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 </code></pre>
 
 
@@ -1241,7 +1389,7 @@ This is used to avoid conflicts with other modules that also create resource acc
 account.
 
 
-<pre><code><b>const</b> <a href="multisig_account.md#0x1_multisig_account_DOMAIN_SEPARATOR">DOMAIN_SEPARATOR</a>: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt; = [116, 111, 112, 111, 95, 102, 114, 97, 109, 101, 119, 111, 114, 107, 58, 58, 109, 117, 108, 116, 105, 115, 105, 103, 95, 97, 99, 99, 111, 117, 110, 116];
+<pre><code><b>const</b> <a href="multisig_account.md#0x1_multisig_account_DOMAIN_SEPARATOR">DOMAIN_SEPARATOR</a>: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt; = [97, 112, 116, 111, 115, 95, 102, 114, 97, 109, 101, 119, 111, 114, 107, 58, 58, 109, 117, 108, 116, 105, 115, 105, 103, 95, 97, 99, 99, 111, 117, 110, 116];
 </code></pre>
 
 
@@ -1302,6 +1450,26 @@ Number of signatures required must be more than zero and at most the total numbe
 
 
 <pre><code><b>const</b> <a href="multisig_account.md#0x1_multisig_account_EINVALID_SIGNATURES_REQUIRED">EINVALID_SIGNATURES_REQUIRED</a>: u64 = 11;
+</code></pre>
+
+
+
+<a id="0x1_multisig_account_EINVALID_TIMELOCK_DURATION"></a>
+
+Timelock period must be between MIN_TIMELOCK_PERIOD and MAX_TIMELOCK_PERIOD.
+
+
+<pre><code><b>const</b> <a href="multisig_account.md#0x1_multisig_account_EINVALID_TIMELOCK_DURATION">EINVALID_TIMELOCK_DURATION</a>: u64 = 21;
+</code></pre>
+
+
+
+<a id="0x1_multisig_account_EINVALID_TIMELOCK_OVERRIDE_THRESHOLD"></a>
+
+Timelock override threshold must be greater than num_signatures_required and at most the number of owners.
+
+
+<pre><code><b>const</b> <a href="multisig_account.md#0x1_multisig_account_EINVALID_TIMELOCK_OVERRIDE_THRESHOLD">EINVALID_TIMELOCK_OVERRIDE_THRESHOLD</a>: u64 = 22;
 </code></pre>
 
 
@@ -1436,6 +1604,36 @@ Provided target function does not match the hash stored in the on-chain transact
 
 
 
+<a id="0x1_multisig_account_ETIMELOCK_DOES_NOT_EXIST"></a>
+
+No timelock configuration exists for the multisig account.
+
+
+<pre><code><b>const</b> <a href="multisig_account.md#0x1_multisig_account_ETIMELOCK_DOES_NOT_EXIST">ETIMELOCK_DOES_NOT_EXIST</a>: u64 = 24;
+</code></pre>
+
+
+
+<a id="0x1_multisig_account_ETIMELOCK_NOT_ENABLED"></a>
+
+Feature flag for multisig timelock is not enabled.
+
+
+<pre><code><b>const</b> <a href="multisig_account.md#0x1_multisig_account_ETIMELOCK_NOT_ENABLED">ETIMELOCK_NOT_ENABLED</a>: u64 = 25;
+</code></pre>
+
+
+
+<a id="0x1_multisig_account_ETIMELOCK_NOT_EXPIRED"></a>
+
+Transaction has enough approvals but the timelock period has not yet elapsed.
+
+
+<pre><code><b>const</b> <a href="multisig_account.md#0x1_multisig_account_ETIMELOCK_NOT_EXPIRED">ETIMELOCK_NOT_EXPIRED</a>: u64 = 23;
+</code></pre>
+
+
+
 <a id="0x1_multisig_account_ETRANSACTION_NOT_FOUND"></a>
 
 Transaction with specified id cannot be found.
@@ -1455,6 +1653,26 @@ Transaction with specified id cannot be found.
 
 
 
+<a id="0x1_multisig_account_MAX_TIMELOCK_PERIOD"></a>
+
+Maximum timelock period: 14 days.
+
+
+<pre><code><b>const</b> <a href="multisig_account.md#0x1_multisig_account_MAX_TIMELOCK_PERIOD">MAX_TIMELOCK_PERIOD</a>: u64 = 1209600;
+</code></pre>
+
+
+
+<a id="0x1_multisig_account_MIN_TIMELOCK_PERIOD"></a>
+
+Minimum timelock period: 1 hour.
+
+
+<pre><code><b>const</b> <a href="multisig_account.md#0x1_multisig_account_MIN_TIMELOCK_PERIOD">MIN_TIMELOCK_PERIOD</a>: u64 = 3600;
+</code></pre>
+
+
+
 <a id="0x1_multisig_account_metadata"></a>
 
 ## Function `metadata`
@@ -1463,7 +1681,7 @@ Return the multisig account's metadata.
 
 
 <pre><code>#[view]
-<b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_metadata">metadata</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): <a href="../../topo-stdlib/doc/simple_map.md#0x1_simple_map_SimpleMap">simple_map::SimpleMap</a>&lt;<a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>, <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;
+<b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_metadata">metadata</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): <a href="../../topo-stdlib/doc/simple_map.md#0x1_simple_map_SimpleMap">simple_map::SimpleMap</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/string.md#0x1_string_String">string::String</a>, <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;
 </code></pre>
 
 
@@ -1472,8 +1690,68 @@ Return the multisig account's metadata.
 <summary>Implementation</summary>
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_metadata">metadata</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): SimpleMap&lt;String, <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt; <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_metadata">metadata</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): SimpleMap&lt;String, <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt; {
     <b>borrow_global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>).metadata
+}
+</code></pre>
+
+
+
+</details>
+
+<a id="0x1_multisig_account_timelock_period"></a>
+
+## Function `timelock_period`
+
+Return the timelock period in seconds, or 0 if no timelock is configured.
+
+
+<pre><code>#[view]
+<b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_timelock_period">timelock_period</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): u64
+</code></pre>
+
+
+
+<details>
+<summary>Implementation</summary>
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_timelock_period">timelock_period</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): u64 {
+    <b>if</b> (<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>)) {
+        (&<a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a>[<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>]).timelock_period
+    } <b>else</b> {
+        0
+    }
+}
+</code></pre>
+
+
+
+</details>
+
+<a id="0x1_multisig_account_timelock_override_threshold"></a>
+
+## Function `timelock_override_threshold`
+
+Return the number of approvals required to bypass the timelock, or 0 if no timelock is configured.
+
+
+<pre><code>#[view]
+<b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_timelock_override_threshold">timelock_override_threshold</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_Option">option::Option</a>&lt;u64&gt;
+</code></pre>
+
+
+
+<details>
+<summary>Implementation</summary>
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_timelock_override_threshold">timelock_override_threshold</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): Option&lt;u64&gt; {
+    <b>if</b> (<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>)) {
+        (&<a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a>[<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>]).override_threshold
+    } <b>else</b> {
+       <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_none">option::none</a>()
+    }
 }
 </code></pre>
 
@@ -1499,7 +1777,7 @@ multisig account.
 <summary>Implementation</summary>
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_num_signatures_required">num_signatures_required</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): u64 <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_num_signatures_required">num_signatures_required</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): u64 {
     <b>borrow_global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>).num_signatures_required
 }
 </code></pre>
@@ -1516,7 +1794,7 @@ Return a vector of all of the provided multisig account's owners.
 
 
 <pre><code>#[view]
-<b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_owners">owners</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;
+<b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_owners">owners</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;
 </code></pre>
 
 
@@ -1525,7 +1803,7 @@ Return a vector of all of the provided multisig account's owners.
 <summary>Implementation</summary>
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_owners">owners</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt; <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_owners">owners</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt; {
     <b>borrow_global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>).owners
 }
 </code></pre>
@@ -1551,7 +1829,7 @@ Return true if the provided owner is an owner of the provided multisig account.
 <summary>Implementation</summary>
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_is_owner">is_owner</a>(owner: <b>address</b>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): bool <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_is_owner">is_owner</a>(owner: <b>address</b>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): bool {
     <b>borrow_global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>).owners.contains(&owner)
 }
 </code></pre>
@@ -1580,11 +1858,11 @@ Return the transaction with the given transaction id.
 <pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_get_transaction">get_transaction</a>(
     <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>,
     sequence_number: u64,
-): <a href="multisig_account.md#0x1_multisig_account_MultisigTransaction">MultisigTransaction</a> <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+): <a href="multisig_account.md#0x1_multisig_account_MultisigTransaction">MultisigTransaction</a> {
     <b>let</b> multisig_account_resource = <b>borrow_global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     <b>assert</b>!(
         sequence_number &gt; 0 && sequence_number &lt; multisig_account_resource.next_sequence_number,
-        <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EINVALID_SEQUENCE_NUMBER">EINVALID_SEQUENCE_NUMBER</a>),
+        <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EINVALID_SEQUENCE_NUMBER">EINVALID_SEQUENCE_NUMBER</a>),
     );
     *multisig_account_resource.transactions.borrow(sequence_number)
 }
@@ -1602,7 +1880,7 @@ Return all pending transactions.
 
 
 <pre><code>#[view]
-<b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_get_pending_transactions">get_pending_transactions</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigTransaction">multisig_account::MultisigTransaction</a>&gt;
+<b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_get_pending_transactions">get_pending_transactions</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigTransaction">multisig_account::MultisigTransaction</a>&gt;
 </code></pre>
 
 
@@ -1613,8 +1891,8 @@ Return all pending transactions.
 
 <pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_get_pending_transactions">get_pending_transactions</a>(
     <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>
-): <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigTransaction">MultisigTransaction</a>&gt; <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
-    <b>let</b> pending_transactions: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigTransaction">MultisigTransaction</a>&gt; = <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>[];
+): <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigTransaction">MultisigTransaction</a>&gt; {
+    <b>let</b> pending_transactions: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigTransaction">MultisigTransaction</a>&gt; = <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>[];
     <b>let</b> <a href="multisig_account.md#0x1_multisig_account">multisig_account</a> = <b>borrow_global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     <b>let</b> i = <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>.last_executed_sequence_number + 1;
     <b>let</b> next_sequence_number = <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>.next_sequence_number;
@@ -1638,7 +1916,7 @@ Return the payload for the next transaction in the queue.
 
 
 <pre><code>#[view]
-<b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_get_next_transaction_payload">get_next_transaction_payload</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, provided_payload: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;): <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;
+<b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_get_next_transaction_payload">get_next_transaction_payload</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, provided_payload: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;): <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;
 </code></pre>
 
 
@@ -1648,7 +1926,7 @@ Return the payload for the next transaction in the queue.
 
 
 <pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_get_next_transaction_payload">get_next_transaction_payload</a>(
-    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, provided_payload: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;): <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt; <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, provided_payload: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;): <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt; {
     <b>let</b> multisig_account_resource = <b>borrow_global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     <b>let</b> sequence_number = multisig_account_resource.last_executed_sequence_number + 1;
     <b>let</b> transaction = multisig_account_resource.transactions.borrow(sequence_number);
@@ -1682,11 +1960,12 @@ Return true if the transaction with given transaction id can be executed now.
 <summary>Implementation</summary>
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_can_be_executed">can_be_executed</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64): bool <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_can_be_executed">can_be_executed</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64): bool {
     <a href="multisig_account.md#0x1_multisig_account_assert_valid_sequence_number">assert_valid_sequence_number</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number);
     <b>let</b> (num_approvals, _) = <a href="multisig_account.md#0x1_multisig_account_num_approvals_and_rejections">num_approvals_and_rejections</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number);
+
     sequence_number == <a href="multisig_account.md#0x1_multisig_account_last_resolved_sequence_number">last_resolved_sequence_number</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>) + 1 &&
-        num_approvals &gt;= <a href="multisig_account.md#0x1_multisig_account_num_signatures_required">num_signatures_required</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>)
+        num_approvals &gt;= <a href="multisig_account.md#0x1_multisig_account_num_signatures_required">num_signatures_required</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>) && <a href="multisig_account.md#0x1_multisig_account_can_execute_with_timelock">can_execute_with_timelock</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number, num_approvals)
 }
 </code></pre>
 
@@ -1711,15 +1990,58 @@ Return true if the owner can execute the transaction with given transaction id n
 <summary>Implementation</summary>
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_can_execute">can_execute</a>(owner: <b>address</b>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64): bool <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_can_execute">can_execute</a>(owner: <b>address</b>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64): bool {
     <a href="multisig_account.md#0x1_multisig_account_assert_valid_sequence_number">assert_valid_sequence_number</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number);
     <b>let</b> (num_approvals, _) = <a href="multisig_account.md#0x1_multisig_account_num_approvals_and_rejections">num_approvals_and_rejections</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number);
     <b>if</b> (!<a href="multisig_account.md#0x1_multisig_account_has_voted_for_approval">has_voted_for_approval</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number, owner)) {
         num_approvals += 1;
     };
+
     <a href="multisig_account.md#0x1_multisig_account_is_owner">is_owner</a>(owner, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>) &&
         sequence_number == <a href="multisig_account.md#0x1_multisig_account_last_resolved_sequence_number">last_resolved_sequence_number</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>) + 1 &&
-        num_approvals &gt;= <a href="multisig_account.md#0x1_multisig_account_num_signatures_required">num_signatures_required</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>)
+        num_approvals &gt;= <a href="multisig_account.md#0x1_multisig_account_num_signatures_required">num_signatures_required</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>) && <a href="multisig_account.md#0x1_multisig_account_can_execute_with_timelock">can_execute_with_timelock</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number, num_approvals)
+}
+</code></pre>
+
+
+
+</details>
+
+<a id="0x1_multisig_account_can_execute_with_timelock"></a>
+
+## Function `can_execute_with_timelock`
+
+Return true if the transaction with given transaction id can be executed immediately, or it has to wait
+for the timelock to expire.
+
+
+<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_can_execute_with_timelock">can_execute_with_timelock</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64, num_approvals: u64): bool
+</code></pre>
+
+
+
+<details>
+<summary>Implementation</summary>
+
+
+<pre><code>inline <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_can_execute_with_timelock">can_execute_with_timelock</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64, num_approvals: u64): bool {
+    <b>if</b> (<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>)) {
+        <b>let</b> multisig_account_resource = &<a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a>[<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>];
+        <b>let</b> timelock = multisig_account_resource.timelock_period;
+        <b>let</b> override_threshold = multisig_account_resource.override_threshold;
+
+        // Get the pending transaction <b>to</b> check <b>if</b> the timelock <b>has</b> expired
+        // Assume that the transaction <b>has</b> already been checked <b>to</b> exist and is valid
+        <b>let</b> pending_transaction = <a href="multisig_account.md#0x1_multisig_account_get_transaction">get_transaction</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number);
+
+        // Use subtraction <b>to</b> avoid overflow (now_seconds() &gt;= creation_time_secs is always <b>true</b>)
+        <b>let</b> elapsed = now_seconds() - pending_transaction.creation_time_secs;
+
+        // If the number of approvals meets the override threshold, or the timelock <b>has</b> expired, allow execution
+        (override_threshold.is_some() && &num_approvals &gt;= override_threshold.borrow()) || elapsed &gt;= timelock
+    } <b>else</b> {
+        <b>true</b>
+    }
 }
 </code></pre>
 
@@ -1744,7 +2066,7 @@ Return true if the transaction with given transaction id can be officially rejec
 <summary>Implementation</summary>
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_can_be_rejected">can_be_rejected</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64): bool <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_can_be_rejected">can_be_rejected</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64): bool {
     <a href="multisig_account.md#0x1_multisig_account_assert_valid_sequence_number">assert_valid_sequence_number</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number);
     <b>let</b> (_, num_rejections) = <a href="multisig_account.md#0x1_multisig_account_num_approvals_and_rejections">num_approvals_and_rejections</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number);
     sequence_number == <a href="multisig_account.md#0x1_multisig_account_last_resolved_sequence_number">last_resolved_sequence_number</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>) + 1 &&
@@ -1773,7 +2095,7 @@ Return true if the owner can execute the "rejected" transaction with given trans
 <summary>Implementation</summary>
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_can_reject">can_reject</a>(owner: <b>address</b>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64): bool <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_can_reject">can_reject</a>(owner: <b>address</b>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64): bool {
     <a href="multisig_account.md#0x1_multisig_account_assert_valid_sequence_number">assert_valid_sequence_number</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number);
     <b>let</b> (_, num_rejections) = <a href="multisig_account.md#0x1_multisig_account_num_approvals_and_rejections">num_approvals_and_rejections</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number);
     <b>if</b> (!<a href="multisig_account.md#0x1_multisig_account_has_voted_for_rejection">has_voted_for_rejection</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number, owner)) {
@@ -1833,7 +2155,7 @@ Return the id of the last transaction that was executed (successful or failed) o
 <summary>Implementation</summary>
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_last_resolved_sequence_number">last_resolved_sequence_number</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): u64 <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_last_resolved_sequence_number">last_resolved_sequence_number</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): u64 {
     <b>let</b> multisig_account_resource = <b>borrow_global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     multisig_account_resource.last_executed_sequence_number
 }
@@ -1860,7 +2182,7 @@ Return the id of the next transaction created.
 <summary>Implementation</summary>
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_next_sequence_number">next_sequence_number</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): u64 <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_next_sequence_number">next_sequence_number</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): u64 {
     <b>let</b> multisig_account_resource = <b>borrow_global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     multisig_account_resource.next_sequence_number
 }
@@ -1888,11 +2210,11 @@ Return a bool tuple indicating whether an owner has voted and if so, whether the
 
 
 <pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_vote">vote</a>(
-    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64, owner: <b>address</b>): (bool, bool) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64, owner: <b>address</b>): (bool, bool) {
     <b>let</b> multisig_account_resource = <b>borrow_global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     <b>assert</b>!(
         sequence_number &gt; 0 && sequence_number &lt; multisig_account_resource.next_sequence_number,
-        <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EINVALID_SEQUENCE_NUMBER">EINVALID_SEQUENCE_NUMBER</a>),
+        <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EINVALID_SEQUENCE_NUMBER">EINVALID_SEQUENCE_NUMBER</a>),
     );
     <b>let</b> transaction = multisig_account_resource.transactions.borrow(sequence_number);
     <b>let</b> votes = &transaction.votes;
@@ -1922,7 +2244,7 @@ Return a bool tuple indicating whether an owner has voted and if so, whether the
 <summary>Implementation</summary>
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_available_transaction_queue_capacity">available_transaction_queue_capacity</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): u64 <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+<pre><code><b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_available_transaction_queue_capacity">available_transaction_queue_capacity</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): u64 {
     <b>let</b> multisig_account_resource = <b>borrow_global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     <b>let</b> num_pending_transactions = multisig_account_resource.next_sequence_number - multisig_account_resource.last_executed_sequence_number - 1;
     <b>if</b> (num_pending_transactions &gt; <a href="multisig_account.md#0x1_multisig_account_MAX_PENDING_TRANSACTIONS">MAX_PENDING_TRANSACTIONS</a>) {
@@ -1950,7 +2272,7 @@ key after they are fully migrated to the new multisig account. Alternatively, th
 create_with_existing_account_and_revoke_auth_key_call instead.
 
 
-<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_existing_account_call">create_with_existing_account_call</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, num_signatures_required: u64, metadata_keys: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>&gt;, metadata_values: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;)
+<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_existing_account_call">create_with_existing_account_call</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, num_signatures_required: u64, metadata_keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/string.md#0x1_string_String">string::String</a>&gt;, metadata_values: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;)
 </code></pre>
 
 
@@ -1960,17 +2282,17 @@ create_with_existing_account_and_revoke_auth_key_call instead.
 
 
 <pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_existing_account_call">create_with_existing_account_call</a>(
-    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
-    owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
+    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
+    owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
     num_signatures_required: u64,
-    metadata_keys: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;String&gt;,
-    metadata_values: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;,
-) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+    metadata_keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;String&gt;,
+    metadata_values: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;,
+) {
     <a href="multisig_account.md#0x1_multisig_account_create_with_owners_internal">create_with_owners_internal</a>(
         <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>,
         owners,
         num_signatures_required,
-        <a href="../../move-stdlib/doc/option.md#0x1_option_none">option::none</a>&lt;SignerCapability&gt;(),
+        <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_none">option::none</a>&lt;SignerCapability&gt;(),
         metadata_keys,
         metadata_values,
     );
@@ -1996,7 +2318,7 @@ key after they are fully migrated to the new multisig account. Alternatively, th
 create_with_existing_account_and_revoke_auth_key instead.
 
 
-<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_existing_account">create_with_existing_account</a>(multisig_address: <b>address</b>, owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, num_signatures_required: u64, account_scheme: u8, account_public_key: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;, create_multisig_account_signed_message: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;, metadata_keys: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>&gt;, metadata_values: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;)
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_existing_account">create_with_existing_account</a>(multisig_address: <b>address</b>, owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, num_signatures_required: u64, account_scheme: u8, account_public_key: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;, create_multisig_account_signed_message: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;, metadata_keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/string.md#0x1_string_String">string::String</a>&gt;, metadata_values: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;)
 </code></pre>
 
 
@@ -2007,14 +2329,14 @@ create_with_existing_account_and_revoke_auth_key instead.
 
 <pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_existing_account">create_with_existing_account</a>(
     multisig_address: <b>address</b>,
-    owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
+    owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
     num_signatures_required: u64,
     account_scheme: u8,
-    account_public_key: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;,
-    create_multisig_account_signed_message: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;,
-    metadata_keys: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;String&gt;,
-    metadata_values: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;,
-) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+    account_public_key: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;,
+    create_multisig_account_signed_message: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;,
+    metadata_keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;String&gt;,
+    metadata_values: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;,
+) {
     // Verify that the `<a href="multisig_account.md#0x1_multisig_account_MultisigAccountCreationMessage">MultisigAccountCreationMessage</a>` <b>has</b> the right information and is signed by the <a href="account.md#0x1_account">account</a>
     // owner's key.
     <b>let</b> proof_challenge = <a href="multisig_account.md#0x1_multisig_account_MultisigAccountCreationMessage">MultisigAccountCreationMessage</a> {
@@ -2032,7 +2354,7 @@ create_with_existing_account_and_revoke_auth_key instead.
         proof_challenge,
     );
 
-    // We create the <a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a> for the multisig <a href="account.md#0x1_account">account</a> here since this is required <b>to</b> add the <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> resource
+    // We create the <a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a> for the multisig <a href="account.md#0x1_account">account</a> here since this is required <b>to</b> add the <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> resource
     // This should be safe and authorized because we have verified the signed message from the existing <a href="account.md#0x1_account">account</a>
     // that authorizes creating a multisig <a href="account.md#0x1_account">account</a> <b>with</b> the specified owners and signature threshold.
     <b>let</b> <a href="multisig_account.md#0x1_multisig_account">multisig_account</a> = &<a href="create_signer.md#0x1_create_signer">create_signer</a>(multisig_address);
@@ -2040,7 +2362,7 @@ create_with_existing_account_and_revoke_auth_key instead.
         <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>,
         owners,
         num_signatures_required,
-        <a href="../../move-stdlib/doc/option.md#0x1_option_none">option::none</a>&lt;SignerCapability&gt;(),
+        <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_none">option::none</a>&lt;SignerCapability&gt;(),
         metadata_keys,
         metadata_values,
     );
@@ -2063,7 +2385,7 @@ SignerCapability of the resource account still exists, it can still be used to g
 account.
 
 
-<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_existing_account_and_revoke_auth_key_call">create_with_existing_account_and_revoke_auth_key_call</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, num_signatures_required: u64, metadata_keys: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>&gt;, metadata_values: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;)
+<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_existing_account_and_revoke_auth_key_call">create_with_existing_account_and_revoke_auth_key_call</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, num_signatures_required: u64, metadata_keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/string.md#0x1_string_String">string::String</a>&gt;, metadata_values: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;)
 </code></pre>
 
 
@@ -2073,17 +2395,17 @@ account.
 
 
 <pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_existing_account_and_revoke_auth_key_call">create_with_existing_account_and_revoke_auth_key_call</a>(
-    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
-    owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
+    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
+    owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
     num_signatures_required: u64,
-    metadata_keys: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;String&gt;,
-    metadata_values:<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;,
-) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+    metadata_keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;String&gt;,
+    metadata_values:<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;,
+) {
     <a href="multisig_account.md#0x1_multisig_account_create_with_owners_internal">create_with_owners_internal</a>(
         <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>,
         owners,
         num_signatures_required,
-        <a href="../../move-stdlib/doc/option.md#0x1_option_none">option::none</a>&lt;SignerCapability&gt;(),
+        <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_none">option::none</a>&lt;SignerCapability&gt;(),
         metadata_keys,
         metadata_values,
     );
@@ -2091,7 +2413,7 @@ account.
     // Rotate the <a href="account.md#0x1_account">account</a>'s auth key <b>to</b> 0x0, which effectively revokes control via auth key.
     <b>let</b> multisig_address = address_of(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     <a href="account.md#0x1_account_rotate_authentication_key_internal">account::rotate_authentication_key_internal</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, <a href="multisig_account.md#0x1_multisig_account_ZERO_AUTH_KEY">ZERO_AUTH_KEY</a>);
-    // This also needs <b>to</b> revoke <a href="../../topo-stdlib/doc/any.md#0x1_any">any</a> <a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a> <a href="../../topo-stdlib/doc/capability.md#0x1_capability">capability</a> or rotation <a href="../../topo-stdlib/doc/capability.md#0x1_capability">capability</a> that <b>exists</b> for the <a href="account.md#0x1_account">account</a> <b>to</b>
+    // This also needs <b>to</b> revoke <a href="../../topo-stdlib/doc/any.md#0x1_any">any</a> <a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a> <a href="../../topo-stdlib/doc/capability.md#0x1_capability">capability</a> or rotation <a href="../../topo-stdlib/doc/capability.md#0x1_capability">capability</a> that <b>exists</b> for the <a href="account.md#0x1_account">account</a> <b>to</b>
     // completely remove all access <b>to</b> the <a href="account.md#0x1_account">account</a>.
     <b>if</b> (<a href="account.md#0x1_account_is_signer_capability_offered">account::is_signer_capability_offered</a>(multisig_address)) {
         <a href="account.md#0x1_account_revoke_any_signer_capability">account::revoke_any_signer_capability</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
@@ -2117,7 +2439,7 @@ SignerCapability of the resource account still exists, it can still be used to g
 account.
 
 
-<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_existing_account_and_revoke_auth_key">create_with_existing_account_and_revoke_auth_key</a>(multisig_address: <b>address</b>, owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, num_signatures_required: u64, account_scheme: u8, account_public_key: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;, create_multisig_account_signed_message: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;, metadata_keys: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>&gt;, metadata_values: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;)
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_existing_account_and_revoke_auth_key">create_with_existing_account_and_revoke_auth_key</a>(multisig_address: <b>address</b>, owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, num_signatures_required: u64, account_scheme: u8, account_public_key: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;, create_multisig_account_signed_message: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;, metadata_keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/string.md#0x1_string_String">string::String</a>&gt;, metadata_values: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;)
 </code></pre>
 
 
@@ -2128,14 +2450,14 @@ account.
 
 <pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_existing_account_and_revoke_auth_key">create_with_existing_account_and_revoke_auth_key</a>(
     multisig_address: <b>address</b>,
-    owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
+    owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
     num_signatures_required: u64,
     account_scheme: u8,
-    account_public_key: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;,
-    create_multisig_account_signed_message: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;,
-    metadata_keys: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;String&gt;,
-    metadata_values: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;,
-) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+    account_public_key: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;,
+    create_multisig_account_signed_message: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;,
+    metadata_keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;String&gt;,
+    metadata_values: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;,
+) {
     // Verify that the `<a href="multisig_account.md#0x1_multisig_account_MultisigAccountCreationMessage">MultisigAccountCreationMessage</a>` <b>has</b> the right information and is signed by the <a href="account.md#0x1_account">account</a>
     // owner's key.
     <b>let</b> proof_challenge = <a href="multisig_account.md#0x1_multisig_account_MultisigAccountCreationWithAuthKeyRevocationMessage">MultisigAccountCreationWithAuthKeyRevocationMessage</a> {
@@ -2153,7 +2475,7 @@ account.
         proof_challenge,
     );
 
-    // We create the <a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a> for the multisig <a href="account.md#0x1_account">account</a> here since this is required <b>to</b> add the <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> resource
+    // We create the <a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a> for the multisig <a href="account.md#0x1_account">account</a> here since this is required <b>to</b> add the <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> resource
     // This should be safe and authorized because we have verified the signed message from the existing <a href="account.md#0x1_account">account</a>
     // that authorizes creating a multisig <a href="account.md#0x1_account">account</a> <b>with</b> the specified owners and signature threshold.
     <b>let</b> <a href="multisig_account.md#0x1_multisig_account">multisig_account</a> = &<a href="create_signer.md#0x1_create_signer">create_signer</a>(multisig_address);
@@ -2161,7 +2483,7 @@ account.
         <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>,
         owners,
         num_signatures_required,
-        <a href="../../move-stdlib/doc/option.md#0x1_option_none">option::none</a>&lt;SignerCapability&gt;(),
+        <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_none">option::none</a>&lt;SignerCapability&gt;(),
         metadata_keys,
         metadata_values,
     );
@@ -2169,7 +2491,7 @@ account.
     // Rotate the <a href="account.md#0x1_account">account</a>'s auth key <b>to</b> 0x0, which effectively revokes control via auth key.
     <b>let</b> multisig_address = address_of(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     <a href="account.md#0x1_account_rotate_authentication_key_internal">account::rotate_authentication_key_internal</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, <a href="multisig_account.md#0x1_multisig_account_ZERO_AUTH_KEY">ZERO_AUTH_KEY</a>);
-    // This also needs <b>to</b> revoke <a href="../../topo-stdlib/doc/any.md#0x1_any">any</a> <a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a> <a href="../../topo-stdlib/doc/capability.md#0x1_capability">capability</a> or rotation <a href="../../topo-stdlib/doc/capability.md#0x1_capability">capability</a> that <b>exists</b> for the <a href="account.md#0x1_account">account</a> <b>to</b>
+    // This also needs <b>to</b> revoke <a href="../../topo-stdlib/doc/any.md#0x1_any">any</a> <a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a> <a href="../../topo-stdlib/doc/capability.md#0x1_capability">capability</a> or rotation <a href="../../topo-stdlib/doc/capability.md#0x1_capability">capability</a> that <b>exists</b> for the <a href="account.md#0x1_account">account</a> <b>to</b>
     // completely remove all access <b>to</b> the <a href="account.md#0x1_account">account</a>.
     <b>if</b> (<a href="account.md#0x1_account_is_signer_capability_offered">account::is_signer_capability_offered</a>(multisig_address)) {
         <a href="account.md#0x1_account_revoke_any_signer_capability">account::revoke_any_signer_capability</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
@@ -2191,7 +2513,7 @@ account.
 Creates a new multisig account and add the signer as a single owner.
 
 
-<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create">create</a>(owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, num_signatures_required: u64, metadata_keys: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>&gt;, metadata_values: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;)
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create">create</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, num_signatures_required: u64, metadata_keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/string.md#0x1_string_String">string::String</a>&gt;, metadata_values: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;)
 </code></pre>
 
 
@@ -2201,12 +2523,12 @@ Creates a new multisig account and add the signer as a single owner.
 
 
 <pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create">create</a>(
-    owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
+    owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
     num_signatures_required: u64,
-    metadata_keys: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;String&gt;,
-    metadata_values: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;,
-) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
-    <a href="multisig_account.md#0x1_multisig_account_create_with_owners">create_with_owners</a>(owner, <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>[], num_signatures_required, metadata_keys, metadata_values);
+    metadata_keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;String&gt;,
+    metadata_values: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;,
+) {
+    <a href="multisig_account.md#0x1_multisig_account_create_with_owners">create_with_owners</a>(owner, <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>[], num_signatures_required, metadata_keys, metadata_values);
 }
 </code></pre>
 
@@ -2226,7 +2548,7 @@ cannot be any duplicate owners in the list.
 at most the total number of owners.
 
 
-<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_owners">create_with_owners</a>(owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, additional_owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, num_signatures_required: u64, metadata_keys: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>&gt;, metadata_values: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;)
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_owners">create_with_owners</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, additional_owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, num_signatures_required: u64, metadata_keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/string.md#0x1_string_String">string::String</a>&gt;, metadata_values: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;)
 </code></pre>
 
 
@@ -2236,22 +2558,89 @@ at most the total number of owners.
 
 
 <pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_owners">create_with_owners</a>(
-    owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
-    additional_owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
+    owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
+    additional_owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
     num_signatures_required: u64,
-    metadata_keys: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;String&gt;,
-    metadata_values: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;,
-) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+    metadata_keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;String&gt;,
+    metadata_values: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;,
+) {
     <b>let</b> (<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, multisig_signer_cap) = <a href="multisig_account.md#0x1_multisig_account_create_multisig_account">create_multisig_account</a>(owner);
     additional_owners.push_back(address_of(owner));
     <a href="multisig_account.md#0x1_multisig_account_create_with_owners_internal">create_with_owners_internal</a>(
         &<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>,
         additional_owners,
         num_signatures_required,
-        <a href="../../move-stdlib/doc/option.md#0x1_option_some">option::some</a>(multisig_signer_cap),
+        <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_some">option::some</a>(multisig_signer_cap),
         metadata_keys,
         metadata_values,
     );
+}
+</code></pre>
+
+
+
+</details>
+
+<a id="0x1_multisig_account_create_with_owners_and_timelock"></a>
+
+## Function `create_with_owners_and_timelock`
+
+Like <code>create_with_owners</code>, but also configures a timelock at creation time so the initial
+queue is protected by the timelock from the very first transaction.
+
+<code>timelock_period</code> and <code>override_threshold</code> are two separate <code>Option&lt;u64&gt;</code> because entry
+function arguments cannot carry tuple-typed options. If <code>timelock_period</code> is <code>None</code> no
+timelock is configured and <code>override_threshold</code> must also be <code>None</code>. If <code>timelock_period</code>
+is <code>Some</code>, the bounds and invariants are identical to <code>upsert_timelock</code>.
+
+
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_owners_and_timelock">create_with_owners_and_timelock</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, additional_owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, num_signatures_required: u64, metadata_keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/string.md#0x1_string_String">string::String</a>&gt;, metadata_values: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;, timelock_period: <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_Option">option::Option</a>&lt;u64&gt;, override_threshold: <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_Option">option::Option</a>&lt;u64&gt;)
+</code></pre>
+
+
+
+<details>
+<summary>Implementation</summary>
+
+
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_owners_and_timelock">create_with_owners_and_timelock</a>(
+    owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
+    additional_owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
+    num_signatures_required: u64,
+    metadata_keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;String&gt;,
+    metadata_values: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;,
+    timelock_period: Option&lt;u64&gt;,
+    override_threshold: Option&lt;u64&gt;,
+) {
+    <b>assert</b>!(
+        <a href="../../topo-stdlib/../move-stdlib/doc/features.md#0x1_features_is_multisig_timelock_enabled">features::is_multisig_timelock_enabled</a>(),
+        <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_unavailable">error::unavailable</a>(<a href="multisig_account.md#0x1_multisig_account_ETIMELOCK_NOT_ENABLED">ETIMELOCK_NOT_ENABLED</a>)
+    );
+    // A timelock override_threshold <b>has</b> no meaning without a timelock_period — reject it up
+    // front so a caller cannot be surprised that their override setting was silently dropped.
+    <b>assert</b>!(
+        timelock_period.is_some() || override_threshold.is_none(),
+        <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EINVALID_TIMELOCK_OVERRIDE_THRESHOLD">EINVALID_TIMELOCK_OVERRIDE_THRESHOLD</a>)
+    );
+
+    <b>let</b> (<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, multisig_signer_cap) = <a href="multisig_account.md#0x1_multisig_account_create_multisig_account">create_multisig_account</a>(owner);
+    additional_owners.push_back(address_of(owner));
+    <a href="multisig_account.md#0x1_multisig_account_create_with_owners_internal">create_with_owners_internal</a>(
+        &<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>,
+        additional_owners,
+        num_signatures_required,
+        <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_some">option::some</a>(multisig_signer_cap),
+        metadata_keys,
+        metadata_values,
+    );
+
+    <b>if</b> (timelock_period.is_some()) {
+        <a href="multisig_account.md#0x1_multisig_account_upsert_timelock_internal">upsert_timelock_internal</a>(
+            &<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>,
+            timelock_period.destroy_some(),
+            override_threshold,
+        );
+    }
 }
 </code></pre>
 
@@ -2269,7 +2658,7 @@ This is for creating a vanity multisig account from a bootstrapping account that
 be an owner after the vanity multisig address has been secured.
 
 
-<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_owners_then_remove_bootstrapper">create_with_owners_then_remove_bootstrapper</a>(bootstrapper: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, num_signatures_required: u64, metadata_keys: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>&gt;, metadata_values: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;)
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_owners_then_remove_bootstrapper">create_with_owners_then_remove_bootstrapper</a>(bootstrapper: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, num_signatures_required: u64, metadata_keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/string.md#0x1_string_String">string::String</a>&gt;, metadata_values: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;)
 </code></pre>
 
 
@@ -2279,12 +2668,12 @@ be an owner after the vanity multisig address has been secured.
 
 
 <pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_owners_then_remove_bootstrapper">create_with_owners_then_remove_bootstrapper</a>(
-    bootstrapper: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
-    owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
+    bootstrapper: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
+    owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
     num_signatures_required: u64,
-    metadata_keys: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;String&gt;,
-    metadata_values: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;,
-) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+    metadata_keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;String&gt;,
+    metadata_values: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;,
+) {
     <b>let</b> bootstrapper_address = address_of(bootstrapper);
     <a href="multisig_account.md#0x1_multisig_account_create_with_owners">create_with_owners</a>(
         bootstrapper,
@@ -2295,9 +2684,9 @@ be an owner after the vanity multisig address has been secured.
     );
     <a href="multisig_account.md#0x1_multisig_account_update_owner_schema">update_owner_schema</a>(
         <a href="multisig_account.md#0x1_multisig_account_get_next_multisig_account_address">get_next_multisig_account_address</a>(bootstrapper_address),
-        <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>[],
-        <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>[bootstrapper_address],
-        <a href="../../move-stdlib/doc/option.md#0x1_option_none">option::none</a>()
+        <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>[],
+        <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>[bootstrapper_address],
+        <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_none">option::none</a>()
     );
 }
 </code></pre>
@@ -2312,7 +2701,7 @@ be an owner after the vanity multisig address has been secured.
 
 
 
-<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_owners_internal">create_with_owners_internal</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, num_signatures_required: u64, multisig_account_signer_cap: <a href="../../move-stdlib/doc/option.md#0x1_option_Option">option::Option</a>&lt;<a href="account.md#0x1_account_SignerCapability">account::SignerCapability</a>&gt;, metadata_keys: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>&gt;, metadata_values: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;)
+<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_owners_internal">create_with_owners_internal</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, num_signatures_required: u64, multisig_account_signer_cap: <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_Option">option::Option</a>&lt;<a href="account.md#0x1_account_SignerCapability">account::SignerCapability</a>&gt;, metadata_keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/string.md#0x1_string_String">string::String</a>&gt;, metadata_values: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;)
 </code></pre>
 
 
@@ -2322,17 +2711,17 @@ be an owner after the vanity multisig address has been secured.
 
 
 <pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_owners_internal">create_with_owners_internal</a>(
-    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
-    owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
+    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
+    owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
     num_signatures_required: u64,
     multisig_account_signer_cap: Option&lt;SignerCapability&gt;,
-    metadata_keys: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;String&gt;,
-    metadata_values: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;,
-) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
-    <b>assert</b>!(<a href="../../move-stdlib/doc/features.md#0x1_features_multisig_accounts_enabled">features::multisig_accounts_enabled</a>(), <a href="../../move-stdlib/doc/error.md#0x1_error_unavailable">error::unavailable</a>(<a href="multisig_account.md#0x1_multisig_account_EMULTISIG_ACCOUNTS_NOT_ENABLED_YET">EMULTISIG_ACCOUNTS_NOT_ENABLED_YET</a>));
+    metadata_keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;String&gt;,
+    metadata_values: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;,
+) {
+    <b>assert</b>!(<a href="../../topo-stdlib/../move-stdlib/doc/features.md#0x1_features_multisig_accounts_enabled">features::multisig_accounts_enabled</a>(), <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_unavailable">error::unavailable</a>(<a href="multisig_account.md#0x1_multisig_account_EMULTISIG_ACCOUNTS_NOT_ENABLED_YET">EMULTISIG_ACCOUNTS_NOT_ENABLED_YET</a>));
     <b>assert</b>!(
         num_signatures_required &gt; 0 && <a href="multisig_account.md#0x1_multisig_account_num_signatures_required">num_signatures_required</a> &lt;= owners.length(),
-        <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EINVALID_SIGNATURES_REQUIRED">EINVALID_SIGNATURES_REQUIRED</a>),
+        <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EINVALID_SIGNATURES_REQUIRED">EINVALID_SIGNATURES_REQUIRED</a>),
     );
 
     <b>let</b> multisig_address = address_of(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
@@ -2341,7 +2730,7 @@ be an owner after the vanity multisig address has been secured.
         owners,
         num_signatures_required,
         transactions: <a href="../../topo-stdlib/doc/table.md#0x1_table_new">table::new</a>&lt;u64, <a href="multisig_account.md#0x1_multisig_account_MultisigTransaction">MultisigTransaction</a>&gt;(),
-        metadata: <a href="../../topo-stdlib/doc/simple_map.md#0x1_simple_map_create">simple_map::create</a>&lt;String, <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;(),
+        metadata: <a href="../../topo-stdlib/doc/simple_map.md#0x1_simple_map_create">simple_map::create</a>&lt;String, <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;(),
         // First transaction will start at id 1 instead of 0.
         last_executed_sequence_number: 0,
         next_sequence_number: 1,
@@ -2365,14 +2754,26 @@ be an owner after the vanity multisig address has been secured.
 
 </details>
 
-<a id="0x1_multisig_account_add_owner"></a>
+<a id="0x1_multisig_account_upsert_timelock"></a>
 
-## Function `add_owner`
+## Function `upsert_timelock`
 
-Similar to add_owners, but only allow adding one owner.
+Upsert the timelock configuration for the multisig account.
+timelock_period must be between MIN_TIMELOCK_PERIOD and MAX_TIMELOCK_PERIOD.
+override_threshold, if provided, must be > num_signatures_required and <= the number of owners.
+
+Note on pending transactions: the timelock check measures elapsed time from a transaction's
+<code>creation_time_secs</code>, not from when the timelock was activated. Because multisig transactions
+execute strictly in sequence order, this is only observable for transactions queued *after*
+this <code>upsert_timelock</code> call but *before* it executes — those transactions may become
+executable sooner than <code>timelock_period</code> seconds after this call takes effect, because part
+of their elapsed time is counted from before the new timelock was live. Transactions queued
+after this call has executed receive the full <code>timelock_period</code> protection. This residual
+window is bounded by the previous timelock period (or by approval time, if there was no
+prior timelock) and is considered an acceptable, operator-visible risk.
 
 
-<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_add_owner">add_owner</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, new_owner: <b>address</b>)
+<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_upsert_timelock">upsert_timelock</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, timelock_period: u64, override_threshold: <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_Option">option::Option</a>&lt;u64&gt;)
 </code></pre>
 
 
@@ -2381,8 +2782,136 @@ Similar to add_owners, but only allow adding one owner.
 <summary>Implementation</summary>
 
 
-<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_add_owner">add_owner</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, new_owner: <b>address</b>) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
-    <a href="multisig_account.md#0x1_multisig_account_add_owners">add_owners</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>[new_owner]);
+<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_upsert_timelock">upsert_timelock</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, timelock_period: u64, override_threshold: Option&lt;u64&gt;) {
+    <b>assert</b>!(
+        <a href="../../topo-stdlib/../move-stdlib/doc/features.md#0x1_features_is_multisig_timelock_enabled">features::is_multisig_timelock_enabled</a>(),
+        <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_unavailable">error::unavailable</a>(<a href="multisig_account.md#0x1_multisig_account_ETIMELOCK_NOT_ENABLED">ETIMELOCK_NOT_ENABLED</a>)
+    );
+    <a href="multisig_account.md#0x1_multisig_account_upsert_timelock_internal">upsert_timelock_internal</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, timelock_period, override_threshold);
+}
+</code></pre>
+
+
+
+</details>
+
+<a id="0x1_multisig_account_upsert_timelock_internal"></a>
+
+## Function `upsert_timelock_internal`
+
+Shared validation + publish logic for timelock configuration. Used by <code>upsert_timelock</code> and
+by the creation-time variants (<code>create_with_owners_and_timelock</code>, ...) so the invariant that
+<code><a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a></code> is only ever published through a single validated path is preserved.
+
+
+<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_upsert_timelock_internal">upsert_timelock_internal</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, timelock_period: u64, override_threshold: <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_Option">option::Option</a>&lt;u64&gt;)
+</code></pre>
+
+
+
+<details>
+<summary>Implementation</summary>
+
+
+<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_upsert_timelock_internal">upsert_timelock_internal</a>(
+    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
+    timelock_period: u64,
+    override_threshold: Option&lt;u64&gt;,
+) {
+    <b>let</b> multisig_address = address_of(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
+    <a href="multisig_account.md#0x1_multisig_account_assert_multisig_account_exists">assert_multisig_account_exists</a>(multisig_address);
+
+    <b>assert</b>!(
+        timelock_period &gt;= <a href="multisig_account.md#0x1_multisig_account_MIN_TIMELOCK_PERIOD">MIN_TIMELOCK_PERIOD</a> && <a href="multisig_account.md#0x1_multisig_account_timelock_period">timelock_period</a> &lt;= <a href="multisig_account.md#0x1_multisig_account_MAX_TIMELOCK_PERIOD">MAX_TIMELOCK_PERIOD</a>,
+        <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EINVALID_TIMELOCK_DURATION">EINVALID_TIMELOCK_DURATION</a>)
+    );
+
+    <b>let</b> multisig_account_resource = <b>borrow_global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(multisig_address);
+    <b>assert</b>!(
+        override_threshold.is_none() || override_threshold.borrow() &gt; &multisig_account_resource.num_signatures_required,
+        <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EINVALID_TIMELOCK_OVERRIDE_THRESHOLD">EINVALID_TIMELOCK_OVERRIDE_THRESHOLD</a>)
+    );
+    <b>assert</b>!(
+        override_threshold.is_none() || override_threshold.borrow() &lt;= &multisig_account_resource.owners.length(),
+        <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EINVALID_TIMELOCK_OVERRIDE_THRESHOLD">EINVALID_TIMELOCK_OVERRIDE_THRESHOLD</a>)
+    );
+
+    <b>if</b> (<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a>&gt;(multisig_address)) {
+        <b>let</b> multisig_account_resource = &<b>mut</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a>[multisig_address];
+        multisig_account_resource.timelock_period = timelock_period;
+        multisig_account_resource.override_threshold = override_threshold;
+    } <b>else</b> {
+        <b>move_to</b>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, MultisigAccountTimeLock::V1 {
+            timelock_period,
+            override_threshold,
+        });
+    }
+
+    emit(<a href="multisig_account.md#0x1_multisig_account_TimelockUpdated">TimelockUpdated</a> {
+        <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: multisig_address,
+        timelock_period,
+        override_threshold,
+    });
+}
+</code></pre>
+
+
+
+</details>
+
+<a id="0x1_multisig_account_remove_timelock"></a>
+
+## Function `remove_timelock`
+
+Remove the timelock configuration for the multisig account.
+Aborts if no timelock is configured.
+
+
+<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_remove_timelock">remove_timelock</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>)
+</code></pre>
+
+
+
+<details>
+<summary>Implementation</summary>
+
+
+<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_remove_timelock">remove_timelock</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>) {
+    <b>let</b> multisig_address = address_of(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
+    <a href="multisig_account.md#0x1_multisig_account_assert_multisig_account_exists">assert_multisig_account_exists</a>(multisig_address);
+    <b>assert</b>!(
+        <b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a>&gt;(multisig_address),
+        <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_not_found">error::not_found</a>(<a href="multisig_account.md#0x1_multisig_account_ETIMELOCK_DOES_NOT_EXIST">ETIMELOCK_DOES_NOT_EXIST</a>)
+    );
+    <b>move_from</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a>&gt;(multisig_address);
+    emit(<a href="multisig_account.md#0x1_multisig_account_TimelockRemoved">TimelockRemoved</a> {
+        <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: multisig_address,
+    });
+}
+</code></pre>
+
+
+
+</details>
+
+<a id="0x1_multisig_account_add_owner"></a>
+
+## Function `add_owner`
+
+Similar to add_owners, but only allow adding one owner.
+
+
+<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_add_owner">add_owner</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, new_owner: <b>address</b>)
+</code></pre>
+
+
+
+<details>
+<summary>Implementation</summary>
+
+
+<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_add_owner">add_owner</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, new_owner: <b>address</b>) {
+    <a href="multisig_account.md#0x1_multisig_account_add_owners">add_owners</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>[new_owner]);
 }
 </code></pre>
 
@@ -2402,7 +2931,7 @@ ensures that a multisig transaction cannot lead to another module obtaining the 
 maliciously alter the owners list.
 
 
-<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_add_owners">add_owners</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, new_owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;)
+<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_add_owners">add_owners</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, new_owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;)
 </code></pre>
 
 
@@ -2412,12 +2941,12 @@ maliciously alter the owners list.
 
 
 <pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_add_owners">add_owners</a>(
-    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, new_owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, new_owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;) {
     <a href="multisig_account.md#0x1_multisig_account_update_owner_schema">update_owner_schema</a>(
         address_of(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>),
         new_owners,
-        <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>[],
-        <a href="../../move-stdlib/doc/option.md#0x1_option_none">option::none</a>()
+        <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>[],
+        <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_none">option::none</a>()
     );
 }
 </code></pre>
@@ -2433,7 +2962,7 @@ maliciously alter the owners list.
 Add owners then update number of signatures required, in a single operation.
 
 
-<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_add_owners_and_update_signatures_required">add_owners_and_update_signatures_required</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, new_owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, new_num_signatures_required: u64)
+<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_add_owners_and_update_signatures_required">add_owners_and_update_signatures_required</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, new_owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, new_num_signatures_required: u64)
 </code></pre>
 
 
@@ -2443,15 +2972,15 @@ Add owners then update number of signatures required, in a single operation.
 
 
 <pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_add_owners_and_update_signatures_required">add_owners_and_update_signatures_required</a>(
-    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
-    new_owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
+    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
+    new_owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
     new_num_signatures_required: u64
-) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+) {
     <a href="multisig_account.md#0x1_multisig_account_update_owner_schema">update_owner_schema</a>(
         address_of(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>),
         new_owners,
-        <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>[],
-        <a href="../../move-stdlib/doc/option.md#0x1_option_some">option::some</a>(new_num_signatures_required)
+        <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>[],
+        <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_some">option::some</a>(new_num_signatures_required)
     );
 }
 </code></pre>
@@ -2467,7 +2996,7 @@ Add owners then update number of signatures required, in a single operation.
 Similar to remove_owners, but only allow removing one owner.
 
 
-<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_remove_owner">remove_owner</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, owner_to_remove: <b>address</b>)
+<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_remove_owner">remove_owner</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, owner_to_remove: <b>address</b>)
 </code></pre>
 
 
@@ -2477,8 +3006,8 @@ Similar to remove_owners, but only allow removing one owner.
 
 
 <pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_remove_owner">remove_owner</a>(
-    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, owner_to_remove: <b>address</b>) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
-    <a href="multisig_account.md#0x1_multisig_account_remove_owners">remove_owners</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>[owner_to_remove]);
+    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, owner_to_remove: <b>address</b>) {
+    <a href="multisig_account.md#0x1_multisig_account_remove_owners">remove_owners</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>[owner_to_remove]);
 }
 </code></pre>
 
@@ -2499,7 +3028,7 @@ ensures that a multisig transaction cannot lead to another module obtaining the 
 maliciously alter the owners list.
 
 
-<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_remove_owners">remove_owners</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, owners_to_remove: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;)
+<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_remove_owners">remove_owners</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, owners_to_remove: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;)
 </code></pre>
 
 
@@ -2509,12 +3038,12 @@ maliciously alter the owners list.
 
 
 <pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_remove_owners">remove_owners</a>(
-    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, owners_to_remove: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, owners_to_remove: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;) {
     <a href="multisig_account.md#0x1_multisig_account_update_owner_schema">update_owner_schema</a>(
         address_of(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>),
-        <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>[],
+        <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>[],
         owners_to_remove,
-        <a href="../../move-stdlib/doc/option.md#0x1_option_none">option::none</a>()
+        <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_none">option::none</a>()
     );
 }
 </code></pre>
@@ -2530,7 +3059,7 @@ maliciously alter the owners list.
 Swap an owner in for an old one, without changing required signatures.
 
 
-<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_swap_owner">swap_owner</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, to_swap_in: <b>address</b>, to_swap_out: <b>address</b>)
+<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_swap_owner">swap_owner</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, to_swap_in: <b>address</b>, to_swap_out: <b>address</b>)
 </code></pre>
 
 
@@ -2540,15 +3069,15 @@ Swap an owner in for an old one, without changing required signatures.
 
 
 <pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_swap_owner">swap_owner</a>(
-    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
+    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
     to_swap_in: <b>address</b>,
     to_swap_out: <b>address</b>
-) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+) {
     <a href="multisig_account.md#0x1_multisig_account_update_owner_schema">update_owner_schema</a>(
         address_of(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>),
-        <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>[to_swap_in],
-        <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>[to_swap_out],
-        <a href="../../move-stdlib/doc/option.md#0x1_option_none">option::none</a>()
+        <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>[to_swap_in],
+        <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>[to_swap_out],
+        <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_none">option::none</a>()
     );
 }
 </code></pre>
@@ -2564,7 +3093,7 @@ Swap an owner in for an old one, without changing required signatures.
 Swap owners in and out, without changing required signatures.
 
 
-<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_swap_owners">swap_owners</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, to_swap_in: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, to_swap_out: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;)
+<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_swap_owners">swap_owners</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, to_swap_in: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, to_swap_out: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;)
 </code></pre>
 
 
@@ -2574,15 +3103,15 @@ Swap owners in and out, without changing required signatures.
 
 
 <pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_swap_owners">swap_owners</a>(
-    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
-    to_swap_in: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
-    to_swap_out: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;
-) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
+    to_swap_in: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
+    to_swap_out: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;
+) {
     <a href="multisig_account.md#0x1_multisig_account_update_owner_schema">update_owner_schema</a>(
         address_of(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>),
         to_swap_in,
         to_swap_out,
-        <a href="../../move-stdlib/doc/option.md#0x1_option_none">option::none</a>()
+        <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_none">option::none</a>()
     );
 }
 </code></pre>
@@ -2598,7 +3127,7 @@ Swap owners in and out, without changing required signatures.
 Swap owners in and out, updating number of required signatures.
 
 
-<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_swap_owners_and_update_signatures_required">swap_owners_and_update_signatures_required</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, new_owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, owners_to_remove: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, new_num_signatures_required: u64)
+<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_swap_owners_and_update_signatures_required">swap_owners_and_update_signatures_required</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, new_owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, owners_to_remove: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, new_num_signatures_required: u64)
 </code></pre>
 
 
@@ -2608,16 +3137,16 @@ Swap owners in and out, updating number of required signatures.
 
 
 <pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_swap_owners_and_update_signatures_required">swap_owners_and_update_signatures_required</a>(
-    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
-    new_owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
-    owners_to_remove: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
+    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
+    new_owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
+    owners_to_remove: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
     new_num_signatures_required: u64
-) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+) {
     <a href="multisig_account.md#0x1_multisig_account_update_owner_schema">update_owner_schema</a>(
         address_of(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>),
         new_owners,
         owners_to_remove,
-        <a href="../../move-stdlib/doc/option.md#0x1_option_some">option::some</a>(new_num_signatures_required)
+        <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_some">option::some</a>(new_num_signatures_required)
     );
 }
 </code></pre>
@@ -2638,7 +3167,7 @@ ensures that a multisig transaction cannot lead to another module obtaining the 
 maliciously alter the number of signatures required.
 
 
-<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_update_signatures_required">update_signatures_required</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, new_num_signatures_required: u64)
+<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_update_signatures_required">update_signatures_required</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, new_num_signatures_required: u64)
 </code></pre>
 
 
@@ -2648,12 +3177,12 @@ maliciously alter the number of signatures required.
 
 
 <pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_update_signatures_required">update_signatures_required</a>(
-    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, new_num_signatures_required: u64) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, new_num_signatures_required: u64) {
     <a href="multisig_account.md#0x1_multisig_account_update_owner_schema">update_owner_schema</a>(
         address_of(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>),
-        <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>[],
-        <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>[],
-        <a href="../../move-stdlib/doc/option.md#0x1_option_some">option::some</a>(new_num_signatures_required)
+        <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>[],
+        <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>[],
+        <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_some">option::some</a>(new_num_signatures_required)
     );
 }
 </code></pre>
@@ -2675,7 +3204,7 @@ ensures that a multisig transaction cannot lead to another module obtaining the 
 maliciously alter the number of signatures required.
 
 
-<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_update_metadata">update_metadata</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, keys: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>&gt;, values: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;)
+<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_update_metadata">update_metadata</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/string.md#0x1_string_String">string::String</a>&gt;, values: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;)
 </code></pre>
 
 
@@ -2685,7 +3214,7 @@ maliciously alter the number of signatures required.
 
 
 <pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_update_metadata">update_metadata</a>(
-    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, keys: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;String&gt;, values: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;String&gt;, values: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;) {
     <a href="multisig_account.md#0x1_multisig_account_update_metadata_internal">update_metadata_internal</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, keys, values, <b>true</b>);
 }
 </code></pre>
@@ -2700,7 +3229,7 @@ maliciously alter the number of signatures required.
 
 
 
-<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_update_metadata_internal">update_metadata_internal</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, keys: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>&gt;, values: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;, emit_event: bool)
+<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_update_metadata_internal">update_metadata_internal</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/string.md#0x1_string_String">string::String</a>&gt;, values: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;, emit_event: bool)
 </code></pre>
 
 
@@ -2710,22 +3239,22 @@ maliciously alter the number of signatures required.
 
 
 <pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_update_metadata_internal">update_metadata_internal</a>(
-    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
-    keys: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;String&gt;,
-    values: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;,
+    <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
+    keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;String&gt;,
+    values: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;,
     emit_event: bool,
-) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+) {
     <b>let</b> num_attributes = keys.length();
     <b>assert</b>!(
         num_attributes == values.length(),
-        <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_ENUMBER_OF_METADATA_KEYS_AND_VALUES_DONT_MATCH">ENUMBER_OF_METADATA_KEYS_AND_VALUES_DONT_MATCH</a>),
+        <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_ENUMBER_OF_METADATA_KEYS_AND_VALUES_DONT_MATCH">ENUMBER_OF_METADATA_KEYS_AND_VALUES_DONT_MATCH</a>),
     );
 
     <b>let</b> multisig_address = address_of(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     <a href="multisig_account.md#0x1_multisig_account_assert_multisig_account_exists">assert_multisig_account_exists</a>(multisig_address);
     <b>let</b> multisig_account_resource = <b>borrow_global_mut</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(multisig_address);
     <b>let</b> old_metadata = multisig_account_resource.metadata;
-    multisig_account_resource.metadata = <a href="../../topo-stdlib/doc/simple_map.md#0x1_simple_map_create">simple_map::create</a>&lt;String, <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;();
+    multisig_account_resource.metadata = <a href="../../topo-stdlib/doc/simple_map.md#0x1_simple_map_create">simple_map::create</a>&lt;String, <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;();
     <b>let</b> metadata = &<b>mut</b> multisig_account_resource.metadata;
     <b>let</b> i = 0;
     <b>while</b> (i &lt; num_attributes) {
@@ -2733,7 +3262,7 @@ maliciously alter the number of signatures required.
         <b>let</b> value = values[i];
         <b>assert</b>!(
             !metadata.contains_key(&key),
-            <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EDUPLICATE_METADATA_KEY">EDUPLICATE_METADATA_KEY</a>),
+            <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EDUPLICATE_METADATA_KEY">EDUPLICATE_METADATA_KEY</a>),
         );
 
         metadata.add(key, value);
@@ -2763,7 +3292,7 @@ maliciously alter the number of signatures required.
 Create a multisig transaction, which will have one approval initially (from the creator).
 
 
-<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_transaction">create_transaction</a>(owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, payload: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;)
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_transaction">create_transaction</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, payload: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;)
 </code></pre>
 
 
@@ -2773,19 +3302,19 @@ Create a multisig transaction, which will have one approval initially (from the 
 
 
 <pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_transaction">create_transaction</a>(
-    owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
+    owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
     <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>,
-    payload: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;,
-) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
-    <b>assert</b>!(payload.length() &gt; 0, <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EPAYLOAD_CANNOT_BE_EMPTY">EPAYLOAD_CANNOT_BE_EMPTY</a>));
+    payload: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;,
+) {
+    <b>assert</b>!(payload.length() &gt; 0, <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EPAYLOAD_CANNOT_BE_EMPTY">EPAYLOAD_CANNOT_BE_EMPTY</a>));
 
     <a href="multisig_account.md#0x1_multisig_account_assert_multisig_account_exists">assert_multisig_account_exists</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     <a href="multisig_account.md#0x1_multisig_account_assert_is_owner">assert_is_owner</a>(owner, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
 
     <b>let</b> creator = address_of(owner);
     <b>let</b> transaction = <a href="multisig_account.md#0x1_multisig_account_MultisigTransaction">MultisigTransaction</a> {
-        payload: <a href="../../move-stdlib/doc/option.md#0x1_option_some">option::some</a>(payload),
-        payload_hash: <a href="../../move-stdlib/doc/option.md#0x1_option_none">option::none</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;(),
+        payload: <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_some">option::some</a>(payload),
+        payload_hash: <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_none">option::none</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;(),
         votes: <a href="../../topo-stdlib/doc/simple_map.md#0x1_simple_map_create">simple_map::create</a>&lt;<b>address</b>, bool&gt;(),
         creator,
         creation_time_secs: now_seconds(),
@@ -2807,7 +3336,7 @@ This means the payload will be stored off chain for gas saving. Later, during ex
 to provide the full payload, which will be validated against the hash stored on-chain.
 
 
-<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_transaction_with_hash">create_transaction_with_hash</a>(owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, payload_hash: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;)
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_transaction_with_hash">create_transaction_with_hash</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, payload_hash: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;)
 </code></pre>
 
 
@@ -2817,20 +3346,20 @@ to provide the full payload, which will be validated against the hash stored on-
 
 
 <pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_transaction_with_hash">create_transaction_with_hash</a>(
-    owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
+    owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
     <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>,
-    payload_hash: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;,
-) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
-    // Payload <a href="../../move-stdlib/doc/hash.md#0x1_hash">hash</a> is a sha3-256 <a href="../../move-stdlib/doc/hash.md#0x1_hash">hash</a>, so it must be exactly 32 bytes.
-    <b>assert</b>!(payload_hash.length() == 32, <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EINVALID_PAYLOAD_HASH">EINVALID_PAYLOAD_HASH</a>));
+    payload_hash: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;,
+) {
+    // Payload <a href="../../topo-stdlib/../move-stdlib/doc/hash.md#0x1_hash">hash</a> is a sha3-256 <a href="../../topo-stdlib/../move-stdlib/doc/hash.md#0x1_hash">hash</a>, so it must be exactly 32 bytes.
+    <b>assert</b>!(payload_hash.length() == 32, <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EINVALID_PAYLOAD_HASH">EINVALID_PAYLOAD_HASH</a>));
 
     <a href="multisig_account.md#0x1_multisig_account_assert_multisig_account_exists">assert_multisig_account_exists</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     <a href="multisig_account.md#0x1_multisig_account_assert_is_owner">assert_is_owner</a>(owner, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
 
     <b>let</b> creator = address_of(owner);
     <b>let</b> transaction = <a href="multisig_account.md#0x1_multisig_account_MultisigTransaction">MultisigTransaction</a> {
-        payload: <a href="../../move-stdlib/doc/option.md#0x1_option_none">option::none</a>&lt;<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;(),
-        payload_hash: <a href="../../move-stdlib/doc/option.md#0x1_option_some">option::some</a>(payload_hash),
+        payload: <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_none">option::none</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;(),
+        payload_hash: <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_some">option::some</a>(payload_hash),
         votes: <a href="../../topo-stdlib/doc/simple_map.md#0x1_simple_map_create">simple_map::create</a>&lt;<b>address</b>, bool&gt;(),
         creator,
         creation_time_secs: now_seconds(),
@@ -2850,7 +3379,7 @@ to provide the full payload, which will be validated against the hash stored on-
 Approve a multisig transaction.
 
 
-<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_approve_transaction">approve_transaction</a>(owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64)
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_approve_transaction">approve_transaction</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64)
 </code></pre>
 
 
@@ -2860,7 +3389,7 @@ Approve a multisig transaction.
 
 
 <pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_approve_transaction">approve_transaction</a>(
-    owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+    owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64) {
     <a href="multisig_account.md#0x1_multisig_account_vote_transanction">vote_transanction</a>(owner, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number, <b>true</b>);
 }
 </code></pre>
@@ -2876,7 +3405,7 @@ Approve a multisig transaction.
 Reject a multisig transaction.
 
 
-<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_reject_transaction">reject_transaction</a>(owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64)
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_reject_transaction">reject_transaction</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64)
 </code></pre>
 
 
@@ -2886,7 +3415,7 @@ Reject a multisig transaction.
 
 
 <pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_reject_transaction">reject_transaction</a>(
-    owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+    owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64) {
     <a href="multisig_account.md#0x1_multisig_account_vote_transanction">vote_transanction</a>(owner, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number, <b>false</b>);
 }
 </code></pre>
@@ -2904,7 +3433,7 @@ Retained for backward compatibility: the function with the typographical error i
 will continue to be an accessible entry point.
 
 
-<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_vote_transanction">vote_transanction</a>(owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64, approved: bool)
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_vote_transanction">vote_transanction</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64, approved: bool)
 </code></pre>
 
 
@@ -2914,14 +3443,14 @@ will continue to be an accessible entry point.
 
 
 <pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_vote_transanction">vote_transanction</a>(
-    owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64, approved: bool) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+    owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64, approved: bool) {
     <a href="multisig_account.md#0x1_multisig_account_assert_multisig_account_exists">assert_multisig_account_exists</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     <b>let</b> multisig_account_resource = <b>borrow_global_mut</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     <a href="multisig_account.md#0x1_multisig_account_assert_is_owner_internal">assert_is_owner_internal</a>(owner, multisig_account_resource);
 
     <b>assert</b>!(
         multisig_account_resource.transactions.contains(sequence_number),
-        <a href="../../move-stdlib/doc/error.md#0x1_error_not_found">error::not_found</a>(<a href="multisig_account.md#0x1_multisig_account_ETRANSACTION_NOT_FOUND">ETRANSACTION_NOT_FOUND</a>),
+        <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_not_found">error::not_found</a>(<a href="multisig_account.md#0x1_multisig_account_ETRANSACTION_NOT_FOUND">ETRANSACTION_NOT_FOUND</a>),
     );
     <b>let</b> transaction = multisig_account_resource.transactions.borrow_mut(sequence_number);
     <b>let</b> votes = &<b>mut</b> transaction.votes;
@@ -2955,7 +3484,7 @@ will continue to be an accessible entry point.
 Generic function that can be used to either approve or reject a multisig transaction
 
 
-<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_vote_transaction">vote_transaction</a>(owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64, approved: bool)
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_vote_transaction">vote_transaction</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64, approved: bool)
 </code></pre>
 
 
@@ -2965,8 +3494,8 @@ Generic function that can be used to either approve or reject a multisig transac
 
 
 <pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_vote_transaction">vote_transaction</a>(
-    owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64, approved: bool) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
-    <b>assert</b>!(<a href="../../move-stdlib/doc/features.md#0x1_features_multisig_v2_enhancement_feature_enabled">features::multisig_v2_enhancement_feature_enabled</a>(), <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_state">error::invalid_state</a>(<a href="multisig_account.md#0x1_multisig_account_EMULTISIG_V2_ENHANCEMENT_NOT_ENABLED">EMULTISIG_V2_ENHANCEMENT_NOT_ENABLED</a>));
+    owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64, approved: bool) {
+    <b>assert</b>!(<a href="../../topo-stdlib/../move-stdlib/doc/features.md#0x1_features_multisig_v2_enhancement_feature_enabled">features::multisig_v2_enhancement_feature_enabled</a>(), <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_state">error::invalid_state</a>(<a href="multisig_account.md#0x1_multisig_account_EMULTISIG_V2_ENHANCEMENT_NOT_ENABLED">EMULTISIG_V2_ENHANCEMENT_NOT_ENABLED</a>));
     <a href="multisig_account.md#0x1_multisig_account_vote_transanction">vote_transanction</a>(owner, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number, approved);
 }
 </code></pre>
@@ -2982,7 +3511,7 @@ Generic function that can be used to either approve or reject a multisig transac
 Generic function that can be used to either approve or reject a batch of transactions within a specified range.
 
 
-<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_vote_transactions">vote_transactions</a>(owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, starting_sequence_number: u64, final_sequence_number: u64, approved: bool)
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_vote_transactions">vote_transactions</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, starting_sequence_number: u64, final_sequence_number: u64, approved: bool)
 </code></pre>
 
 
@@ -2992,8 +3521,8 @@ Generic function that can be used to either approve or reject a batch of transac
 
 
 <pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_vote_transactions">vote_transactions</a>(
-    owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, starting_sequence_number: u64, final_sequence_number: u64, approved: bool) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
-    <b>assert</b>!(<a href="../../move-stdlib/doc/features.md#0x1_features_multisig_v2_enhancement_feature_enabled">features::multisig_v2_enhancement_feature_enabled</a>(), <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_state">error::invalid_state</a>(<a href="multisig_account.md#0x1_multisig_account_EMULTISIG_V2_ENHANCEMENT_NOT_ENABLED">EMULTISIG_V2_ENHANCEMENT_NOT_ENABLED</a>));
+    owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, starting_sequence_number: u64, final_sequence_number: u64, approved: bool) {
+    <b>assert</b>!(<a href="../../topo-stdlib/../move-stdlib/doc/features.md#0x1_features_multisig_v2_enhancement_feature_enabled">features::multisig_v2_enhancement_feature_enabled</a>(), <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_state">error::invalid_state</a>(<a href="multisig_account.md#0x1_multisig_account_EMULTISIG_V2_ENHANCEMENT_NOT_ENABLED">EMULTISIG_V2_ENHANCEMENT_NOT_ENABLED</a>));
     <b>let</b> sequence_number = starting_sequence_number;
     <b>while</b>(sequence_number &lt;= final_sequence_number) {
         <a href="multisig_account.md#0x1_multisig_account_vote_transanction">vote_transanction</a>(owner, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number, approved);
@@ -3013,7 +3542,7 @@ Generic function that can be used to either approve or reject a batch of transac
 Remove the next transaction if it has sufficient owner rejections.
 
 
-<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_execute_rejected_transaction">execute_rejected_transaction</a>(owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>)
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_execute_rejected_transaction">execute_rejected_transaction</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>)
 </code></pre>
 
 
@@ -3023,15 +3552,15 @@ Remove the next transaction if it has sufficient owner rejections.
 
 
 <pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_execute_rejected_transaction">execute_rejected_transaction</a>(
-    owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
+    owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
     <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>,
-) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+) {
     <a href="multisig_account.md#0x1_multisig_account_assert_multisig_account_exists">assert_multisig_account_exists</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     <a href="multisig_account.md#0x1_multisig_account_assert_is_owner">assert_is_owner</a>(owner, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
 
     <b>let</b> sequence_number = <a href="multisig_account.md#0x1_multisig_account_last_resolved_sequence_number">last_resolved_sequence_number</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>) + 1;
     <b>let</b> owner_addr = address_of(owner);
-    <b>if</b> (<a href="../../move-stdlib/doc/features.md#0x1_features_multisig_v2_enhancement_feature_enabled">features::multisig_v2_enhancement_feature_enabled</a>()) {
+    <b>if</b> (<a href="../../topo-stdlib/../move-stdlib/doc/features.md#0x1_features_multisig_v2_enhancement_feature_enabled">features::multisig_v2_enhancement_feature_enabled</a>()) {
         // Implicitly vote for rejection <b>if</b> the owner <b>has</b> not voted for rejection yet.
         <b>if</b> (!<a href="multisig_account.md#0x1_multisig_account_has_voted_for_rejection">has_voted_for_rejection</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number, owner_addr)) {
             <a href="multisig_account.md#0x1_multisig_account_reject_transaction">reject_transaction</a>(owner, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number);
@@ -3042,7 +3571,7 @@ Remove the next transaction if it has sufficient owner rejections.
     <b>let</b> (_, num_rejections) = <a href="multisig_account.md#0x1_multisig_account_remove_executed_transaction">remove_executed_transaction</a>(multisig_account_resource);
     <b>assert</b>!(
         num_rejections &gt;= multisig_account_resource.num_signatures_required,
-        <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_state">error::invalid_state</a>(<a href="multisig_account.md#0x1_multisig_account_ENOT_ENOUGH_REJECTIONS">ENOT_ENOUGH_REJECTIONS</a>),
+        <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_state">error::invalid_state</a>(<a href="multisig_account.md#0x1_multisig_account_ENOT_ENOUGH_REJECTIONS">ENOT_ENOUGH_REJECTIONS</a>),
     );
 
     emit(
@@ -3067,7 +3596,7 @@ Remove the next transaction if it has sufficient owner rejections.
 Remove the next transactions until the final_sequence_number if they have sufficient owner rejections.
 
 
-<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_execute_rejected_transactions">execute_rejected_transactions</a>(owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, final_sequence_number: u64)
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_execute_rejected_transactions">execute_rejected_transactions</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, final_sequence_number: u64)
 </code></pre>
 
 
@@ -3077,13 +3606,13 @@ Remove the next transactions until the final_sequence_number if they have suffic
 
 
 <pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_execute_rejected_transactions">execute_rejected_transactions</a>(
-    owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
+    owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>,
     <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>,
     final_sequence_number: u64,
-) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
-    <b>assert</b>!(<a href="../../move-stdlib/doc/features.md#0x1_features_multisig_v2_enhancement_feature_enabled">features::multisig_v2_enhancement_feature_enabled</a>(), <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_state">error::invalid_state</a>(<a href="multisig_account.md#0x1_multisig_account_EMULTISIG_V2_ENHANCEMENT_NOT_ENABLED">EMULTISIG_V2_ENHANCEMENT_NOT_ENABLED</a>));
-    <b>assert</b>!(<a href="multisig_account.md#0x1_multisig_account_last_resolved_sequence_number">last_resolved_sequence_number</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>) &lt; final_sequence_number, <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EINVALID_SEQUENCE_NUMBER">EINVALID_SEQUENCE_NUMBER</a>));
-    <b>assert</b>!(final_sequence_number &lt; <a href="multisig_account.md#0x1_multisig_account_next_sequence_number">next_sequence_number</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>), <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EINVALID_SEQUENCE_NUMBER">EINVALID_SEQUENCE_NUMBER</a>));
+) {
+    <b>assert</b>!(<a href="../../topo-stdlib/../move-stdlib/doc/features.md#0x1_features_multisig_v2_enhancement_feature_enabled">features::multisig_v2_enhancement_feature_enabled</a>(), <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_state">error::invalid_state</a>(<a href="multisig_account.md#0x1_multisig_account_EMULTISIG_V2_ENHANCEMENT_NOT_ENABLED">EMULTISIG_V2_ENHANCEMENT_NOT_ENABLED</a>));
+    <b>assert</b>!(<a href="multisig_account.md#0x1_multisig_account_last_resolved_sequence_number">last_resolved_sequence_number</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>) &lt; final_sequence_number, <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EINVALID_SEQUENCE_NUMBER">EINVALID_SEQUENCE_NUMBER</a>));
+    <b>assert</b>!(final_sequence_number &lt; <a href="multisig_account.md#0x1_multisig_account_next_sequence_number">next_sequence_number</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>), <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EINVALID_SEQUENCE_NUMBER">EINVALID_SEQUENCE_NUMBER</a>));
     <b>while</b>(<a href="multisig_account.md#0x1_multisig_account_last_resolved_sequence_number">last_resolved_sequence_number</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>) &lt; final_sequence_number) {
         <a href="multisig_account.md#0x1_multisig_account_execute_rejected_transaction">execute_rejected_transaction</a>(owner, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     }
@@ -3104,7 +3633,8 @@ the first step of transaction execution.
 Transaction payload is optional if it's already stored on chain for the transaction.
 
 
-<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_validate_multisig_transaction">validate_multisig_transaction</a>(owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, payload: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;)
+<pre><code>#[lint::skip(#[unused_function])]
+<b>fun</b> <a href="multisig_account.md#0x1_multisig_account_validate_multisig_transaction">validate_multisig_transaction</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, payload: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;)
 </code></pre>
 
 
@@ -3114,24 +3644,37 @@ Transaction payload is optional if it's already stored on chain for the transact
 
 
 <pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_validate_multisig_transaction">validate_multisig_transaction</a>(
-    owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, payload: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+    owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, payload: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;) {
     <a href="multisig_account.md#0x1_multisig_account_assert_multisig_account_exists">assert_multisig_account_exists</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     <a href="multisig_account.md#0x1_multisig_account_assert_is_owner">assert_is_owner</a>(owner, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     <b>let</b> sequence_number = <a href="multisig_account.md#0x1_multisig_account_last_resolved_sequence_number">last_resolved_sequence_number</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>) + 1;
     <a href="multisig_account.md#0x1_multisig_account_assert_transaction_exists">assert_transaction_exists</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number);
 
-    <b>if</b> (<a href="../../move-stdlib/doc/features.md#0x1_features_multisig_v2_enhancement_feature_enabled">features::multisig_v2_enhancement_feature_enabled</a>()) {
+    <b>if</b> (<a href="../../topo-stdlib/../move-stdlib/doc/features.md#0x1_features_multisig_v2_enhancement_feature_enabled">features::multisig_v2_enhancement_feature_enabled</a>()) {
         <b>assert</b>!(
             <a href="multisig_account.md#0x1_multisig_account_can_execute">can_execute</a>(address_of(owner), <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number),
-            <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_ENOT_ENOUGH_APPROVALS">ENOT_ENOUGH_APPROVALS</a>),
+            <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_ENOT_ENOUGH_APPROVALS">ENOT_ENOUGH_APPROVALS</a>),
         );
     }
     <b>else</b> {
         <b>assert</b>!(
             <a href="multisig_account.md#0x1_multisig_account_can_be_executed">can_be_executed</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number),
-            <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_ENOT_ENOUGH_APPROVALS">ENOT_ENOUGH_APPROVALS</a>),
+            <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_ENOT_ENOUGH_APPROVALS">ENOT_ENOUGH_APPROVALS</a>),
         );
     };
+
+    // Count approvals, including the executing owner's implicit vote.
+    <b>let</b> (num_approvals, _) = <a href="multisig_account.md#0x1_multisig_account_num_approvals_and_rejections">num_approvals_and_rejections</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number);
+    <b>if</b> (!<a href="multisig_account.md#0x1_multisig_account_has_voted_for_approval">has_voted_for_approval</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number, address_of(owner))) {
+        num_approvals += 1;
+    };
+    <b>assert</b>!(num_approvals &gt;= <a href="multisig_account.md#0x1_multisig_account_num_signatures_required">num_signatures_required</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>), <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_ENOT_ENOUGH_APPROVALS">ENOT_ENOUGH_APPROVALS</a>));
+
+    // Timelock check — separate from quorum so the <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error">error</a> is unambiguous.
+    <b>assert</b>!(
+        <a href="multisig_account.md#0x1_multisig_account_can_execute_with_timelock">can_execute_with_timelock</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, sequence_number, num_approvals),
+        <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_state">error::invalid_state</a>(<a href="multisig_account.md#0x1_multisig_account_ETIMELOCK_NOT_EXPIRED">ETIMELOCK_NOT_EXPIRED</a>),
+    );
 
     // If the transaction payload is not stored on chain, verify that the provided payload matches the hashes stored
     // on chain.
@@ -3141,20 +3684,20 @@ Transaction payload is optional if it's already stored on chain for the transact
         <b>let</b> payload_hash = transaction.payload_hash.borrow();
         <b>assert</b>!(
             sha3_256(payload) == *payload_hash,
-            <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EPAYLOAD_DOES_NOT_MATCH_HASH">EPAYLOAD_DOES_NOT_MATCH_HASH</a>),
+            <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EPAYLOAD_DOES_NOT_MATCH_HASH">EPAYLOAD_DOES_NOT_MATCH_HASH</a>),
         );
     };
 
     // If the transaction payload is stored on chain and there is a provided payload,
     // verify that the provided payload matches the stored payload.
-    <b>if</b> (<a href="../../move-stdlib/doc/features.md#0x1_features_abort_if_multisig_payload_mismatch_enabled">features::abort_if_multisig_payload_mismatch_enabled</a>()
+    <b>if</b> (<a href="../../topo-stdlib/../move-stdlib/doc/features.md#0x1_features_abort_if_multisig_payload_mismatch_enabled">features::abort_if_multisig_payload_mismatch_enabled</a>()
         && transaction.payload.is_some()
         && !payload.is_empty()
     ) {
         <b>let</b> stored_payload = transaction.payload.borrow();
         <b>assert</b>!(
             payload == *stored_payload,
-            <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EPAYLOAD_DOES_NOT_MATCH">EPAYLOAD_DOES_NOT_MATCH</a>),
+            <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EPAYLOAD_DOES_NOT_MATCH">EPAYLOAD_DOES_NOT_MATCH</a>),
         );
     }
 }
@@ -3172,7 +3715,8 @@ Post-execution cleanup for a successful multisig transaction execution.
 This function is private so no other code can call this beside the VM itself as part of MultisigTransaction.
 
 
-<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_successful_transaction_execution_cleanup">successful_transaction_execution_cleanup</a>(executor: <b>address</b>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, transaction_payload: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;)
+<pre><code>#[lint::skip(#[unused_function])]
+<b>fun</b> <a href="multisig_account.md#0x1_multisig_account_successful_transaction_execution_cleanup">successful_transaction_execution_cleanup</a>(executor: <b>address</b>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, transaction_payload: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;)
 </code></pre>
 
 
@@ -3184,10 +3728,10 @@ This function is private so no other code can call this beside the VM itself as 
 <pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_successful_transaction_execution_cleanup">successful_transaction_execution_cleanup</a>(
     executor: <b>address</b>,
     <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>,
-    transaction_payload: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;,
-) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+    transaction_payload: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;,
+) {
     <b>let</b> num_approvals = <a href="multisig_account.md#0x1_multisig_account_transaction_execution_cleanup_common">transaction_execution_cleanup_common</a>(executor, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
-    <b>let</b> multisig_account_resource = <b>borrow_global_mut</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
+    <b>let</b> multisig_account_resource = <b>borrow_global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     emit(
         <a href="multisig_account.md#0x1_multisig_account_TransactionExecutionSucceeded">TransactionExecutionSucceeded</a> {
             <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>,
@@ -3212,7 +3756,8 @@ Post-execution cleanup for a failed multisig transaction execution.
 This function is private so no other code can call this beside the VM itself as part of MultisigTransaction.
 
 
-<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_failed_transaction_execution_cleanup">failed_transaction_execution_cleanup</a>(executor: <b>address</b>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, transaction_payload: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;, execution_error: <a href="multisig_account.md#0x1_multisig_account_ExecutionError">multisig_account::ExecutionError</a>)
+<pre><code>#[lint::skip(#[unused_function])]
+<b>fun</b> <a href="multisig_account.md#0x1_multisig_account_failed_transaction_execution_cleanup">failed_transaction_execution_cleanup</a>(executor: <b>address</b>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, transaction_payload: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;, execution_error: <a href="multisig_account.md#0x1_multisig_account_ExecutionError">multisig_account::ExecutionError</a>)
 </code></pre>
 
 
@@ -3224,11 +3769,11 @@ This function is private so no other code can call this beside the VM itself as 
 <pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_failed_transaction_execution_cleanup">failed_transaction_execution_cleanup</a>(
     executor: <b>address</b>,
     <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>,
-    transaction_payload: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;,
+    transaction_payload: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;,
     execution_error: <a href="multisig_account.md#0x1_multisig_account_ExecutionError">ExecutionError</a>,
-) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+) {
     <b>let</b> num_approvals = <a href="multisig_account.md#0x1_multisig_account_transaction_execution_cleanup_common">transaction_execution_cleanup_common</a>(executor, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
-    <b>let</b> multisig_account_resource = <b>borrow_global_mut</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
+    <b>let</b> multisig_account_resource = <b>borrow_global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     emit(
         <a href="multisig_account.md#0x1_multisig_account_TransactionExecutionFailed">TransactionExecutionFailed</a> {
             <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>,
@@ -3268,7 +3813,7 @@ This function is private so no other code can call this beside the VM itself as 
     <b>let</b> multisig_account_resource = <b>borrow_global_mut</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     <b>let</b> (num_approvals, _) = <a href="multisig_account.md#0x1_multisig_account_remove_executed_transaction">remove_executed_transaction</a>(multisig_account_resource);
 
-    <b>if</b> (<a href="../../move-stdlib/doc/features.md#0x1_features_multisig_v2_enhancement_feature_enabled">features::multisig_v2_enhancement_feature_enabled</a>() && implicit_approval) {
+    <b>if</b> (<a href="../../topo-stdlib/../move-stdlib/doc/features.md#0x1_features_multisig_v2_enhancement_feature_enabled">features::multisig_v2_enhancement_feature_enabled</a>() && implicit_approval) {
         emit(
             <a href="multisig_account.md#0x1_multisig_account_Vote">Vote</a> {
                 <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>,
@@ -3335,10 +3880,10 @@ This function is private so no other code can call this beside the VM itself as 
     <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>,
     transaction: <a href="multisig_account.md#0x1_multisig_account_MultisigTransaction">MultisigTransaction</a>
 ) {
-    <b>if</b> (<a href="../../move-stdlib/doc/features.md#0x1_features_multisig_v2_enhancement_feature_enabled">features::multisig_v2_enhancement_feature_enabled</a>()) {
+    <b>if</b> (<a href="../../topo-stdlib/../move-stdlib/doc/features.md#0x1_features_multisig_v2_enhancement_feature_enabled">features::multisig_v2_enhancement_feature_enabled</a>()) {
         <b>assert</b>!(
             <a href="multisig_account.md#0x1_multisig_account_available_transaction_queue_capacity">available_transaction_queue_capacity</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>) &gt; 0,
-            <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_state">error::invalid_state</a>(<a href="multisig_account.md#0x1_multisig_account_EMAX_PENDING_TRANSACTIONS_EXCEEDED">EMAX_PENDING_TRANSACTIONS_EXCEEDED</a>)
+            <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_state">error::invalid_state</a>(<a href="multisig_account.md#0x1_multisig_account_EMAX_PENDING_TRANSACTIONS_EXCEEDED">EMAX_PENDING_TRANSACTIONS_EXCEEDED</a>)
         );
     };
 
@@ -3366,7 +3911,7 @@ This function is private so no other code can call this beside the VM itself as 
 
 
 
-<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_multisig_account">create_multisig_account</a>(owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>): (<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="account.md#0x1_account_SignerCapability">account::SignerCapability</a>)
+<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_multisig_account">create_multisig_account</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>): (<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="account.md#0x1_account_SignerCapability">account::SignerCapability</a>)
 </code></pre>
 
 
@@ -3375,11 +3920,11 @@ This function is private so no other code can call this beside the VM itself as 
 <summary>Implementation</summary>
 
 
-<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_multisig_account">create_multisig_account</a>(owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>): (<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, SignerCapability) {
+<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_multisig_account">create_multisig_account</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>): (<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, SignerCapability) {
     <b>let</b> owner_nonce = <a href="account.md#0x1_account_get_sequence_number">account::get_sequence_number</a>(address_of(owner));
     <b>let</b> (multisig_signer, multisig_signer_cap) =
         <a href="account.md#0x1_account_create_resource_account">account::create_resource_account</a>(owner, <a href="multisig_account.md#0x1_multisig_account_create_multisig_account_seed">create_multisig_account_seed</a>(to_bytes(&owner_nonce)));
-    // Register the <a href="account.md#0x1_account">account</a> <b>to</b> receive TOPO <b>as</b> this is not done by default <b>as</b> part of the resource <a href="account.md#0x1_account">account</a> creation
+    // Register the <a href="account.md#0x1_account">account</a> <b>to</b> receive APT <b>as</b> this is not done by default <b>as</b> part of the resource <a href="account.md#0x1_account">account</a> creation
     // flow.
     <b>if</b> (!<a href="coin.md#0x1_coin_is_account_registered">coin::is_account_registered</a>&lt;TopoCoin&gt;(address_of(&multisig_signer))) {
         <a href="coin.md#0x1_coin_register">coin::register</a>&lt;TopoCoin&gt;(&multisig_signer);
@@ -3399,7 +3944,7 @@ This function is private so no other code can call this beside the VM itself as 
 
 
 
-<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_multisig_account_seed">create_multisig_account_seed</a>(seed: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;): <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;
+<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_multisig_account_seed">create_multisig_account_seed</a>(seed: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;): <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;
 </code></pre>
 
 
@@ -3408,9 +3953,9 @@ This function is private so no other code can call this beside the VM itself as 
 <summary>Implementation</summary>
 
 
-<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_multisig_account_seed">create_multisig_account_seed</a>(seed: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;): <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt; {
+<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_multisig_account_seed">create_multisig_account_seed</a>(seed: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;): <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt; {
     // Generate a seed that will be used <b>to</b> create the resource <a href="account.md#0x1_account">account</a> that hosts the multisig <a href="account.md#0x1_account">account</a>.
-    <b>let</b> multisig_account_seed = <a href="../../move-stdlib/doc/vector.md#0x1_vector_empty">vector::empty</a>&lt;u8&gt;();
+    <b>let</b> multisig_account_seed = <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector_empty">vector::empty</a>&lt;u8&gt;();
     multisig_account_seed.append(<a href="multisig_account.md#0x1_multisig_account_DOMAIN_SEPARATOR">DOMAIN_SEPARATOR</a>);
     multisig_account_seed.append(seed);
 
@@ -3428,7 +3973,7 @@ This function is private so no other code can call this beside the VM itself as 
 
 
 
-<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_validate_owners">validate_owners</a>(owners: &<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>)
+<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_validate_owners">validate_owners</a>(owners: &<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>)
 </code></pre>
 
 
@@ -3437,14 +3982,14 @@ This function is private so no other code can call this beside the VM itself as 
 <summary>Implementation</summary>
 
 
-<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_validate_owners">validate_owners</a>(owners: &<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>) {
-    <b>let</b> distinct_owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt; = <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>[];
+<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_validate_owners">validate_owners</a>(owners: &<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>) {
+    <b>let</b> distinct_owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt; = <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>[];
     owners.for_each_ref(|owner| {
         <b>let</b> owner = *owner;
-        <b>assert</b>!(owner != <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EOWNER_CANNOT_BE_MULTISIG_ACCOUNT_ITSELF">EOWNER_CANNOT_BE_MULTISIG_ACCOUNT_ITSELF</a>));
-        <b>let</b> (found, _) = <a href="../../move-stdlib/doc/vector.md#0x1_vector_index_of">vector::index_of</a>(&distinct_owners, &owner);
-        <b>assert</b>!(!found, <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EDUPLICATE_OWNER">EDUPLICATE_OWNER</a>));
-        <a href="../../move-stdlib/doc/vector.md#0x1_vector_push_back">vector::push_back</a>(&<b>mut</b> distinct_owners, owner);
+        <b>assert</b>!(owner != <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>, <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EOWNER_CANNOT_BE_MULTISIG_ACCOUNT_ITSELF">EOWNER_CANNOT_BE_MULTISIG_ACCOUNT_ITSELF</a>));
+        <b>let</b> (found, _) = <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector_index_of">vector::index_of</a>(&distinct_owners, &owner);
+        <b>assert</b>!(!found, <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EDUPLICATE_OWNER">EDUPLICATE_OWNER</a>));
+        <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector_push_back">vector::push_back</a>(&<b>mut</b> distinct_owners, owner);
     });
 }
 </code></pre>
@@ -3459,7 +4004,7 @@ This function is private so no other code can call this beside the VM itself as 
 
 
 
-<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_assert_is_owner_internal">assert_is_owner_internal</a>(owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">multisig_account::MultisigAccount</a>)
+<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_assert_is_owner_internal">assert_is_owner_internal</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">multisig_account::MultisigAccount</a>)
 </code></pre>
 
 
@@ -3468,10 +4013,10 @@ This function is private so no other code can call this beside the VM itself as 
 <summary>Implementation</summary>
 
 
-<pre><code>inline <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_assert_is_owner_internal">assert_is_owner_internal</a>(owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>) {
+<pre><code>inline <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_assert_is_owner_internal">assert_is_owner_internal</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>) {
     <b>assert</b>!(
         <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>.owners.contains(&address_of(owner)),
-        <a href="../../move-stdlib/doc/error.md#0x1_error_permission_denied">error::permission_denied</a>(<a href="multisig_account.md#0x1_multisig_account_ENOT_OWNER">ENOT_OWNER</a>),
+        <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_permission_denied">error::permission_denied</a>(<a href="multisig_account.md#0x1_multisig_account_ENOT_OWNER">ENOT_OWNER</a>),
     );
 }
 </code></pre>
@@ -3486,7 +4031,7 @@ This function is private so no other code can call this beside the VM itself as 
 
 
 
-<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_assert_is_owner">assert_is_owner</a>(owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>)
+<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_assert_is_owner">assert_is_owner</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>)
 </code></pre>
 
 
@@ -3495,7 +4040,7 @@ This function is private so no other code can call this beside the VM itself as 
 <summary>Implementation</summary>
 
 
-<pre><code>inline <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_assert_is_owner">assert_is_owner</a>(owner: &<a href="../../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>) {
+<pre><code>inline <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_assert_is_owner">assert_is_owner</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>) {
     <b>let</b> multisig_account_resource = <b>borrow_global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     <a href="multisig_account.md#0x1_multisig_account_assert_is_owner_internal">assert_is_owner_internal</a>(owner, multisig_account_resource);
 }
@@ -3511,7 +4056,7 @@ This function is private so no other code can call this beside the VM itself as 
 
 
 
-<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_num_approvals_and_rejections_internal">num_approvals_and_rejections_internal</a>(owners: &<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, transaction: &<a href="multisig_account.md#0x1_multisig_account_MultisigTransaction">multisig_account::MultisigTransaction</a>): (u64, u64)
+<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_num_approvals_and_rejections_internal">num_approvals_and_rejections_internal</a>(owners: &<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, transaction: &<a href="multisig_account.md#0x1_multisig_account_MultisigTransaction">multisig_account::MultisigTransaction</a>): (u64, u64)
 </code></pre>
 
 
@@ -3520,7 +4065,7 @@ This function is private so no other code can call this beside the VM itself as 
 <summary>Implementation</summary>
 
 
-<pre><code>inline <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_num_approvals_and_rejections_internal">num_approvals_and_rejections_internal</a>(owners: &<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, transaction: &<a href="multisig_account.md#0x1_multisig_account_MultisigTransaction">MultisigTransaction</a>): (u64, u64) {
+<pre><code>inline <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_num_approvals_and_rejections_internal">num_approvals_and_rejections_internal</a>(owners: &<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, transaction: &<a href="multisig_account.md#0x1_multisig_account_MultisigTransaction">MultisigTransaction</a>): (u64, u64) {
     <b>let</b> num_approvals = 0;
     <b>let</b> num_rejections = 0;
 
@@ -3635,7 +4180,7 @@ This function is private so no other code can call this beside the VM itself as 
 
 
 <pre><code>inline <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_assert_multisig_account_exists">assert_multisig_account_exists</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>) {
-    <b>assert</b>!(<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>), <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_state">error::invalid_state</a>(<a href="multisig_account.md#0x1_multisig_account_EACCOUNT_NOT_MULTISIG">EACCOUNT_NOT_MULTISIG</a>));
+    <b>assert</b>!(<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>), <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_state">error::invalid_state</a>(<a href="multisig_account.md#0x1_multisig_account_EACCOUNT_NOT_MULTISIG">EACCOUNT_NOT_MULTISIG</a>));
 }
 </code></pre>
 
@@ -3662,7 +4207,7 @@ This function is private so no other code can call this beside the VM itself as 
     <b>let</b> multisig_account_resource = <b>borrow_global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     <b>assert</b>!(
         sequence_number &gt; 0 && sequence_number &lt; multisig_account_resource.next_sequence_number,
-        <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EINVALID_SEQUENCE_NUMBER">EINVALID_SEQUENCE_NUMBER</a>),
+        <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EINVALID_SEQUENCE_NUMBER">EINVALID_SEQUENCE_NUMBER</a>),
     );
 }
 </code></pre>
@@ -3690,7 +4235,7 @@ This function is private so no other code can call this beside the VM itself as 
     <b>let</b> multisig_account_resource = <b>borrow_global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
     <b>assert</b>!(
         multisig_account_resource.transactions.contains(sequence_number),
-        <a href="../../move-stdlib/doc/error.md#0x1_error_not_found">error::not_found</a>(<a href="multisig_account.md#0x1_multisig_account_ETRANSACTION_NOT_FOUND">ETRANSACTION_NOT_FOUND</a>),
+        <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_not_found">error::not_found</a>(<a href="multisig_account.md#0x1_multisig_account_ETRANSACTION_NOT_FOUND">ETRANSACTION_NOT_FOUND</a>),
     );
 }
 </code></pre>
@@ -3706,7 +4251,7 @@ This function is private so no other code can call this beside the VM itself as 
 Add new owners, remove owners to remove, update signatures required.
 
 
-<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_update_owner_schema">update_owner_schema</a>(multisig_address: <b>address</b>, new_owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, owners_to_remove: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, optional_new_num_signatures_required: <a href="../../move-stdlib/doc/option.md#0x1_option_Option">option::Option</a>&lt;u64&gt;)
+<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_update_owner_schema">update_owner_schema</a>(multisig_address: <b>address</b>, new_owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, owners_to_remove: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, optional_new_num_signatures_required: <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_Option">option::Option</a>&lt;u64&gt;)
 </code></pre>
 
 
@@ -3717,18 +4262,18 @@ Add new owners, remove owners to remove, update signatures required.
 
 <pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_update_owner_schema">update_owner_schema</a>(
     multisig_address: <b>address</b>,
-    new_owners: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
-    owners_to_remove: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
+    new_owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
+    owners_to_remove: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;,
     optional_new_num_signatures_required: Option&lt;u64&gt;,
-) <b>acquires</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a> {
+) {
     <a href="multisig_account.md#0x1_multisig_account_assert_multisig_account_exists">assert_multisig_account_exists</a>(multisig_address);
     <b>let</b> multisig_account_ref_mut =
         <b>borrow_global_mut</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(multisig_address);
     // Verify no overlap between new owners and owners <b>to</b> remove.
     new_owners.for_each_ref(|new_owner_ref| {
         <b>assert</b>!(
-            !<a href="../../move-stdlib/doc/vector.md#0x1_vector_contains">vector::contains</a>(&owners_to_remove, new_owner_ref),
-            <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EOWNERS_TO_REMOVE_NEW_OWNERS_OVERLAP">EOWNERS_TO_REMOVE_NEW_OWNERS_OVERLAP</a>)
+            !<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector_contains">vector::contains</a>(&owners_to_remove, new_owner_ref),
+            <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EOWNERS_TO_REMOVE_NEW_OWNERS_OVERLAP">EOWNERS_TO_REMOVE_NEW_OWNERS_OVERLAP</a>)
         )
     });
     // If new owners provided, try <b>to</b> add them and emit an <a href="event.md#0x1_event">event</a>.
@@ -3743,14 +4288,14 @@ Add new owners, remove owners to remove, update signatures required.
     // If owners <b>to</b> remove provided, try <b>to</b> remove them.
     <b>if</b> (owners_to_remove.length() &gt; 0) {
         <b>let</b> owners_ref_mut = &<b>mut</b> multisig_account_ref_mut.owners;
-        <b>let</b> owners_removed = <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>[];
+        <b>let</b> owners_removed = <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>[];
         owners_to_remove.for_each_ref(|owner_to_remove_ref| {
             <b>let</b> (found, index) =
-                <a href="../../move-stdlib/doc/vector.md#0x1_vector_index_of">vector::index_of</a>(owners_ref_mut, owner_to_remove_ref);
+                <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector_index_of">vector::index_of</a>(owners_ref_mut, owner_to_remove_ref);
             <b>if</b> (found) {
-                <a href="../../move-stdlib/doc/vector.md#0x1_vector_push_back">vector::push_back</a>(
+                <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector_push_back">vector::push_back</a>(
                     &<b>mut</b> owners_removed,
-                    <a href="../../move-stdlib/doc/vector.md#0x1_vector_swap_remove">vector::swap_remove</a>(owners_ref_mut, index)
+                    <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector_swap_remove">vector::swap_remove</a>(owners_ref_mut, index)
                 );
             }
         });
@@ -3767,7 +4312,7 @@ Add new owners, remove owners to remove, update signatures required.
             optional_new_num_signatures_required.extract();
         <b>assert</b>!(
             new_num_signatures_required &gt; 0,
-            <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EINVALID_SIGNATURES_REQUIRED">EINVALID_SIGNATURES_REQUIRED</a>)
+            <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_argument">error::invalid_argument</a>(<a href="multisig_account.md#0x1_multisig_account_EINVALID_SIGNATURES_REQUIRED">EINVALID_SIGNATURES_REQUIRED</a>)
         );
         <b>let</b> old_num_signatures_required =
             multisig_account_ref_mut.num_signatures_required;
@@ -3788,8 +4333,29 @@ Add new owners, remove owners to remove, update signatures required.
     <b>let</b> num_owners = multisig_account_ref_mut.owners.length();
     <b>assert</b>!(
         num_owners &gt;= multisig_account_ref_mut.num_signatures_required,
-        <a href="../../move-stdlib/doc/error.md#0x1_error_invalid_state">error::invalid_state</a>(<a href="multisig_account.md#0x1_multisig_account_ENOT_ENOUGH_OWNERS">ENOT_ENOUGH_OWNERS</a>)
+        <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_state">error::invalid_state</a>(<a href="multisig_account.md#0x1_multisig_account_ENOT_ENOUGH_OWNERS">ENOT_ENOUGH_OWNERS</a>)
     );
+
+    // If a timelock is configured, adjust and validate the override threshold
+    // after owner/threshold changes.
+    <b>if</b> (<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a>&gt;(multisig_address)) {
+        <b>let</b> timelock = &<b>mut</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a>[multisig_address];
+        // If override threshold exceeds the new owner count, clamp it down and emit an <a href="event.md#0x1_event">event</a>
+        // so off-chain monitors observe the security-relevant mutation.
+        <b>if</b> (timelock.override_threshold.is_some() && timelock.override_threshold.borrow() &gt; &num_owners) {
+            timelock.override_threshold = <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_some">option::some</a>(num_owners);
+            emit(<a href="multisig_account.md#0x1_multisig_account_TimelockUpdated">TimelockUpdated</a> {
+                <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: multisig_address,
+                timelock_period: timelock.timelock_period,
+                override_threshold: timelock.override_threshold,
+            });
+        };
+        // Override threshold must still be greater than num_signatures_required.
+        <b>assert</b>!(
+            timelock.override_threshold.is_none() || timelock.override_threshold.borrow() &gt; &multisig_account_ref_mut.num_signatures_required,
+            <a href="../../topo-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_state">error::invalid_state</a>(<a href="multisig_account.md#0x1_multisig_account_EINVALID_TIMELOCK_OVERRIDE_THRESHOLD">EINVALID_TIMELOCK_OVERRIDE_THRESHOLD</a>)
+        );
+    };
 }
 </code></pre>
 
@@ -3964,7 +4530,7 @@ Add new owners, remove owners to remove, update signatures required.
 
 
 <pre><code>#[view]
-<b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_metadata">metadata</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): <a href="../../topo-stdlib/doc/simple_map.md#0x1_simple_map_SimpleMap">simple_map::SimpleMap</a>&lt;<a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>, <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;
+<b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_metadata">metadata</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): <a href="../../topo-stdlib/doc/simple_map.md#0x1_simple_map_SimpleMap">simple_map::SimpleMap</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/string.md#0x1_string_String">string::String</a>, <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;
 </code></pre>
 
 
@@ -3972,6 +4538,47 @@ Add new owners, remove owners to remove, update signatures required.
 
 <pre><code><b>aborts_if</b> !<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
 <b>ensures</b> result == <b>global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>).metadata;
+</code></pre>
+
+
+
+<a id="@Specification_1_timelock_period"></a>
+
+### Function `timelock_period`
+
+
+<pre><code>#[view]
+<b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_timelock_period">timelock_period</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): u64
+</code></pre>
+
+
+
+
+<pre><code><b>aborts_if</b> <b>false</b>;
+<b>ensures</b> !<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>) ==&gt; result == 0;
+<b>ensures</b> <b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>) ==&gt;
+    result == <b>global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>).timelock_period;
+</code></pre>
+
+
+
+<a id="@Specification_1_timelock_override_threshold"></a>
+
+### Function `timelock_override_threshold`
+
+
+<pre><code>#[view]
+<b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_timelock_override_threshold">timelock_override_threshold</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_Option">option::Option</a>&lt;u64&gt;
+</code></pre>
+
+
+
+
+<pre><code><b>aborts_if</b> <b>false</b>;
+<b>ensures</b> !<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>) ==&gt;
+    <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_is_none">option::is_none</a>(result);
+<b>ensures</b> <b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>) ==&gt;
+    result == <b>global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>).override_threshold;
 </code></pre>
 
 
@@ -4000,7 +4607,7 @@ Add new owners, remove owners to remove, update signatures required.
 
 
 <pre><code>#[view]
-<b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_owners">owners</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;
+<b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_owners">owners</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;
 </code></pre>
 
 
@@ -4008,6 +4615,24 @@ Add new owners, remove owners to remove, update signatures required.
 
 <pre><code><b>aborts_if</b> !<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
 <b>ensures</b> result == <b>global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>).owners;
+</code></pre>
+
+
+
+<a id="@Specification_1_is_owner"></a>
+
+### Function `is_owner`
+
+
+<pre><code>#[view]
+<b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_is_owner">is_owner</a>(owner: <b>address</b>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>): bool
+</code></pre>
+
+
+
+
+<pre><code><b>aborts_if</b> !<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
+<b>ensures</b> result == <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector_spec_contains">vector::spec_contains</a>(<b>global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>).owners, owner);
 </code></pre>
 
 
@@ -4039,7 +4664,7 @@ Add new owners, remove owners to remove, update signatures required.
 
 
 <pre><code>#[view]
-<b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_get_next_transaction_payload">get_next_transaction_payload</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, provided_payload: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;): <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;
+<b>public</b> <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_get_next_transaction_payload">get_next_transaction_payload</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, provided_payload: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;): <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;
 </code></pre>
 
 
@@ -4051,7 +4676,7 @@ Add new owners, remove owners to remove, update signatures required.
 <b>aborts_if</b> !<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
 <b>aborts_if</b> multisig_account_resource.last_executed_sequence_number + 1 &gt; MAX_U64;
 <b>aborts_if</b> !<a href="../../topo-stdlib/doc/table.md#0x1_table_spec_contains">table::spec_contains</a>(multisig_account_resource.transactions, sequence_number);
-<b>ensures</b> <a href="../../move-stdlib/doc/option.md#0x1_option_is_none">option::is_none</a>(transaction.payload) ==&gt; result == provided_payload;
+<b>ensures</b> <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_is_none">option::is_none</a>(transaction.payload) ==&gt; result == provided_payload;
 </code></pre>
 
 
@@ -4133,6 +4758,265 @@ Add new owners, remove owners to remove, update signatures required.
 <b>let</b> vote = voted && <a href="../../topo-stdlib/doc/simple_map.md#0x1_simple_map_spec_get">simple_map::spec_get</a>(votes, owner);
 <b>ensures</b> result_1 == voted;
 <b>ensures</b> result_2 == vote;
+</code></pre>
+
+
+
+<a id="@Specification_1_create_with_owners_and_timelock"></a>
+
+### Function `create_with_owners_and_timelock`
+
+
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_owners_and_timelock">create_with_owners_and_timelock</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, additional_owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, num_signatures_required: u64, metadata_keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/string.md#0x1_string_String">string::String</a>&gt;, metadata_values: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;, timelock_period: <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_Option">option::Option</a>&lt;u64&gt;, override_threshold: <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_Option">option::Option</a>&lt;u64&gt;)
+</code></pre>
+
+
+
+
+<pre><code><b>pragma</b> aborts_if_is_partial;
+<b>aborts_if</b> !<a href="../../topo-stdlib/../move-stdlib/doc/features.md#0x1_features_spec_multisig_timelock_enabled">features::spec_multisig_timelock_enabled</a>();
+<b>aborts_if</b> <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_is_some">option::is_some</a>(override_threshold) && <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_is_none">option::is_none</a>(timelock_period);
+<b>aborts_if</b> num_signatures_required == 0;
+</code></pre>
+
+
+
+<a id="@Specification_1_create_with_owners_internal"></a>
+
+### Function `create_with_owners_internal`
+
+
+<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_with_owners_internal">create_with_owners_internal</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, owners: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, num_signatures_required: u64, multisig_account_signer_cap: <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_Option">option::Option</a>&lt;<a href="account.md#0x1_account_SignerCapability">account::SignerCapability</a>&gt;, metadata_keys: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/string.md#0x1_string_String">string::String</a>&gt;, metadata_values: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;&gt;)
+</code></pre>
+
+
+
+
+<pre><code><b>pragma</b> aborts_if_is_partial;
+<b>aborts_if</b> num_signatures_required == 0 || num_signatures_required &gt; len(owners);
+<b>ensures</b> <b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer_address_of">signer::address_of</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>));
+<b>let</b> <b>post</b> multisig = <b>global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer_address_of">signer::address_of</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>));
+<b>ensures</b> multisig.num_signatures_required == num_signatures_required;
+<b>ensures</b> multisig.last_executed_sequence_number == 0;
+<b>ensures</b> multisig.next_sequence_number == 1;
+</code></pre>
+
+
+
+<a id="@Specification_1_upsert_timelock"></a>
+
+### Function `upsert_timelock`
+
+
+<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_upsert_timelock">upsert_timelock</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, timelock_period: u64, override_threshold: <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_Option">option::Option</a>&lt;u64&gt;)
+</code></pre>
+
+
+
+
+<pre><code><b>pragma</b> aborts_if_is_partial;
+<b>let</b> multisig_address = <a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer_address_of">signer::address_of</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
+<b>aborts_if</b> !<a href="../../topo-stdlib/../move-stdlib/doc/features.md#0x1_features_spec_multisig_timelock_enabled">features::spec_multisig_timelock_enabled</a>();
+<b>aborts_if</b> !<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(multisig_address);
+<b>aborts_if</b> <a href="multisig_account.md#0x1_multisig_account_timelock_period">timelock_period</a> &lt; <a href="multisig_account.md#0x1_multisig_account_MIN_TIMELOCK_PERIOD">MIN_TIMELOCK_PERIOD</a> || timelock_period &gt; <a href="multisig_account.md#0x1_multisig_account_MAX_TIMELOCK_PERIOD">MAX_TIMELOCK_PERIOD</a>;
+<b>aborts_if</b> <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_is_some">option::is_some</a>(override_threshold) &&
+    <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_borrow">option::borrow</a>(override_threshold) &lt;= <b>global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(multisig_address).num_signatures_required;
+<b>aborts_if</b> <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_is_some">option::is_some</a>(override_threshold) &&
+    <a href="../../topo-stdlib/../move-stdlib/doc/option.md#0x1_option_borrow">option::borrow</a>(override_threshold) &gt; len(<b>global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(multisig_address).owners);
+<b>ensures</b> <b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a>&gt;(multisig_address);
+<b>ensures</b> <b>global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a>&gt;(multisig_address).timelock_period == timelock_period;
+<b>ensures</b> <b>global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a>&gt;(multisig_address).override_threshold == override_threshold;
+<b>ensures</b> <b>global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(multisig_address) == <b>old</b>(<b>global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(multisig_address));
+</code></pre>
+
+
+
+<a id="@Specification_1_remove_timelock"></a>
+
+### Function `remove_timelock`
+
+
+<pre><code>entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_remove_timelock">remove_timelock</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>)
+</code></pre>
+
+
+
+
+<pre><code><b>let</b> multisig_address = <a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer_address_of">signer::address_of</a>(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
+<b>aborts_if</b> !<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(multisig_address);
+<b>aborts_if</b> !<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a>&gt;(multisig_address);
+<b>ensures</b> !<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccountTimeLock">MultisigAccountTimeLock</a>&gt;(multisig_address);
+<b>ensures</b> <b>global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(multisig_address) == <b>old</b>(<b>global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(multisig_address));
+</code></pre>
+
+
+
+<a id="@Specification_1_create_transaction"></a>
+
+### Function `create_transaction`
+
+
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_transaction">create_transaction</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, payload: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;)
+</code></pre>
+
+
+
+
+<pre><code><b>pragma</b> aborts_if_is_partial;
+<b>aborts_if</b> len(payload) == 0;
+<b>aborts_if</b> !<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
+<b>aborts_if</b> !<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector_spec_contains">vector::spec_contains</a>(<b>global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>).owners, <a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer_address_of">signer::address_of</a>(owner));
+</code></pre>
+
+
+
+<a id="@Specification_1_create_transaction_with_hash"></a>
+
+### Function `create_transaction_with_hash`
+
+
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_create_transaction_with_hash">create_transaction_with_hash</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, payload_hash: <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;)
+</code></pre>
+
+
+
+
+<pre><code><b>pragma</b> aborts_if_is_partial;
+<b>aborts_if</b> len(payload_hash) != 32;
+<b>aborts_if</b> !<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
+<b>aborts_if</b> !<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector_spec_contains">vector::spec_contains</a>(<b>global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>).owners, <a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer_address_of">signer::address_of</a>(owner));
+</code></pre>
+
+
+
+<a id="@Specification_1_approve_transaction"></a>
+
+### Function `approve_transaction`
+
+
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_approve_transaction">approve_transaction</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64)
+</code></pre>
+
+
+
+
+<pre><code><b>pragma</b> aborts_if_is_partial;
+<b>aborts_if</b> !<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
+<b>aborts_if</b> !<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector_spec_contains">vector::spec_contains</a>(<b>global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>).owners, <a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer_address_of">signer::address_of</a>(owner));
+</code></pre>
+
+
+
+<a id="@Specification_1_reject_transaction"></a>
+
+### Function `reject_transaction`
+
+
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_reject_transaction">reject_transaction</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64)
+</code></pre>
+
+
+
+
+<pre><code><b>pragma</b> aborts_if_is_partial;
+<b>aborts_if</b> !<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
+<b>aborts_if</b> !<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector_spec_contains">vector::spec_contains</a>(<b>global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>).owners, <a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer_address_of">signer::address_of</a>(owner));
+</code></pre>
+
+
+
+<a id="@Specification_1_vote_transanction"></a>
+
+### Function `vote_transanction`
+
+
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_vote_transanction">vote_transanction</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64, approved: bool)
+</code></pre>
+
+
+
+
+<pre><code><b>pragma</b> aborts_if_is_partial;
+<b>aborts_if</b> !<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
+<b>aborts_if</b> !<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector_spec_contains">vector::spec_contains</a>(<b>global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>).owners, <a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer_address_of">signer::address_of</a>(owner));
+<b>aborts_if</b> !<a href="../../topo-stdlib/doc/table.md#0x1_table_spec_contains">table::spec_contains</a>(<b>global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>).transactions, sequence_number);
+</code></pre>
+
+
+
+<a id="@Specification_1_vote_transaction"></a>
+
+### Function `vote_transaction`
+
+
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_vote_transaction">vote_transaction</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>, sequence_number: u64, approved: bool)
+</code></pre>
+
+
+
+
+<pre><code><b>pragma</b> aborts_if_is_partial;
+<b>aborts_if</b> !<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
+<b>aborts_if</b> !<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector_spec_contains">vector::spec_contains</a>(<b>global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>).owners, <a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer_address_of">signer::address_of</a>(owner));
+<b>aborts_if</b> !<a href="../../topo-stdlib/doc/table.md#0x1_table_spec_contains">table::spec_contains</a>(<b>global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>).transactions, sequence_number);
+</code></pre>
+
+
+
+<a id="@Specification_1_execute_rejected_transaction"></a>
+
+### Function `execute_rejected_transaction`
+
+
+<pre><code><b>public</b> entry <b>fun</b> <a href="multisig_account.md#0x1_multisig_account_execute_rejected_transaction">execute_rejected_transaction</a>(owner: &<a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer">signer</a>, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>)
+</code></pre>
+
+
+
+
+<pre><code><b>pragma</b> aborts_if_is_partial;
+<b>aborts_if</b> !<b>exists</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
+<b>aborts_if</b> !<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector_spec_contains">vector::spec_contains</a>(<b>global</b>&lt;<a href="multisig_account.md#0x1_multisig_account_MultisigAccount">MultisigAccount</a>&gt;(<a href="multisig_account.md#0x1_multisig_account">multisig_account</a>).owners, <a href="../../topo-stdlib/../move-stdlib/doc/signer.md#0x1_signer_address_of">signer::address_of</a>(owner));
+</code></pre>
+
+
+
+<a id="@Specification_1_remove_executed_transaction"></a>
+
+### Function `remove_executed_transaction`
+
+
+<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_remove_executed_transaction">remove_executed_transaction</a>(multisig_account_resource: &<b>mut</b> <a href="multisig_account.md#0x1_multisig_account_MultisigAccount">multisig_account::MultisigAccount</a>): (u64, u64)
+</code></pre>
+
+
+
+
+<pre><code><b>pragma</b> aborts_if_is_partial;
+<b>aborts_if</b> multisig_account_resource.last_executed_sequence_number + 1 &gt; MAX_U64;
+<b>aborts_if</b> !<a href="../../topo-stdlib/doc/table.md#0x1_table_spec_contains">table::spec_contains</a>(
+    multisig_account_resource.transactions,
+    multisig_account_resource.last_executed_sequence_number + 1
+);
+<b>ensures</b> multisig_account_resource.last_executed_sequence_number ==
+    <b>old</b>(multisig_account_resource).last_executed_sequence_number + 1;
+</code></pre>
+
+
+
+<a id="@Specification_1_validate_owners"></a>
+
+### Function `validate_owners`
+
+
+<pre><code><b>fun</b> <a href="multisig_account.md#0x1_multisig_account_validate_owners">validate_owners</a>(owners: &<a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>: <b>address</b>)
+</code></pre>
+
+
+
+
+<pre><code><b>pragma</b> aborts_if_is_partial;
+<b>aborts_if</b> <a href="../../topo-stdlib/../move-stdlib/doc/vector.md#0x1_vector_spec_contains">vector::spec_contains</a>(owners, <a href="multisig_account.md#0x1_multisig_account">multisig_account</a>);
 </code></pre>
 
 

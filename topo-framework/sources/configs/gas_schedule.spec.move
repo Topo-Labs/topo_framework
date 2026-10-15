@@ -3,14 +3,14 @@ spec topo_framework::gas_schedule {
     /// No.: 1
     /// Requirement: During genesis, the Aptos framework account should be assigned the gas schedule resource.
     /// Criticality: Medium
-    /// Implementation: The gas_schedule::initialize function calls the assert_aptos_framework function to ensure that
+    /// Implementation: The gas_schedule::initialize function calls the assert_topo_framework function to ensure that
     /// the signer is the topo_framework and then assigns the GasScheduleV2 resource to it.
     /// Enforcement: Formally verified via [high-level-req-1](initialize).
     ///
     /// No.: 2
     /// Requirement: Only the Aptos framework account should be allowed to update the gas schedule resource.
     /// Criticality: Critical
-    /// Implementation: The gas_schedule::set_gas_schedule function calls the assert_aptos_framework function to ensure
+    /// Implementation: The gas_schedule::set_gas_schedule function calls the assert_topo_framework function to ensure
     /// that the signer is the aptos framework account.
     /// Enforcement: Formally verified via [high-level-req-2](set_gas_schedule).
     ///
@@ -39,7 +39,7 @@ spec topo_framework::gas_schedule {
 
         let addr = signer::address_of(topo_framework);
         /// [high-level-req-1]
-        include system_addresses::AbortsIfNotAptosFramework{ account: topo_framework };
+        include system_addresses::AbortsIfNotTopoFramework{ account: topo_framework };
         /// [high-level-req-3.3]
         aborts_if len(gas_schedule_blob) == 0;
         aborts_if exists<GasScheduleV2>(addr);
@@ -54,14 +54,12 @@ spec topo_framework::gas_schedule {
         use topo_framework::staking_config;
         use topo_framework::chain_status;
 
-        // TODO: set because of timeout (property proved)
-        pragma verify_duration_estimate = 600;
         requires exists<CoinInfo<TopoCoin>>(@topo_framework);
         requires chain_status::is_genesis();
         include staking_config::StakingRewardsConfigRequirement;
 
         /// [high-level-req-2]
-        include system_addresses::AbortsIfNotAptosFramework{ account: topo_framework };
+        include system_addresses::AbortsIfNotTopoFramework{ account: topo_framework };
         /// [high-level-req-3.2]
         aborts_if len(gas_schedule_blob) == 0;
         let new_gas_schedule = util::spec_from_bytes<GasScheduleV2>(gas_schedule_blob);
@@ -76,11 +74,12 @@ spec topo_framework::gas_schedule {
         use topo_framework::coin::CoinInfo;
         use topo_framework::topo_coin::TopoCoin;
         use topo_framework::staking_config;
+        aborts_if topo_framework::reconfiguration_state::spec_is_in_progress();
+        aborts_if poc_accounting::is_prepared();
 
-        // TODO: set because of timeout (property proved).
         pragma verify_duration_estimate = 600;
         requires exists<CoinInfo<TopoCoin>>(@topo_framework);
-        include system_addresses::AbortsIfNotAptosFramework{ account: topo_framework };
+        include system_addresses::AbortsIfNotTopoFramework{ account: topo_framework };
         include staking_config::StakingRewardsConfigRequirement;
         aborts_if !exists<StorageGasConfig>(@topo_framework);
         ensures global<StorageGasConfig>(@topo_framework) == config;
@@ -88,8 +87,9 @@ spec topo_framework::gas_schedule {
 
     spec set_for_next_epoch(topo_framework: &signer, gas_schedule_blob: vector<u8>) {
         use topo_framework::util;
+        aborts_if topo_framework::reconfiguration_state::spec_is_in_progress();
 
-        include system_addresses::AbortsIfNotAptosFramework{ account: topo_framework };
+        include system_addresses::AbortsIfNotTopoFramework{ account: topo_framework };
         include config_buffer::SetForNextEpochAbortsIf {
             account: topo_framework,
             config: gas_schedule_blob
@@ -104,8 +104,9 @@ spec topo_framework::gas_schedule {
         use std::bcs;
         use std::features;
         use topo_framework::util;
+        aborts_if topo_framework::reconfiguration_state::spec_is_in_progress();
 
-        include system_addresses::AbortsIfNotAptosFramework{ account: topo_framework };
+        include system_addresses::AbortsIfNotTopoFramework{ account: topo_framework };
         include config_buffer::SetForNextEpochAbortsIf {
             account: topo_framework,
             config: new_gas_schedule_blob
@@ -117,18 +118,13 @@ spec topo_framework::gas_schedule {
     }
 
     spec on_new_epoch(framework: &signer) {
-        requires @topo_framework == std::signer::address_of(framework);
-        include config_buffer::OnNewEpochRequirement<GasScheduleV2>;
-        aborts_if false;
-    }
-
-    spec set_storage_gas_config(topo_framework: &signer, config: storage_gas::StorageGasConfig) {
-        include system_addresses::AbortsIfNotAptosFramework{ account: topo_framework };
-        aborts_if !exists<storage_gas::StorageGasConfig>(@topo_framework);
+        pragma opaque;
+        include config_buffer::OnNewEpochApply<GasScheduleV2>;
     }
 
     spec set_storage_gas_config_for_next_epoch(topo_framework: &signer, config: storage_gas::StorageGasConfig) {
-        include system_addresses::AbortsIfNotAptosFramework{ account: topo_framework };
+        aborts_if topo_framework::reconfiguration_state::spec_is_in_progress();
+        include system_addresses::AbortsIfNotTopoFramework{ account: topo_framework };
         aborts_if !exists<storage_gas::StorageGasConfig>(@topo_framework);
     }
 }

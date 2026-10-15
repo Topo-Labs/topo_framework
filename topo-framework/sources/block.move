@@ -9,6 +9,7 @@ module topo_framework::block {
     use topo_framework::decryption;
 
     use topo_framework::account;
+    use topo_framework::chunky_dkg_config;
     use topo_framework::event::{Self, EventHandle};
     use topo_framework::reconfiguration;
     use topo_framework::reconfiguration_with_dkg;
@@ -92,7 +93,7 @@ module topo_framework::block {
     public(friend) fun initialize(
         topo_framework: &signer, epoch_interval_microsecs: u64
     ) {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
         assert!(
             epoch_interval_microsecs > 0, error::invalid_argument(EZERO_EPOCH_INTERVAL)
         );
@@ -130,11 +131,11 @@ module topo_framework::block {
     }
 
     /// Update the epoch interval.
-    /// Can only be called as part of the Aptos governance proposal process established by the TopoGovernance module.
+    /// Can only be called as part of the Aptos governance proposal process established by the AptosGovernance module.
     public fun update_epoch_interval_microsecs(
         topo_framework: &signer, new_epoch_interval: u64
     ) acquires BlockResource {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
         assert!(new_epoch_interval > 0, error::invalid_argument(EZERO_EPOCH_INTERVAL));
 
         let block_resource = borrow_global_mut<BlockResource>(@topo_framework);
@@ -226,7 +227,12 @@ module topo_framework::block {
         decryption::on_new_block(&vm, epoch, round, option::none());
 
         if (timestamp - reconfiguration::last_reconfiguration_time() >= epoch_interval) {
-            reconfiguration::reconfigure();
+            // 区块触发换届时，目标不合格则延期；本块及后续统计仍计入当前 Epoch。
+            if (stake::is_poc_prepared()) {
+                reconfiguration_with_dkg::try_finish_for_block();
+            } else {
+                reconfiguration::try_reconfigure();
+            };
         };
     }
 
@@ -257,12 +263,24 @@ module topo_framework::block {
         decryption::on_new_block(&vm, epoch, round, option::none());
 
         if (timestamp - reconfiguration::last_reconfiguration_time() >= epoch_interval) {
-            reconfiguration_with_dkg::try_start();
+            // The first epoch with Chunky DKG enabled does not have a
+            // decryption key yet, so consensus still emits V1 block metadata.
+            // Bootstrap both DKG sessions here; later epochs use V2/V3.
+            if (chunky_dkg_config::enabled()) {
+                reconfiguration_with_dkg::try_start_with_chunky_dkg();
+            } else {
+                reconfiguration_with_dkg::try_start();
+            };
+            reconfiguration_with_dkg::try_advance_reconfig();
         };
     }
 
     /// `block_prologue()` but also update the decryption key and trigger
     /// reconfiguration with DKG and Chunky DKG after epoch timed out.
+    ///
+    /// The signature is frozen: testnet runs with decryption enabled, so old
+    /// binaries call this entry with exactly these arguments. New fields go
+    /// into `block_prologue_ext_v3`.
     fun block_prologue_ext_v2(
         vm: signer,
         hash: address,
@@ -291,6 +309,43 @@ module topo_framework::block {
 
         if (timestamp - reconfiguration::last_reconfiguration_time() >= epoch_interval) {
             reconfiguration_with_dkg::try_start_with_chunky_dkg();
+            reconfiguration_with_dkg::try_advance_reconfig();
+        };
+    }
+
+    /// `block_prologue_ext_v2()` but the decryption key arrives paired with
+    /// the dense decryption round it consumed. Emitted by validators once the
+    /// `decryption::PerBlockDecryptionKeyV2` resource exists on chain.
+    fun block_prologue_ext_v3(
+        vm: signer,
+        hash: address,
+        epoch: u64,
+        round: u64,
+        proposer: address,
+        failed_proposer_indices: vector<u64>,
+        previous_block_votes_bitvec: vector<u8>,
+        timestamp: u64,
+        randomness_seed: Option<vector<u8>>,
+        decryption_key: Option<vector<u8>>,
+        decryption_round: Option<u64>
+    ) acquires BlockResource, CommitHistory {
+        let epoch_interval =
+            block_prologue_common(
+                &vm,
+                hash,
+                epoch,
+                round,
+                proposer,
+                failed_proposer_indices,
+                previous_block_votes_bitvec,
+                timestamp
+            );
+        randomness::on_new_block(&vm, epoch, round, randomness_seed);
+        decryption::on_new_block_v2(&vm, epoch, round, decryption_key, decryption_round);
+
+        if (timestamp - reconfiguration::last_reconfiguration_time() >= epoch_interval) {
+            reconfiguration_with_dkg::try_start_with_chunky_dkg();
+            reconfiguration_with_dkg::try_advance_reconfig();
         };
     }
 

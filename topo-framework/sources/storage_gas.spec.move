@@ -88,7 +88,6 @@ spec topo_framework::storage_gas {
 
     /// A non decreasing curve must ensure that next is greater than cur.
     spec new_gas_curve(min_gas: u64, max_gas: u64, points: vector<Point>): GasCurve {
-        pragma verify_duration_estimate = 120; // TODO: set because of timeout (property proved).
         include NewGasCurveAbortsIf;
         include ValidatePointsAbortsIf;
         /// [high-level-req-3]
@@ -120,7 +119,8 @@ spec topo_framework::storage_gas {
 
     /// Signer address must be @topo_framework and StorageGasConfig exists.
     spec set_config(topo_framework: &signer, config: StorageGasConfig) {
-        include system_addresses::AbortsIfNotAptosFramework{ account: topo_framework };
+        aborts_if topo_framework::reconfiguration_state::spec_is_in_progress();
+        include system_addresses::AbortsIfNotTopoFramework{ account: topo_framework };
         aborts_if !exists<StorageGasConfig>(@topo_framework);
     }
 
@@ -128,8 +128,7 @@ spec topo_framework::storage_gas {
     /// Address @topo_framework does not exist StorageGasConfig and StorageGas before the function call is restricted
     /// and exists after the function is executed.
     spec initialize(topo_framework: &signer) {
-        include system_addresses::AbortsIfNotAptosFramework{ account: topo_framework };
-        pragma verify_duration_estimate = 120;
+        include system_addresses::AbortsIfNotTopoFramework{ account: topo_framework };
         aborts_if exists<StorageGasConfig>(@topo_framework);
         aborts_if exists<StorageGas>(@topo_framework);
 
@@ -141,15 +140,12 @@ spec topo_framework::storage_gas {
     /// A non decreasing curve must ensure that next is greater than cur.
     spec validate_points(points: &vector<Point>) {
         pragma aborts_if_is_strict = false;
-        pragma verify = false; // TODO: set because of timeout (property proved).
         pragma opaque;
         include ValidatePointsAbortsIf;
     }
 
     spec calculate_gas(max_usage: u64, current_usage: u64, curve: &GasCurve): u64 {
         pragma opaque;
-        // Not verified when verify_duration_estimate > vc_timeout
-        pragma verify_duration_estimate = 120; // TODO: set because of timeout (property proved).
         requires max_usage > 0;
         requires max_usage <= MAX_U64 / BASIS_POINT_DENOMINATION;
         aborts_if false;
@@ -166,6 +162,7 @@ spec topo_framework::storage_gas {
     /// Address @topo_framework must exist StorageGasConfig and StorageGas and StateStorageUsage.
     spec on_reconfig {
         use topo_framework::chain_status;
+        modifies global<StorageGas>(@topo_framework);
         requires chain_status::is_operating();
         aborts_if !exists<StorageGasConfig>(@topo_framework);
         aborts_if !exists<StorageGas>(@topo_framework);

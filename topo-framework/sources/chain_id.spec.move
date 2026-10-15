@@ -24,6 +24,8 @@ spec topo_framework::chain_id {
 
     spec initialize {
         use std::signer;
+        pragma opaque;
+        modifies global<ChainId>(@topo_framework);
         let addr = signer::address_of(topo_framework);
         aborts_if addr != @topo_framework;
         aborts_if exists<ChainId>(@topo_framework);
@@ -33,7 +35,9 @@ spec topo_framework::chain_id {
     }
 
     spec get {
+        pragma opaque;
         /// [high-level-req-2]
         aborts_if !exists<ChainId>(@topo_framework);
+        ensures result == global<ChainId>(@topo_framework).id;
     }
 }

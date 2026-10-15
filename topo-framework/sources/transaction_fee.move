@@ -3,9 +3,10 @@ module topo_framework::transaction_fee {
     use topo_framework::coin::{Self, AggregatableCoin, BurnCapability, MintCapability};
     use topo_framework::topo_account;
     use topo_framework::topo_coin::TopoCoin;
-    use topo_framework::fungible_asset::BurnRef;
+    use topo_framework::fungible_asset::{BurnRef, MintRef};
     use topo_framework::system_addresses;
     use std::error;
+    use std::features;
     use std::option::Option;
     use topo_framework::event;
 
@@ -24,20 +25,20 @@ module topo_framework::transaction_fee {
     /// No longer supported.
     const ENO_LONGER_SUPPORTED: u64 = 4;
 
-    #[deprecated]
-    /// Stores burn capability to burn the gas fees.
-    struct TopoCoinCapabilities has key {
-        burn_cap: BurnCapability<TopoCoin>
-    }
-
     /// Stores burn capability to burn the gas fees.
     struct AptosFABurnCapabilities has key {
         burn_ref: BurnRef
     }
 
-    /// Stores mint capability to mint the refunds.
+    /// Stores the coin mint capability to mint the refunds. Used as the fallback path when
+    /// `GAS_REFUND_FA_MINT` is disabled or `AptosFAMintCapabilities` is not yet published.
     struct TopoCoinMintCapability has key {
         mint_cap: MintCapability<TopoCoin>
+    }
+
+    /// Stores mint ref to mint the refunds as APT FA. Used when `GAS_REFUND_FA_MINT` is enabled.
+    struct AptosFAMintCapabilities has key {
+        mint_ref: MintRef
     }
 
     #[event]
@@ -74,47 +75,78 @@ module topo_framework::transaction_fee {
     }
 
     /// Burn transaction fees in epilogue.
-    public(friend) fun burn_fee(
+    friend fun burn_fee(
         account: address, fee: u64
     ) {
-        let burn_ref =
-            &borrow_global<AptosFABurnCapabilities>(@topo_framework).burn_ref;
+        let burn_ref = &AptosFABurnCapabilities[@topo_framework].burn_ref;
         topo_account::burn_from_fungible_store_for_gas(burn_ref, account, fee);
     }
 
     /// Mint refund in epilogue.
-    public(friend) fun mint_and_refund(
+    friend fun mint_and_refund(
         account: address, refund: u64
-    ) acquires TopoCoinMintCapability {
-        let mint_cap = &borrow_global<TopoCoinMintCapability>(@topo_framework).mint_cap;
-        let refund_coin = coin::mint(refund, mint_cap);
-        coin::deposit_for_gas_fee(account, refund_coin);
+    ) {
+        if (features::gas_refund_fa_mint_enabled()
+            && exists<AptosFAMintCapabilities>(@topo_framework)) {
+            let mint_ref = &AptosFAMintCapabilities[@topo_framework].mint_ref;
+            topo_account::mint_to_fungible_store_for_gas(mint_ref, account, refund);
+        } else {
+            let mint_cap = &TopoCoinMintCapability[@topo_framework].mint_cap;
+            let refund_coin = coin::mint(refund, mint_cap);
+            coin::deposit_for_gas_fee(account, refund_coin);
+        }
     }
 
     /// Only called during genesis.
-    public(friend) fun store_topo_coin_burn_cap(
+    friend fun store_topo_coin_burn_cap(
         topo_framework: &signer, burn_cap: BurnCapability<TopoCoin>
     ) {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
 
         let burn_ref = coin::convert_and_take_paired_burn_ref(burn_cap);
         move_to(topo_framework, AptosFABurnCapabilities { burn_ref });
     }
 
     /// Only called during genesis.
-    public(friend) fun store_topo_coin_mint_cap(
+    friend fun store_topo_coin_mint_cap(
         topo_framework: &signer, mint_cap: MintCapability<TopoCoin>
     ) {
-        system_addresses::assert_aptos_framework(topo_framework);
-        move_to(topo_framework, TopoCoinMintCapability { mint_cap })
+        system_addresses::assert_topo_framework(topo_framework);
+        // Store the FA mint ref (used when GAS_REFUND_FA_MINT is enabled) and keep the legacy
+        // coin mint cap as the fallback, so the feature flag remains a safe two-way switch.
+        let mint_ref = coin::get_paired_mint_copy_ref(&mint_cap);
+        move_to(topo_framework, AptosFAMintCapabilities { mint_ref });
+        move_to(topo_framework, TopoCoinMintCapability { mint_cap });
     }
 
-    // Called by the VM after epilogue.
-    fun emit_fee_statement(fee_statement: FeeStatement) {
+    /// Migrate an existing chain from the legacy `TopoCoinMintCapability` (coin `MintCapability`)
+    /// to `AptosFAMintCapabilities` (FA `MintRef`), so gas refunds mint APT FA directly without
+    /// touching the legacy coin supply aggregator. Gated by the topo_framework signer (governance).
+    public entry fun convert_to_aptos_fa_mint_ref(
+        topo_framework: &signer
+    ) acquires TopoCoinMintCapability {
+        system_addresses::assert_topo_framework(topo_framework);
+        let mint_cap = &TopoCoinMintCapability[@topo_framework].mint_cap;
+        let mint_ref = coin::get_paired_mint_copy_ref(mint_cap);
+        move_to(topo_framework, AptosFAMintCapabilities { mint_ref });
+    }
+
+    /// Called by epilogue only.
+    friend fun emit_fee_statement(fee_statement: FeeStatement) {
         event::emit(fee_statement)
     }
 
+    friend fun storage_fee_refund_octas(self: &FeeStatement): u64 {
+        self.storage_fee_refund_octas
+    }
+
     // DEPRECATED section:
+
+    #[deprecated]
+    /// Stores burn capability to burn the gas fees.
+    struct TopoCoinCapabilities has key {
+        burn_cap: BurnCapability<TopoCoin>
+    }
 
     #[deprecated]
     /// DEPRECATED: Stores information about the block proposer and the amount of fees
@@ -128,7 +160,7 @@ module topo_framework::transaction_fee {
     #[deprecated]
     /// DEPRECATED
     public fun initialize_fee_collection_and_distribution(
-        _aptos_framework: &signer, _burn_percentage: u8
+        _topo_framework: &signer, _burn_percentage: u8
     ) {
         abort error::not_implemented(ENO_LONGER_SUPPORTED)
     }
@@ -136,7 +168,7 @@ module topo_framework::transaction_fee {
     #[deprecated]
     /// DEPRECATED
     public fun upgrade_burn_percentage(
-        _aptos_framework: &signer, _new_burn_percentage: u8
+        _topo_framework: &signer, _new_burn_percentage: u8
     ) {
         abort error::not_implemented(ENO_LONGER_SUPPORTED)
     }
@@ -148,7 +180,7 @@ module topo_framework::transaction_fee {
 
     #[deprecated]
     public entry fun convert_to_aptos_fa_burn_ref(
-        _aptos_framework: &signer
+        _topo_framework: &signer
     ) {
         abort error::not_implemented(ENO_LONGER_SUPPORTED)
     }

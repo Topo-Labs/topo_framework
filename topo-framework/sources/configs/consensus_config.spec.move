@@ -3,7 +3,7 @@ spec topo_framework::consensus_config {
     /// No.: 1
     /// Requirement: During genesis, the Aptos framework account should be assigned the consensus config resource.
     /// Criticality: Medium
-    /// Implementation: The consensus_config::initialize function calls the assert_aptos_framework function to ensure
+    /// Implementation: The consensus_config::initialize function calls the assert_topo_framework function to ensure
     /// that the signer is the topo_framework and then assigns the ConsensusConfig resource to it.
     /// Enforcement: Formally verified via [high-level-req-1](initialize).
     ///
@@ -34,7 +34,7 @@ spec topo_framework::consensus_config {
         use std::signer;
         let addr = signer::address_of(topo_framework);
         /// [high-level-req-1]
-        aborts_if !system_addresses::is_aptos_framework_address(addr);
+        aborts_if !system_addresses::is_topo_framework_address(addr);
         aborts_if exists<ConsensusConfig>(@topo_framework);
         /// [high-level-req-3.1]
         aborts_if !(len(config) > 0);
@@ -51,12 +51,10 @@ spec topo_framework::consensus_config {
         use topo_framework::topo_coin::TopoCoin;
         use topo_framework::staking_config;
 
-        // TODO: set because of timeout (property proved)
-        pragma verify_duration_estimate = 600;
         include staking_config::StakingRewardsConfigRequirement;
         let addr = signer::address_of(account);
         /// [high-level-req-2]
-        aborts_if !system_addresses::is_aptos_framework_address(addr);
+        aborts_if !system_addresses::is_topo_framework_address(addr);
         aborts_if !exists<ConsensusConfig>(@topo_framework);
         /// [high-level-req-3.2]
         aborts_if !(len(config) > 0);
@@ -68,13 +66,19 @@ spec topo_framework::consensus_config {
     }
 
     spec set_for_next_epoch(account: &signer, config: vector<u8>) {
+        aborts_if topo_framework::reconfiguration_state::spec_is_in_progress();
+        pragma opaque;
+        modifies global<config_buffer::PendingConfigs>(@topo_framework);
         include config_buffer::SetForNextEpochAbortsIf;
+        let key = std::type_info::type_name<ConsensusConfig>();
+        let post configs_post = global<config_buffer::PendingConfigs>(@topo_framework).configs;
+        ensures std::simple_map::spec_contains_key(configs_post, key);
+        ensures std::simple_map::spec_get(configs_post, key) == std::any::pack(ConsensusConfig { config });
     }
 
     spec on_new_epoch(framework: &signer) {
-        requires @topo_framework == std::signer::address_of(framework);
-        include config_buffer::OnNewEpochRequirement<ConsensusConfig>;
-        aborts_if false;
+        pragma opaque;
+        include config_buffer::OnNewEpochApply<ConsensusConfig>;
     }
 
     spec validator_txn_enabled(): bool {

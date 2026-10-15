@@ -1,9 +1,9 @@
 #[test_only]
 module topo_framework::native_dispatch_token_tests {
     use topo_framework::fungible_asset;
-    use 0xcafe::native_dispatch_token;
+    use topo_framework::native_dispatch_token;
 
-    #[test(creator = @0xcafe)]
+    #[test(creator = @topo_framework)]
     #[expected_failure(abort_code=0x10019, location=topo_framework::fungible_asset)]
     fun test_native_dispatch_token(
         creator: &signer,

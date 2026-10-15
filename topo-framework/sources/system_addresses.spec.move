@@ -12,9 +12,9 @@ spec topo_framework::system_addresses {
     /// Requirement: Asserting that a provided address corresponds to the Aptos Framework Resources address should always
     /// yield a true result when matched.
     /// Criticality: High
-    /// Implementation: The assert_aptos_framework function ensures that the provided signer belongs to the
+    /// Implementation: The assert_topo_framework function ensures that the provided signer belongs to the
     /// @topo_framework account.
-    /// Enforcement: Formally verified via [high-level-req-2](AbortsIfNotAptosFramework).
+    /// Enforcement: Formally verified via [high-level-req-2](AbortsIfNotTopoFramework).
     ///
     /// No.: 3
     /// Requirement: Asserting that a provided address corresponds to the VM address should always yield a true result when
@@ -52,20 +52,38 @@ spec topo_framework::system_addresses {
         aborts_if addr != @core_resources with error::PERMISSION_DENIED;
     }
 
-    spec assert_aptos_framework(account: &signer) {
+    spec assert_topo_framework(account: &signer) {
         pragma opaque;
-        include AbortsIfNotAptosFramework;
+        include AbortsIfNotTopoFramework;
+    }
+
+    spec is_topo_framework_address(addr: address): bool {
+        pragma opaque;
+        aborts_if false;
+        ensures result == (addr == @topo_framework);
     }
 
     spec assert_framework_reserved_address(account: &signer) {
+        pragma opaque;
         aborts_if !is_framework_reserved_address(signer::address_of(account));
     }
 
     spec assert_framework_reserved(addr: address) {
+        pragma opaque;
         aborts_if !is_framework_reserved_address(addr);
     }
+
+    spec is_framework_reserved_address(addr: address): bool {
+        pragma opaque;
+        aborts_if false;
+        ensures result ==
+            (addr == @topo_framework
+             || addr == @0x2 || addr == @0x3 || addr == @0x4 || addr == @0x5
+             || addr == @0x6 || addr == @0x7 || addr == @0x8 || addr == @0x9
+             || addr == @0xa);
+    }
     /// Specifies that a function aborts if the account does not have the aptos framework address.
-    spec schema AbortsIfNotAptosFramework {
+    spec schema AbortsIfNotTopoFramework {
         account: signer;
         /// [high-level-req-2]
         aborts_if signer::address_of(account) != @topo_framework with error::PERMISSION_DENIED;
@@ -74,6 +92,24 @@ spec topo_framework::system_addresses {
     spec assert_vm(account: &signer) {
         pragma opaque;
         include AbortsIfNotVM;
+    }
+
+    spec is_vm(account: &signer): bool {
+        pragma opaque;
+        aborts_if false;
+        ensures result == (signer::address_of(account) == @vm_reserved);
+    }
+
+    spec is_vm_address(addr: address): bool {
+        pragma opaque;
+        aborts_if false;
+        ensures result == (addr == @vm_reserved);
+    }
+
+    spec is_reserved_address(addr: address): bool {
+        pragma opaque;
+        aborts_if false;
+        ensures result == (addr == @topo_framework || addr == @vm_reserved);
     }
 
     /// Specifies that a function aborts if the account does not have the VM reserved address.

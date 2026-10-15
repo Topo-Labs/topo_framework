@@ -3,7 +3,7 @@
 module topo_std::federated_keyless {
     use topo_std::bcs_stream;
     use topo_std::keyless;
-    use std::error;
+    use topo_std::error;
 
     #[test_only]
     friend topo_std::federated_keyless_tests;

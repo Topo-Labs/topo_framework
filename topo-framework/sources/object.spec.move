@@ -46,22 +46,15 @@ spec topo_framework::object {
     /// </high-level-req>
     ///
     spec module {
-        pragma verify = false;
-        pragma aborts_if_is_partial;
-    }
-
-    spec grant_permission {
-        pragma aborts_if_is_partial;
-        aborts_if !permissioned_signer::spec_is_permissioned_signer(permissioned_signer);
-        aborts_if permissioned_signer::spec_is_permissioned_signer(master);
-        aborts_if signer::address_of(master) != signer::address_of(permissioned_signer);
+        pragma verify = true;
     }
 
     spec fun spec_exists_at<T: key>(object: address): bool;
 
     spec exists_at<T: key>(object: address): bool {
         pragma opaque;
-        ensures [abstract] result == spec_exists_at<T>(object);
+        aborts_if false;
+        ensures result == spec_exists_at<T>(object);
     }
 
 
@@ -121,7 +114,6 @@ spec topo_framework::object {
 
     spec create_object_address(source: &address, seed: vector<u8>): address {
         pragma opaque;
-        pragma aborts_if_is_strict = false;
         aborts_if [abstract] false;
         ensures [abstract] result == spec_create_object_address(source, seed);
     }
@@ -130,19 +122,18 @@ spec topo_framework::object {
 
     spec create_user_derived_object_address_impl(source: address, derive_from: address): address {
         pragma opaque;
+        aborts_if [abstract] false;
         ensures [abstract] result == spec_create_user_derived_object_address_impl(source, derive_from);
     }
 
     spec create_user_derived_object_address(source: address, derive_from: address): address {
         pragma opaque;
-        pragma aborts_if_is_strict = false;
         aborts_if [abstract] false;
         ensures [abstract] result == spec_create_user_derived_object_address(source, derive_from);
     }
 
     spec create_guid_object_address(source: address, creation_num: u64): address {
         pragma opaque;
-        pragma aborts_if_is_strict = false;
         aborts_if [abstract] false;
         ensures [abstract] result == spec_create_guid_object_address(source, creation_num);
     }
@@ -204,13 +195,24 @@ spec topo_framework::object {
     }
 
     spec create_object_from_account(creator: &signer): ConstructorRef {
-        aborts_if !exists<account::Account>(signer::address_of(creator));
-        //Guid properties
-        let object_data = global<account::Account>(signer::address_of(creator));
-        aborts_if object_data.guid_creation_num + 1 > MAX_U64;
-        aborts_if object_data.guid_creation_num + 1 >= account::MAX_GUID_CREATION_NUM;
-        let creation_num = object_data.guid_creation_num;
+        use std::features;
+        use std::features::DEFAULT_ACCOUNT_RESOURCE;
         let addr = signer::address_of(creator);
+        let account_exists_pre = exists<account::Account>(addr);
+        let feature_on = features::spec_is_enabled(DEFAULT_ACCOUNT_RESOURCE);
+
+        aborts_if !account_exists_pre && !feature_on;
+        aborts_if !account_exists_pre && feature_on
+            && (addr == @vm_reserved || addr == @topo_framework || addr == @aptos_token);
+        aborts_if !account_exists_pre && feature_on
+            && len(bcs::to_bytes(addr)) != 32;
+
+        let creation_num = if (account_exists_pre) {
+            global<account::Account>(addr).guid_creation_num
+        } else {
+            2
+        };
+        aborts_if creation_num + 1 >= account::MAX_GUID_CREATION_NUM;
 
         let guid = guid::GUID {
             id: guid::ID {
@@ -218,7 +220,6 @@ spec topo_framework::object {
                 addr,
             }
         };
-
         let bytes_spec = bcs::to_bytes(guid);
         let bytes = concat(bytes_spec, vec<u8>(OBJECT_FROM_GUID_ADDRESS_SCHEME));
         let hash_bytes = hash::sha3_256(bytes);
@@ -226,9 +227,8 @@ spec topo_framework::object {
         aborts_if exists<ObjectCore>(obj_addr);
         aborts_if !from_bcs::deserializable<address>(hash_bytes);
 
-        ensures global<account::Account>(addr).guid_creation_num == old(
-            global<account::Account>(addr)
-        ).guid_creation_num + 1;
+        ensures exists<account::Account>(addr);
+        ensures global<account::Account>(addr).guid_creation_num == creation_num + 1;
         ensures exists<ObjectCore>(obj_addr);
         ensures global<ObjectCore>(obj_addr) == ObjectCore {
             guid_creation_num: INIT_GUID_CREATION_NUM + 1,
@@ -315,8 +315,11 @@ spec topo_framework::object {
     }
 
     spec create_sticky_object_at_address(owner_address: address, object_address: address): ConstructorRef {
-        // TODO(fa_migration)
-        pragma verify = false;
+        /// [high-level-req-1]
+        aborts_if exists<ObjectCore>(object_address);
+        ensures exists<ObjectCore>(object_address);
+        ensures global<ObjectCore>(object_address).guid_creation_num == INIT_GUID_CREATION_NUM + 1;
+        ensures result == ConstructorRef { self: object_address, can_delete: false };
     }
 
     spec create_object_internal(
@@ -545,9 +548,9 @@ spec topo_framework::object {
         ensures result == global<ObjectCore>(self.inner).allow_ungated_transfer;
     }
 
-    spec is_owner<T: key>(self: Object<T>, owner: address): bool {
-        aborts_if !exists<ObjectCore>(self.inner);
-        ensures result == (global<ObjectCore>(self.inner).owner == owner);
+    spec is_owner<T: key>(object: Object<T>, owner: address): bool {
+        aborts_if !exists<ObjectCore>(object.inner);
+        ensures result == (global<ObjectCore>(object.inner).owner == owner);
     }
 
     spec owner<T: key>(self: Object<T>): address {
@@ -555,12 +558,12 @@ spec topo_framework::object {
         ensures result == global<ObjectCore>(self.inner).owner;
     }
 
-    spec owns<T: key>(self: Object<T>, owner: address): bool {
+    spec owns<T: key>(object: Object<T>, owner: address): bool {
         pragma aborts_if_is_partial;
-        let current_address_0 = self.inner;
+        let current_address_0 = object.inner;
         let object_0 = global<ObjectCore>(current_address_0);
         let current_address = object_0.owner;
-        aborts_if self.inner != owner && !exists<ObjectCore>(self.inner);
+        aborts_if object.inner != owner && !exists<ObjectCore>(object.inner);
         ensures current_address_0 == owner ==> result == true;
     }
 

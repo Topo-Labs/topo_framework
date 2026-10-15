@@ -1,48 +1,9 @@
-/// Genesis module — bootstraps the entire Topo chain from a blank state.
-///
-/// ## Responsibilities
-///
-/// This module is the single entry point called by the Rust genesis builder to initialize
-/// every on-chain resource before the first block is produced. It wires together all
-/// framework modules in the correct dependency order.
-///
-/// ## Initialization Sequence
-///
-/// Step 1 — `initialize`: Core framework accounts and protocol modules
-///   - Create @topo_framework account; hand control to topo_governance
-///   - Reserve framework addresses @0x2–@0xa under governance
-///   - Initialize: consensus_config, execution_config, version, stake, staking_config,
-///     storage_gas, gas_schedule, aggregator_factory, chain_id, reconfiguration,
-///     block, state_storage, nonce_validation, transaction_validation
-///
-/// Step 2 — `initialize_topo_coin`: Mint/burn capabilities
-///   - Create TopoCoin with mint + burn caps
-///   - Distribute caps: stake (mint for rewards), staking_registry (mint for rewards),
-///     transaction_fee (burn for gas, mint for refunds)
-///
-/// Step 3 — `create_accounts`: Fund initial accounts from the genesis config
-///
-/// Step 4 — `create_initialize_validators_with_commission`: Bootstrap the validator set
-///   - `ensure_poc_staking_initialized`: Initialize poc_power_store and staking_registry
-///   - For each validator: create account, initialize stake pool, register in staking_registry,
-///     seed genesis POC power, deposit stake, delegate, join validator set
-///   - Destroy the framework mint cap (no more minting outside of reward distribution)
-///   - `stake::on_new_epoch`: activate the genesis validator set
-///
-/// Step 5 — `set_genesis_end`: Mark chain as operational
-///
-/// ## Key Design Decisions
-///
-/// - `ensure_poc_staking_initialized` is idempotent and computes cooldown_secs as
-///   max(recurring_lockup_duration, governance_voting_duration) to prevent governance attacks.
-/// - Genesis validators receive POC power seeded from their stake amount via
-///   `staking_registry::calculate_genesis_power_from_stake`, bootstrapping the POC system
-///   before any real contribution events have been emitted.
-/// - The framework mint cap is destroyed after genesis; all subsequent TopoCoin minting
-///   goes through the staking_registry's stored mint cap (for rewards only).
 module topo_framework::genesis {
     use std::error;
+    use std::fixed_point32;
     use std::vector;
+
+    use topo_std::simple_map;
 
     use topo_framework::account;
     use topo_framework::aggregator_factory;
@@ -57,32 +18,40 @@ module topo_framework::genesis {
     use topo_framework::execution_config;
     use topo_framework::create_signer::create_signer;
     use topo_framework::gas_schedule;
+    use topo_framework::transaction_limits;
     use topo_framework::nonce_validation;
-    use topo_framework::poc_power_store;
+    use topo_framework::poc_registry;
     use topo_framework::reconfiguration;
     use topo_framework::stake;
-    use topo_framework::staking_registry;
+    use topo_framework::staking_contract;
     use topo_framework::staking_config;
     use topo_framework::state_storage;
     use topo_framework::storage_gas;
+    use topo_framework::system_addresses;
     use topo_framework::timestamp;
     use topo_framework::transaction_fee;
     use topo_framework::transaction_validation;
     use topo_framework::version;
+    use topo_framework::vesting;
 
     const EDUPLICATE_ACCOUNT: u64 = 1;
-    // Default exchange rate: 1,000,000 octas of deposit backs 1,000,000 units of POC power.
-    // This keeps genesis bootstrap compatible with local networks that use tiny default stakes.
-    // Governance or the framework account can raise this value after initialization through
-    // staking_registry::set_octas_per_million_power when a stricter economic backing ratio is required.
-    const DEFAULT_OCTAS_PER_MILLION_POWER: u64 = 1000000;
-    // Maximum number of delegators allowed per validator pool.
-    // Caps iteration cost during reward distribution at epoch boundaries.
-    const DEFAULT_MAX_DELEGATORS_PER_VALIDATOR: u64 = 1000;
+    const EACCOUNT_DOES_NOT_EXIST: u64 = 2;
+    const EINVALID_INITIAL_RAW_POWER: u64 = 3;
+
+    /// PoC 创世的初始算力周期长度，后续可通过治理调整未来周期。
+    const POC_POWER_PERIOD_IN_EPOCHS: u64 = 60;
 
     struct AccountMap has drop {
         account_address: address,
         balance: u64,
+    }
+
+    struct EmployeeAccountMap has copy, drop {
+        accounts: vector<address>,
+        validator: ValidatorConfigurationWithCommission,
+        vesting_schedule_numerator: vector<u64>,
+        vesting_schedule_denominator: u64,
+        beneficiary_resetter: address,
     }
 
     struct ValidatorConfiguration has copy, drop {
@@ -103,17 +72,6 @@ module topo_framework::genesis {
     }
 
     /// Genesis step 1: Initialize aptos framework account and core modules on chain.
-    ///
-    /// Called first by the Rust genesis builder. Sets up every protocol-level resource
-    /// that must exist before any transaction can be processed.
-    ///
-    /// Key actions:
-    /// - Creates @topo_framework as a framework-reserved account and hands its
-    ///   SignerCapability to topo_governance (decentralized on-chain governance owns the framework).
-    /// - Reserves @0x2–@0xa under governance as well (future protocol expansion slots).
-    /// - Initializes staking_config with the genesis validator set parameters
-    ///   (minimum/maximum stake, lockup duration, rewards rate, voting power increase limit).
-    /// - Initializes block module with epoch_interval_microsecs (controls epoch length).
     fun initialize(
         gas_schedule: vector<u8>,
         chain_id: u8,
@@ -132,36 +90,37 @@ module topo_framework::genesis {
         // Initialize the aptos framework account. This is the account where system resources and modules will be
         // deployed to. This will be entirely managed by on-chain governance and no entities have the key or privileges
         // to use this account.
-        let (aptos_framework_account, aptos_framework_signer_cap) = account::create_framework_reserved_account(@topo_framework);
+        let (topo_framework_account, topo_framework_signer_cap) = account::create_framework_reserved_account(@topo_framework);
         // Initialize account configs on aptos framework account.
-        account::initialize(&aptos_framework_account);
+        account::initialize(&topo_framework_account);
+        poc_registry::initialize(&topo_framework_account);
 
         transaction_validation::initialize(
-            &aptos_framework_account,
+            &topo_framework_account,
             b"script_prologue",
             b"module_prologue",
             b"multi_agent_script_prologue",
             b"epilogue",
         );
         // Give the decentralized on-chain governance control over the core framework account.
-        topo_governance::store_signer_cap(&aptos_framework_account, @topo_framework, aptos_framework_signer_cap);
+        topo_governance::store_signer_cap(&topo_framework_account, @topo_framework, topo_framework_signer_cap);
 
         // put reserved framework reserved accounts under aptos governance
         let framework_reserved_addresses = vector<address>[@0x2, @0x3, @0x4, @0x5, @0x6, @0x7, @0x8, @0x9, @0xa];
         while (!framework_reserved_addresses.is_empty()) {
             let address = framework_reserved_addresses.pop_back();
             let (_, framework_signer_cap) = account::create_framework_reserved_account(address);
-            topo_governance::store_signer_cap(&aptos_framework_account, address, framework_signer_cap);
+            topo_governance::store_signer_cap(&topo_framework_account, address, framework_signer_cap);
         };
 
-        consensus_config::initialize(&aptos_framework_account, consensus_config);
-        execution_config::set(&aptos_framework_account, execution_config);
-        version::initialize(&aptos_framework_account, initial_version);
-        stake::initialize(&aptos_framework_account);
-        stake::initialize_pending_transaction_fee(&aptos_framework_account);
-        timestamp::set_time_has_started(&aptos_framework_account);
+        consensus_config::initialize(&topo_framework_account, consensus_config);
+        execution_config::set(&topo_framework_account, execution_config);
+        version::initialize(&topo_framework_account, initial_version);
+        stake::initialize(&topo_framework_account);
+        stake::initialize_pending_transaction_fee(&topo_framework_account);
+        timestamp::set_time_has_started(&topo_framework_account);
         staking_config::initialize(
-            &aptos_framework_account,
+            &topo_framework_account,
             minimum_stake,
             maximum_stake,
             recurring_lockup_duration_secs,
@@ -170,28 +129,42 @@ module topo_framework::genesis {
             rewards_rate_denominator,
             voting_power_increase_limit,
         );
-        storage_gas::initialize(&aptos_framework_account);
-        gas_schedule::initialize(&aptos_framework_account, gas_schedule);
+        storage_gas::initialize(&topo_framework_account);
+        gas_schedule::initialize(&topo_framework_account, gas_schedule);
 
         // Ensure we can create aggregators for supply, but not enable it for common use just yet.
-        aggregator_factory::initialize_aggregator_factory(&aptos_framework_account);
+        aggregator_factory::initialize_aggregator_factory(&topo_framework_account);
 
-        chain_id::initialize(&aptos_framework_account, chain_id);
-        reconfiguration::initialize(&aptos_framework_account);
-        block::initialize(&aptos_framework_account, epoch_interval_microsecs);
-        state_storage::initialize(&aptos_framework_account);
-        nonce_validation::initialize(&aptos_framework_account);
+        chain_id::initialize(&topo_framework_account, chain_id);
+        reconfiguration::initialize(&topo_framework_account);
+        block::initialize(&topo_framework_account, epoch_interval_microsecs);
+        state_storage::initialize(&topo_framework_account);
+        nonce_validation::initialize(&topo_framework_account);
+
+        transaction_limits::initialize(
+            &topo_framework_account,
+            // Execution tiers:
+            //   2x: 1M APT
+            //   4x: 5M APT
+            //   8x: 10M APT
+            vector[
+                transaction_limits::new_tier(1_000_000_0000_0000, 200),
+                transaction_limits::new_tier(5_000_000_0000_0000, 400),
+                transaction_limits::new_tier(10_000_000_0000_0000, 800),
+            ],
+            // IO tiers:
+            //   2x: 5M APT
+            //   4x: 10M APT
+            //   8x: 20M APT
+            vector[
+                transaction_limits::new_tier(5_000_000_0000_0000, 200),
+                transaction_limits::new_tier(10_000_000_0000_0000, 400),
+                transaction_limits::new_tier(20_000_000_0000_0000, 800),
+            ],
+        );
     }
 
-    /// Genesis step 2: Initialize Topo coin and distribute mint/burn capabilities.
-    ///
-    /// Creates TopoCoin with both mint and burn capabilities, then distributes them:
-    /// - stake module gets MintCapability to mint staking rewards each epoch
-    /// - staking_registry gets a copy of MintCapability for its own reward distribution path
-    /// - transaction_fee module gets BurnCapability (to burn gas fees) and MintCapability (to mint refunds)
-    ///
-    /// After `create_initialize_validators_with_commission` completes, the framework's
-    /// own mint cap is destroyed — no entity outside of the stored caps can mint TopoCoin.
+    /// Genesis step 2: Initialize Aptos coin.
     fun initialize_topo_coin(topo_framework: &signer) {
         let (burn_cap, mint_cap) = topo_coin::initialize(topo_framework);
 
@@ -200,8 +173,6 @@ module topo_framework::genesis {
 
         // Give stake module MintCapability<TopoCoin> so it can mint rewards.
         stake::store_topo_coin_mint_cap(topo_framework, mint_cap);
-        // Cache a copy for staking_registry so genesis can initialize it later without Rust changes.
-        staking_registry::store_topo_coin_mint_cap(topo_framework, mint_cap);
         // Give transaction_fee module BurnCapability<TopoCoin> so it can burn gas.
         transaction_fee::store_topo_coin_burn_cap(topo_framework, burn_cap);
         // Give transaction_fee module MintCapability<TopoCoin> so it can mint refunds.
@@ -209,7 +180,7 @@ module topo_framework::genesis {
     }
 
     /// Only called for testnets and e2e tests.
-    public fun initialize_core_resources_and_topo_coin(
+    fun initialize_core_resources_and_topo_coin(
         topo_framework: &signer,
         core_resources_auth_key: vector<u8>,
     ) {
@@ -220,8 +191,6 @@ module topo_framework::genesis {
 
         // Give stake module MintCapability<TopoCoin> so it can mint rewards.
         stake::store_topo_coin_mint_cap(topo_framework, mint_cap);
-        // Cache a copy for staking_registry so test-only flows can opt into the new path.
-        staking_registry::store_topo_coin_mint_cap(topo_framework, mint_cap);
         // Give transaction_fee module BurnCapability<TopoCoin> so it can burn gas.
         transaction_fee::store_topo_coin_burn_cap(topo_framework, burn_cap);
         // Give transaction_fee module MintCapability<TopoCoin> so it can mint refunds.
@@ -229,7 +198,7 @@ module topo_framework::genesis {
 
         let core_resources = account::create_account(@core_resources);
         account::rotate_authentication_key_internal(&core_resources, core_resources_auth_key);
-        topo_account::register_topo(&core_resources); // registers TOPO store
+        topo_account::register_apt(&core_resources); // registers APT store
         topo_coin::configure_accounts_for_test(topo_framework, &core_resources, mint_cap);
     }
 
@@ -238,10 +207,10 @@ module topo_framework::genesis {
         accounts.for_each_ref(|account_map| {
             let account_map: &AccountMap = account_map;
             assert!(
-                !unique_accounts.contains(&account_map.account_address),
+                !vector::contains(&unique_accounts, &account_map.account_address),
                 error::already_exists(EDUPLICATE_ACCOUNT),
             );
-            unique_accounts.push_back(account_map.account_address);
+            vector::push_back(&mut unique_accounts, account_map.account_address);
 
             create_account(
                 topo_framework,
@@ -267,60 +236,166 @@ module topo_framework::genesis {
         account
     }
 
-    /// Initialize poc_power_store and staking_registry if not already done.
-    ///
-    /// Idempotent: safe to call multiple times (both sub-initializations guard themselves).
-    ///
-    /// cooldown_secs is set to max(recurring_lockup_duration, governance_voting_duration).
-    /// This ensures a user who undelegates cannot re-delegate and vote again within the same
-    /// governance proposal window, preventing double-influence attacks.
-    ///
-    /// poc_power_store is initialized with @topo_framework as the operator, meaning only
-    /// the framework (via governance) can upload power updates initially. The operator can
-    /// be changed later via `poc_power_store::set_operator`.
-    fun ensure_poc_staking_initialized(topo_framework: &signer) {
-        if (poc_power_store::get_operator() == @0x0) {
-            poc_power_store::initialize(topo_framework, @topo_framework);
-        };
+    fun create_employee_validators(
+        employee_vesting_start: u64,
+        employee_vesting_period_duration: u64,
+        employees: vector<EmployeeAccountMap>,
+    ) {
+        let unique_accounts = vector::empty();
 
-        let recurring_lockup_duration =
-            staking_config::get_recurring_lockup_duration(&staking_config::get());
-        let governance_voting_duration =
-            if (topo_governance::has_governance_config()) {
-                topo_governance::get_voting_duration_secs()
-            } else {
-                0
+        employees.for_each_ref(|employee_group| {
+            let j = 0;
+            let employee_group: &EmployeeAccountMap = employee_group;
+            let num_employees_in_group = vector::length(&employee_group.accounts);
+
+            let buy_ins = simple_map::create();
+
+            while (j < num_employees_in_group) {
+                let account = vector::borrow(&employee_group.accounts, j);
+                assert!(
+                    !vector::contains(&unique_accounts, account),
+                    error::already_exists(EDUPLICATE_ACCOUNT),
+                );
+                vector::push_back(&mut unique_accounts, *account);
+
+                let employee = create_signer(*account);
+                let total = coin::balance<TopoCoin>(*account);
+                let coins = coin::withdraw<TopoCoin>(&employee, total);
+                simple_map::add(&mut buy_ins, *account, coins);
+
+                j += 1;
             };
-        // Use the longer of the two durations to prevent governance timing attacks
-        let cooldown_secs =
-            if (recurring_lockup_duration > governance_voting_duration) {
-                recurring_lockup_duration
-            } else {
-                governance_voting_duration
+
+            let j = 0;
+            let num_vesting_events = vector::length(&employee_group.vesting_schedule_numerator);
+            let schedule = vector::empty();
+
+            while (j < num_vesting_events) {
+                let numerator = vector::borrow(&employee_group.vesting_schedule_numerator, j);
+                let event = fixed_point32::create_from_rational(*numerator, employee_group.vesting_schedule_denominator);
+                vector::push_back(&mut schedule, event);
+
+                j += 1;
             };
-        staking_registry::initialize(
-            topo_framework,
-            DEFAULT_OCTAS_PER_MILLION_POWER,
-            DEFAULT_MAX_DELEGATORS_PER_VALIDATOR,
-            cooldown_secs,
-        );
+
+            let vesting_schedule = vesting::create_vesting_schedule(
+                schedule,
+                employee_vesting_start,
+                employee_vesting_period_duration,
+            );
+
+            let admin = employee_group.validator.validator_config.owner_address;
+            let admin_signer = &create_signer(admin);
+            let contract_address = vesting::create_vesting_contract(
+                admin_signer,
+                &employee_group.accounts,
+                buy_ins,
+                vesting_schedule,
+                admin,
+                employee_group.validator.validator_config.operator_address,
+                employee_group.validator.validator_config.voter_address,
+                employee_group.validator.commission_percentage,
+                x"",
+            );
+            let pool_address = vesting::stake_pool_address(contract_address);
+
+            if (employee_group.beneficiary_resetter != @0x0) {
+                vesting::set_beneficiary_resetter(admin_signer, contract_address, employee_group.beneficiary_resetter);
+            };
+
+            let validator = &employee_group.validator.validator_config;
+            // These checks ensure that validator accounts have 0x1::Account resource.
+            // So, validator accounts can't be stateless.
+            assert!(
+                account::exists_at(validator.owner_address),
+                error::not_found(EACCOUNT_DOES_NOT_EXIST),
+            );
+            assert!(
+                account::exists_at(validator.operator_address),
+                error::not_found(EACCOUNT_DOES_NOT_EXIST),
+            );
+            assert!(
+                account::exists_at(validator.voter_address),
+                error::not_found(EACCOUNT_DOES_NOT_EXIST),
+            );
+            if (employee_group.validator.join_during_genesis) {
+                initialize_validator(pool_address, validator);
+            };
+        });
     }
 
     fun create_initialize_validators_with_commission(
         topo_framework: &signer,
+        use_staking_contract: bool,
         validators: vector<ValidatorConfigurationWithCommission>,
     ) {
-        ensure_poc_staking_initialized(topo_framework);
-        validators.for_each_ref(|validator| {
-            let validator: &ValidatorConfigurationWithCommission = validator;
-            create_initialize_validator(topo_framework, validator);
-        });
+        // 按输入顺序逐池初始化；每轮都保留验证者集合与代币资源，供循环结束后安装原生 Epoch。
+        for (i in 0..validators.length()) {
+            create_initialize_validator(topo_framework, &validators[i], use_staking_contract);
+        } spec {
+            invariant i <= len(validators);
+            invariant exists<stake::ValidatorSet>(@topo_framework);
+            invariant exists<coin::CoinInfo<TopoCoin>>(@topo_framework);
+        };
 
         // Destroy the aptos framework account's ability to mint coins now that we're done with setting up the initial
         // validators.
         topo_coin::destroy_mint_cap(topo_framework);
 
         stake::on_new_epoch();
+    }
+
+    /// 为每个创世验证者创建 owner 直接持有的保证金池，写入统一配置的初始原始算力并全额分配到本池。
+    /// 在 Epoch 0 准备基线和周期 0 算力，分配沿用普通入口于 Epoch 1 生效。
+    /// 算力周期初始为 60 个 Epoch，上传权限初始归框架，每池费用限额从零开始；三者均可在运行期治理调整。
+    /// 使用统一计划流程安装一次 Epoch 1，不结算 Epoch 0 奖励。
+    /// 外层构建器随后仍须执行既有初始 Epoch 事件及 set_genesis_end 步骤。
+    fun create_initialize_poc_validators(
+        framework: &signer,
+        validators: vector<ValidatorConfiguration>,
+        params: topo_framework::poc_accounting::PowerParams,
+        retention_bps: u64,
+        initial_raw_power: u64,
+    ) {
+        chain_status::assert_genesis();
+        system_addresses::assert_topo_framework(framework);
+        assert!(initial_raw_power > 0, error::invalid_argument(EINVALID_INITIAL_RAW_POWER));
+        for (i in 0..validators.length()) {
+            let validator = ValidatorConfigurationWithCommission {
+                validator_config: validators[i],
+                commission_percentage: 0,
+                join_during_genesis: true,
+            };
+            create_initialize_validator(framework, &validator, false);
+        } spec {
+            invariant i <= len(validators);
+            invariant exists<stake::ValidatorSet>(@topo_framework);
+            invariant exists<coin::CoinInfo<TopoCoin>>(@topo_framework);
+        };
+        // 保证金入池后先准备 PoC，初始算力写入时直接按固定基线计算 units。
+        topo_framework::reconfiguration_state::initialize(framework);
+        stake::set_transaction_fee_limit_per_epoch_per_pool(framework, 0);
+        topo_framework::poc_allocation::prepare_poc(framework, params,
+            topo_framework::poc_accounting::default_deployment_limits(),
+            1, retention_bps, POC_POWER_PERIOD_IN_EPOCHS, @topo_framework);
+        for (i in 0..validators.length()) {
+            let owner = validators[i].owner_address;
+            topo_framework::poc_allocation::enable_pool(framework, owner);
+            topo_framework::poc_power_store::set_genesis_committed_power(framework, owner, initial_raw_power);
+            // 创世授权只为实际验证者 owner 建立初始分配，算力全部质押到本人的池。
+            let user = create_signer(owner);
+            topo_framework::poc_allocation::set_allocations(&user, vector[owner], vector[10000]);
+        } spec {
+            invariant i <= len(validators);
+            invariant exists<topo_framework::poc_power_store::PowerStore>(@topo_framework);
+            invariant global<topo_framework::poc_power_store::PowerStore>(@topo_framework).operator == @topo_framework;
+            invariant exists<topo_framework::poc_accounting::AccountingState>(@topo_framework);
+            invariant global<topo_framework::poc_accounting::AccountingState>(@topo_framework).epoch
+                == reconfiguration::current_epoch();
+            invariant global<topo_framework::poc_accounting::AccountingState>(@topo_framework).config.activation_epoch == 1;
+        };
+        topo_coin::destroy_mint_cap(framework);
+        reconfiguration::install_genesis_poc_epoch(framework);
     }
 
     /// Sets up the initial validator set for the network.
@@ -341,63 +416,43 @@ module topo_framework::genesis {
                 commission_percentage: 0,
                 join_during_genesis: true,
             };
-            validators_with_commission.push_back(validator_with_commission);
+            vector::push_back(&mut validators_with_commission, validator_with_commission);
         });
 
-        create_initialize_validators_with_commission(topo_framework, validators_with_commission);
+        create_initialize_validators_with_commission(topo_framework, false, validators_with_commission);
     }
 
-    /// Initialize a single genesis validator: create accounts, register in staking_registry,
-    /// seed POC power, deposit stake, delegate, and optionally join the validator set.
-    ///
-    /// Full sequence for each genesis validator:
-    /// 1. Create owner account funded with stake_amount TopoCoin
-    /// 2. Create operator account (zero balance; operator earns via commission)
-    /// 3. Initialize stake pool (StakePool + ValidatorConfig resources at owner address)
-    /// 4. Register validator pool in staking_registry (if not already registered)
-    /// 5. Seed genesis POC power: poc_power_store gets a period-0 committed snapshot
-    ///    derived from stake_amount * genesis_stake_power_multiplier
-    /// 6. Deposit stake_amount into staking_registry (owner's deposit balance)
-    /// 7. Delegate owner's deposit to their own validator pool
-    /// 8. If join_during_genesis: set consensus key + network addresses, then join validator set
-    ///
-    /// Why seed POC power from stake?
-    /// At genesis there are no ContributionEvents yet, so the POC power store is empty.
-    /// Seeding from stake bootstraps the system so validators have non-zero effective power
-    /// from day one, allowing the first epoch to proceed normally.
     fun create_initialize_validator(
         topo_framework: &signer,
         commission_config: &ValidatorConfigurationWithCommission,
+        use_staking_contract: bool,
     ) {
         let validator = &commission_config.validator_config;
-        let commission_percentage = commission_config.commission_percentage;
-        let genesis_power =
-            staking_registry::calculate_genesis_power_from_stake(validator.stake_amount);
 
         let owner = &create_account(topo_framework, validator.owner_address, validator.stake_amount);
         create_account(topo_framework, validator.operator_address, 0);
+        create_account(topo_framework, validator.voter_address, 0);
 
-        stake::initialize_stake_owner(
-            owner,
-            0,
-            validator.operator_address,
-        );
-        let pool_address = validator.owner_address;
-
-        if (!staking_registry::validator_exists(pool_address)) {
-            staking_registry::register_validator_for_genesis(
-                validator.owner_address,
-                pool_address,
-                commission_percentage * 100,
+        // Initialize the stake pool and join the validator set.
+        let pool_address = if (use_staking_contract) {
+            staking_contract::create_staking_contract(
+                owner,
+                validator.operator_address,
+                validator.voter_address,
+                validator.stake_amount,
+                commission_config.commission_percentage,
+                x"",
             );
+            staking_contract::stake_pool_address(validator.owner_address, validator.operator_address)
+        } else {
+            stake::initialize_stake_owner(
+                owner,
+                validator.stake_amount,
+                validator.operator_address,
+                validator.voter_address,
+            );
+            validator.owner_address
         };
-        poc_power_store::set_genesis_committed_power(
-            topo_framework,
-            validator.owner_address,
-            genesis_power,
-        );
-        staking_registry::deposit(owner, validator.stake_amount);
-        staking_registry::delegate(owner, pool_address);
 
         if (commission_config.join_during_genesis) {
             initialize_validator(pool_address, validator);
@@ -450,6 +505,9 @@ module topo_framework::genesis {
         required_proposer_stake: u64,
         voting_duration_secs: u64,
         accounts: vector<AccountMap>,
+        employee_vesting_start: u64,
+        employee_vesting_period_duration: u64,
+        employees: vector<EmployeeAccountMap>,
         validators: vector<ValidatorConfigurationWithCommission>
     ) {
         initialize(
@@ -476,7 +534,8 @@ module topo_framework::genesis {
             voting_duration_secs
         );
         create_accounts(topo_framework, accounts);
-        create_initialize_validators_with_commission(topo_framework, validators);
+        create_employee_validators(employee_vesting_start, employee_vesting_period_duration, employees);
+        create_initialize_validators_with_commission(topo_framework, true, validators);
         set_genesis_end(topo_framework);
     }
 
@@ -512,6 +571,188 @@ module topo_framework::genesis {
         assert!(account::exists_at(@0x8), 1);
         assert!(account::exists_at(@0x9), 1);
         assert!(account::exists_at(@0xa), 1);
+    }
+
+    #[test(framework = @topo_framework, admin = @0x10)]
+    fun genesis_initializes_poc_registry(framework: signer, admin: signer) {
+        setup();
+        let (_, _, _, _, metadata) = topo_framework::fungible_asset::create_fungible_asset(&admin);
+        let token = topo_framework::object::object_address(&metadata);
+        poc_registry::approve_app_identity(&framework, @0x10, @0xa11, token, @0xc01);
+        poc_registry::register_app(&admin, @0xa11, token, @0xc01, std::string::utf8(b"app"));
+        assert!(poc_registry::exists_app(@0x10), 1);
+        assert!(poc_registry::get_app_admin_by_app_address(@0xa11) == @0x10, 2);
+    }
+
+    #[test_only]
+    /// 为四个独立测试池分别设置相同数额的保证金，密钥沿用现有测试生成入口。
+    fun poc_genesis_validators(amount: u64): vector<ValidatorConfiguration> {
+        let validators = vector[];
+        vector[@0xa11, @0xa12, @0xa13, @0xa14].for_each(|owner| {
+            let (_, public_key, proof) = stake::generate_identity();
+            validators.push_back(ValidatorConfiguration {
+                owner_address: owner,
+                operator_address: owner,
+                voter_address: owner,
+                stake_amount: amount,
+                consensus_pubkey: topo_std::bls12381::public_key_to_bytes(&public_key),
+                proof_of_possession: topo_std::bls12381::proof_of_possession_to_bytes(&proof),
+                network_addresses: vector[],
+                full_node_network_addresses: vector[],
+            });
+        });
+        validators
+    }
+
+    #[test_only]
+    /// 共用真实创世入口建立四池；链 Epoch 仍由各测试显式完成创世事件步骤。
+    fun initialize_poc_genesis_for_test(framework: &signer, initial_raw_power: u64): vector<address> {
+        setup();
+        initialize_topo_coin(framework);
+        staking_config::update_required_stake(framework, 1, 1000);
+        std::features::change_feature_flags_for_testing(framework,
+            vector[std::features::get_distribute_transaction_fee_feature()],
+            vector[std::features::get_periodical_reward_rate_decrease_feature()]);
+        let pools = vector[@0xa11, @0xa12, @0xa13, @0xa14];
+        create_initialize_poc_validators(framework, poc_genesis_validators(100),
+            topo_framework::poc_accounting::new_power_params(100000000, 10, 1000, 4),
+            10000, initial_raw_power);
+        pools
+    }
+
+    #[test(framework = @topo_framework)]
+    fun poc_genesis_installs_one_epoch_without_epoch_zero_rewards(framework: signer) {
+        let initial_raw_power = 17;
+        let pools = initialize_poc_genesis_for_test(&framework, initial_raw_power);
+        // VM 的既有创世事件步骤单独推进链配置，不能重复安装委员会或推进算力时钟。
+        assert!(reconfiguration::current_epoch() == 0, 1);
+        reconfiguration::emit_genesis_event_for_test();
+        set_genesis_end(&framework);
+        assert!(reconfiguration::current_epoch() == 1
+            && topo_framework::poc_accounting::current_epoch() == 1, 2);
+        let (epoch, poc, _, _, distribute_fees, fee_limit) =
+            stake::get_reward_context_fields(&stake::get_installed_reward_context());
+        assert!(epoch == 1 && poc && distribute_fees && fee_limit == 0 && chain_status::is_operating(), 3);
+        assert!(stake::get_installed_native_reward_bps() == 5000, 17);
+        let (period, boundary, _, _) =
+            topo_framework::poc_power_store::get_normalization_clock();
+        assert!(period == 0 && boundary == 61, 4);
+        pools.for_each(|pool| {
+            assert!(stake::get_current_epoch_voting_power(pool) == initial_raw_power, 5);
+            let (units, _, reward_base_octa, vault, index) = topo_framework::poc_accounting::get_pool(pool);
+            assert!(units == (initial_raw_power as u128) * 65536
+                && reward_base_octa == initial_raw_power && vault == 0 && index == 0, 6);
+            let (active, inactive, pending_active, pending_inactive) = stake::get_stake(pool);
+            assert!(active == 100 && inactive == 0 && pending_active == 0 && pending_inactive == 0, 7);
+            assert!(topo_framework::poc_power_store::get_user_committed_power(pool) == initial_raw_power, 13);
+            let (ratios, pending) = topo_framework::poc_accounting::get_allocations(pool);
+            assert!(ratios.length() == 1 && pending.is_none(), 14);
+            let (allocated_pool, bps) = topo_framework::poc_accounting::pool_ratio_fields(&ratios[0]);
+            assert!(allocated_pool == pool && bps == 10000, 15);
+            let (position_units, _, _, _) = topo_framework::poc_accounting::get_position(pool, pool);
+            assert!(position_units == units, 16);
+        });
+        assert!(topo_framework::event::emitted_events<stake::PoCRewardCredited>().is_empty(), 8);
+        assert!(topo_framework::event::emitted_events<stake::PoCEpochInstalled>().length() == 1, 9);
+        assert!(topo_framework::event::emitted_events<reconfiguration::NewEpoch>().length() == 1, 10);
+        assert!(!topo_framework::reconfiguration_state::is_in_progress()
+            && !std::features::is_reconfiguration_frozen(), 11);
+        assert!(topo_framework::poc_power_store::get_power_period_in_epochs() == 60
+            && topo_framework::poc_power_store::get_operator() == @topo_framework
+            && stake::transaction_fee_limit() == 0, 12);
+    }
+
+    #[test(framework = @topo_framework, operator = @0xb0b, vm = @vm_reserved)]
+    fun poc_genesis_defaults_remain_governable(framework: signer, operator: signer, vm: signer) {
+        initialize_poc_genesis_for_test(&framework, 10);
+        reconfiguration::emit_genesis_event_for_test();
+        set_genesis_end(&framework);
+        let initial_context = stake::get_installed_reward_context();
+        let (_, _, _, _, _, limits) = topo_framework::poc_accounting::get_config();
+        assert!(limits == topo_framework::poc_accounting::default_deployment_limits(), 10);
+        topo_framework::poc_allocation::update_deployment_limits(&framework,
+            topo_framework::poc_accounting::new_deployment_limits(6, 2, 8, 5, 10));
+        assert!(topo_framework::poc_accounting::validator_limit() == 5
+            && topo_framework::poc_accounting::max_upload_users() == 8, 11);
+        let index = stake::get_validator_index(@0xa11);
+        stake::update_performance_statistics(std::option::some(index), vector[]);
+        stake::record_fee(&vm, vector[index], vector[18446744073709551615]);
+        assert!(stake::get_pending_transaction_fee()[index] == 0, 1);
+
+        topo_framework::poc_power_store::set_operator(&framework, std::signer::address_of(&operator));
+        topo_framework::poc_power_store::set_power_period_in_epochs(&framework, 2);
+        stake::set_transaction_fee_limit_per_epoch_per_pool(&framework, 3);
+        stake::schedule_reward_split(&framework, 6000, 2);
+        // 新上传者立即可写下一算力周期；改长度不能移动已经确定的首个周期边界。
+        topo_framework::poc_power_store::stage_batch_update(&operator, 1, vector[@0xa11], vector[20]);
+        assert!(topo_framework::poc_power_store::get_operator() == std::signer::address_of(&operator)
+            && topo_framework::poc_power_store::get_power_period_in_epochs() == 2
+            && topo_framework::poc_power_store::next_boundary_epoch() == 61, 2);
+        assert!(topo_framework::poc_power_store::get_user_committed_power(@0xa11) == 10
+            && topo_framework::poc_power_store::get_user_power_for_period(@0xa11, 1) == 20, 3);
+        stake::record_fee(&vm, vector[index], vector[1]);
+        assert!(stake::transaction_fee_limit() == 3
+            && stake::get_installed_reward_context() == initial_context
+            && stake::get_pending_transaction_fee()[index] == 0
+            && stake::get_installed_native_reward_bps() == 5000, 4);
+
+        timestamp::fast_forward_seconds(1);
+        topo_governance::force_end_epoch(&framework);
+        let (epoch, poc, _, _, distribute_fees, fee_limit) =
+            stake::get_reward_context_fields(&stake::get_installed_reward_context());
+        assert!(epoch == 2 && poc && distribute_fees && fee_limit == 3
+            && stake::get_installed_native_reward_bps() == 6000, 5);
+        assert!(topo_framework::poc_power_store::get_current_period() == 0
+            && topo_framework::poc_power_store::next_boundary_epoch() == 61
+            && topo_framework::poc_power_store::get_user_committed_power(@0xa11) == 10, 6);
+        let (_, _, _, poc_vault_balance_octa, _) = topo_framework::poc_accounting::get_pool(@0xa11);
+        let (active_stake_octa, _, _, _) = stake::get_stake(@0xa11);
+        // Epoch 1 的 10 Octa 通胀奖励按当期原生奖励占比 50% 分配：原生质押和 PoC 奖励金库各增加 5 Octa。
+        // 当期交易费限额为零，后续提高限额也不补发。
+        assert!(poc_vault_balance_octa == 5 && active_stake_octa == 105, 7);
+
+        let index = stake::get_validator_index(@0xa11);
+        stake::update_performance_statistics(std::option::some(index), vector[]);
+        stake::record_fee(&vm, vector[index], vector[18446744073709551615]);
+        assert!(stake::get_pending_transaction_fee()[index] == 3, 8);
+        timestamp::fast_forward_seconds(1);
+        topo_governance::force_end_epoch(&framework);
+        let (_, _, _, poc_vault_balance_octa, _) = topo_framework::poc_accounting::get_pool(@0xa11);
+        let (active_stake_octa, _, _, _) = stake::get_stake(@0xa11);
+        // Epoch 2 的通胀和交易费均按 60% 分流：10 Octa 通胀原生得 6、PoC 得 4，3 Octa 费用原生得 1、PoC 得 2。
+        assert!(poc_vault_balance_octa == 11 && active_stake_octa == 112, 9);
+    }
+
+    #[test(framework = @topo_framework)]
+    #[expected_failure(abort_code = 0x30001, location = topo_framework::chain_status)]
+    fun poc_genesis_entry_rejects_operating_chain(framework: signer) {
+        setup();
+        set_genesis_end(&framework);
+        create_initialize_poc_validators(&framework, vector[],
+            topo_framework::poc_accounting::new_power_params(100000000, 10, 1000, 4),
+            10000, 10);
+    }
+
+    #[test(framework = @topo_framework)]
+    #[expected_failure(abort_code = 0x10003, location = topo_framework::genesis)]
+    fun poc_genesis_rejects_zero_initial_raw_power(framework: signer) {
+        initialize_poc_genesis_for_test(&framework, 0);
+    }
+
+    #[test(framework = @topo_framework)]
+    fun poc_native_genesis_remains_unprepared(framework: signer) {
+        setup();
+        initialize_topo_coin(&framework);
+        std::features::change_feature_flags_for_testing(&framework, vector[],
+            vector[std::features::get_periodical_reward_rate_decrease_feature()]);
+        create_initialize_validators(&framework, poc_genesis_validators(1));
+        reconfiguration::emit_genesis_event_for_test();
+        set_genesis_end(&framework);
+        assert!(reconfiguration::current_epoch() == 1 && !stake::is_poc_prepared(), 1);
+        assert!(!topo_framework::poc_power_store::is_initialized(), 2);
+        vector[@0xa11, @0xa12, @0xa13, @0xa14].for_each(|pool| {
+            assert!(stake::get_current_epoch_voting_power(pool) == 1, 3);
+        });
     }
 
     #[test(topo_framework = @0x1)]
@@ -560,21 +801,17 @@ module topo_framework::genesis {
         use topo_framework::object;
         use topo_framework::primary_fungible_store;
         use topo_framework::fungible_asset::Metadata;
-        use std::features;
-
-        let feature = features::get_new_accounts_default_to_fa_apt_store_feature();
-        features::change_feature_flags_for_testing(topo_framework, vector[feature], vector[]);
 
         aggregator_factory::initialize_aggregator_factory_for_test(topo_framework);
 
         let (burn_cap, mint_cap) = topo_coin::initialize(topo_framework);
-        topo_coin::ensure_initialized_with_topo_fa_metadata_for_test();
+        topo_coin::ensure_initialized_with_apt_fa_metadata_for_test();
 
         let core_resources = account::create_account(@core_resources);
-        topo_account::register_topo(&core_resources); // registers TOPO store
+        topo_account::register_apt(&core_resources); // registers APT store
 
-        let topo_metadata = object::address_to_object<Metadata>(@aptos_fungible_asset);
-        assert!(primary_fungible_store::primary_store_exists(@core_resources, topo_metadata), 2);
+        let apt_metadata = object::address_to_object<Metadata>(@aptos_fungible_asset);
+        assert!(primary_fungible_store::primary_store_exists(@core_resources, apt_metadata), 2);
 
         topo_coin::configure_accounts_for_test(topo_framework, &core_resources, mint_cap);
 

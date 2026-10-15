@@ -32,6 +32,7 @@ spec std::features {
 
     spec change_feature_flags_for_next_epoch(framework: &signer, enable: vector<u64>, disable: vector<u64>) {
         aborts_if signer::address_of(framework) != @std;
+        aborts_if exists<PendingFeatureFreeze>(@std);
         // TODO(tengzhang): add functional spec
         // TODO(#12526): undo declaring opaque once fixed
         pragma opaque;
@@ -98,8 +99,14 @@ spec std::features {
         spec_is_enabled(ABORT_IF_MULTISIG_PAYLOAD_MISMATCH)
     }
 
-    spec fun spec_new_accounts_default_to_fa_apt_store_enabled(): bool {
-        spec_is_enabled(NEW_ACCOUNTS_DEFAULT_TO_FA_APT_STORE)
+    spec fun spec_multisig_timelock_enabled(): bool {
+        spec_is_enabled(MULTISIG_TIMELOCK)
+    }
+
+    spec is_multisig_timelock_enabled {
+        pragma opaque;
+        aborts_if [abstract] false;
+        ensures [abstract] result == spec_multisig_timelock_enabled();
     }
 
     spec fun spec_new_accounts_default_to_fa_store_enabled(): bool {
@@ -127,10 +134,34 @@ spec std::features {
         let features_pending = global<PendingFeatures>(@std).features;
         let post features_std = global<Features>(@std).features;
         ensures exists<PendingFeatures>(@std) ==> features_std == features_pending;
+        aborts_if exists<PendingFeatureFreeze>(@std);
+    }
+
+    spec is_reconfiguration_frozen {
         aborts_if false;
+        ensures result == exists<PendingFeatureFreeze>(@std);
+    }
+
+    spec begin_reconfiguration_freeze {
+        modifies global<PendingFeatureFreeze>(@std);
+        aborts_if signer::address_of(framework) != @std;
+        aborts_if exists<PendingFeatureFreeze>(@std);
+        ensures exists<PendingFeatureFreeze>(@std);
+    }
+
+    spec end_reconfiguration_freeze {
+        modifies global<PendingFeatureFreeze>(@std);
+        aborts_if !exists<PendingFeatureFreeze>(@std);
+        ensures !exists<PendingFeatureFreeze>(@std);
     }
 
     spec fun spec_sha_512_and_ripemd_160_enabled(): bool {
         spec_is_enabled(SHA_512_AND_RIPEMD_160_NATIVES)
+    }
+
+    spec is_storage_slot_natives_enabled {
+        pragma opaque;
+        aborts_if [abstract] false;
+        ensures [abstract] result == spec_is_enabled(STORAGE_SLOT_NATIVES);
     }
 }

@@ -11,7 +11,6 @@ module topo_framework::coin {
     use topo_framework::event::{Self, EventHandle};
     use topo_framework::guid;
     use topo_framework::optional_aggregator::{Self, OptionalAggregator};
-    use topo_framework::permissioned_signer;
     use topo_framework::system_addresses;
 
     use topo_framework::fungible_asset::{
@@ -110,7 +109,7 @@ module topo_framework::coin {
     /// The coin converison map is not created yet.
     const ECOIN_CONVERSION_MAP_NOT_FOUND: u64 = 27;
 
-    /// TOPO pairing is not enabled yet.
+    /// APT pairing is not eanbled yet.
     const ETOPO_PAIRING_IS_NOT_ENABLED: u64 = 28;
 
     /// The decimals of the coin is too large.
@@ -299,7 +298,7 @@ module topo_framework::coin {
     }
 
     public entry fun create_coin_conversion_map(topo_framework: &signer) {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
         if (!exists<CoinConversionMap>(@topo_framework)) {
             move_to(
                 topo_framework,
@@ -308,11 +307,11 @@ module topo_framework::coin {
         };
     }
 
-    /// Create TOPO pairing by passing `TopoCoin`.
+    /// Create APT pairing by passing `TopoCoin`.
     public entry fun create_pairing<CoinType>(
         topo_framework: &signer
     ) acquires CoinConversionMap, CoinInfo {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
         create_and_return_paired_metadata_if_not_exist<CoinType>(true);
     }
 
@@ -416,7 +415,7 @@ module topo_framework::coin {
         fungible_asset: FungibleAsset
     ): Coin<CoinType> acquires CoinInfo, PairedCoinType {
         let metadata_addr =
-            fungible_asset.metadata_from_asset().object_address();
+            fungible_asset.asset_metadata().object_address();
         assert!(
             object::object_exists<PairedCoinType>(metadata_addr),
             error::not_found(EPAIRED_COIN)
@@ -448,6 +447,20 @@ module topo_framework::coin {
             error::internal(EPAIRED_FUNGIBLE_ASSET_REFS_NOT_FOUND)
         );
         borrow_global<PairedFungibleAssetRefs>(metadata_addr).mint_ref_opt.is_some()
+    }
+
+    /// Return an independent, standalone copy of the paired fungible asset's `MintRef`, derived
+    /// from a `MintCapability`. Unlike `get_paired_mint_ref`, which flash-borrows the single
+    /// stored `MintRef` out of `PairedFungibleAssetRefs` and requires it to be returned via a
+    /// `MintRefReceipt`, this leaves the stored ref in place and hands back an owned `MintRef`
+    /// that the caller can store permanently (e.g. in `transaction_fee`) and use without any
+    /// per-call read-modify-write of the shared `PairedFungibleAssetRefs` resource. Mirrors
+    /// `get_paired_burn_copy_ref`.
+    public(friend) fun get_paired_mint_copy_ref<CoinType>(
+        mint_cap: &MintCapability<CoinType>
+    ): MintRef acquires CoinConversionMap, PairedFungibleAssetRefs {
+        let mint_ref = borrow_paired_mint_ref(mint_cap);
+        mint_ref.generate_mint_copy_ref()
     }
 
     /// Get the `MintRef` of paired fungible asset of a coin type from `MintCapability`.
@@ -595,6 +608,21 @@ module topo_framework::coin {
         burn_ref_opt.fill(burn_ref);
     }
 
+    inline fun borrow_paired_mint_ref<CoinType>(
+        _: &MintCapability<CoinType>
+    ): &MintRef {
+        let metadata = assert_paired_metadata_exists<CoinType>();
+        let metadata_addr = metadata.object_address();
+        assert!(
+            exists<PairedFungibleAssetRefs>(metadata_addr),
+            error::internal(EPAIRED_FUNGIBLE_ASSET_REFS_NOT_FOUND)
+        );
+        let mint_ref_opt =
+            &borrow_global<PairedFungibleAssetRefs>(metadata_addr).mint_ref_opt;
+        assert!(mint_ref_opt.is_some(), error::not_found(EMINT_REF_NOT_FOUND));
+        mint_ref_opt.borrow()
+    }
+
     inline fun borrow_paired_burn_ref<CoinType>(
         _: &BurnCapability<CoinType>
     ): &BurnRef {
@@ -617,7 +645,7 @@ module topo_framework::coin {
     /// This should be called by on-chain governance to update the config and allow
     /// or disallow upgradability of total supply.
     public fun allow_supply_upgrades(
-        _aptos_framework: &signer, _allowed: bool
+        _topo_framework: &signer, _allowed: bool
     ) {
         abort error::invalid_state(ECOIN_SUPPLY_UPGRADE_NOT_SUPPORTED)
     }
@@ -692,25 +720,11 @@ module topo_framework::coin {
         };
     }
 
-    inline fun assert_signer_has_permission<CoinType>(account: &signer) {
-        if (permissioned_signer::is_permissioned_signer(account)) {
-            fungible_asset::withdraw_permission_check_by_address(
-                account,
-                primary_fungible_store::primary_store_address(
-                    signer::address_of(account),
-                    ensure_paired_metadata<CoinType>()
-                ),
-                0
-            );
-        }
-    }
-
     /// Voluntarily migrate to fungible store for `CoinType` if not yet.
     public entry fun migrate_to_fungible_store<CoinType>(
         account: &signer
     ) acquires CoinStore, CoinConversionMap, CoinInfo {
         let account_addr = signer::address_of(account);
-        assert_signer_has_permission<CoinType>(account);
         maybe_convert_to_fungible_store<CoinType>(account_addr);
     }
 
@@ -898,15 +912,7 @@ module topo_framework::coin {
     public fun deposit_with_signer<CoinType>(
         account: &signer, coin: Coin<CoinType>
     ) acquires CoinConversionMap, CoinInfo {
-        let metadata = ensure_paired_metadata<CoinType>();
         let account_address = signer::address_of(account);
-        fungible_asset::refill_permission(
-            account,
-            coin.value,
-            primary_fungible_store::primary_store_address_inlined(
-                account_address, metadata
-            )
-        );
         deposit(account_address, coin);
     }
 
@@ -979,10 +985,26 @@ module topo_framework::coin {
         coin_store.frozen = false;
     }
 
-    /// Upgrade total supply to use a parallelizable implementation if it is
-    /// available.
-    public entry fun upgrade_supply<CoinType>(_account: &signer) {
-        abort error::invalid_state(ECOIN_SUPPLY_UPGRADE_NOT_SUPPORTED)
+    /// Upgrade total supply to use a non-parallelizable implementation.
+    public entry fun upgrade_supply<CoinType>(account: &signer) {
+        system_addresses::assert_topo_framework(account);
+        let account_addr = signer::address_of(account);
+
+        // Only coin creators can upgrade total supply.
+        assert!(
+            coin_address<CoinType>() == account_addr,
+            error::invalid_argument(ECOIN_INFO_ADDRESS_MISMATCH),
+        );
+
+        let maybe_supply = &mut borrow_global_mut<CoinInfo<CoinType>>(account_addr).supply;
+        if (maybe_supply.is_some()) {
+            let supply = maybe_supply.borrow_mut();
+            if (optional_aggregator::is_parallelizable(supply)) {
+                optional_aggregator::switch(supply);
+            }
+        }
+
+        // abort error::invalid_state(ECOIN_SUPPLY_UPGRADE_NOT_SUPPORTED)
     }
 
     /// Creates a new Coin with given `CoinType` and returns minting/freezing/burning capabilities.
@@ -994,7 +1016,7 @@ module topo_framework::coin {
         symbol: string::String,
         decimals: u8,
         monitor_supply: bool
-    ): (BurnCapability<CoinType>, FreezeCapability<CoinType>, MintCapability<CoinType>) acquires CoinInfo, CoinConversionMap {
+    ): (BurnCapability<CoinType>, FreezeCapability<CoinType>, MintCapability<CoinType>) {
         initialize_internal(
             account,
             name,
@@ -1012,8 +1034,8 @@ module topo_framework::coin {
         symbol: string::String,
         decimals: u8,
         monitor_supply: bool
-    ): (BurnCapability<CoinType>, FreezeCapability<CoinType>, MintCapability<CoinType>) acquires CoinInfo, CoinConversionMap {
-        system_addresses::assert_aptos_framework(account);
+    ): (BurnCapability<CoinType>, FreezeCapability<CoinType>, MintCapability<CoinType>) {
+        system_addresses::assert_topo_framework(account);
         initialize_internal(
             account,
             name,
@@ -1031,9 +1053,8 @@ module topo_framework::coin {
         decimals: u8,
         monitor_supply: bool,
         parallelizable: bool
-    ): (BurnCapability<CoinType>, FreezeCapability<CoinType>, MintCapability<CoinType>) acquires CoinInfo, CoinConversionMap {
+    ): (BurnCapability<CoinType>, FreezeCapability<CoinType>, MintCapability<CoinType>) {
         let account_addr = signer::address_of(account);
-        assert_signer_has_permission<CoinType>(account);
 
         assert!(
             coin_address<CoinType>() == account_addr,
@@ -1103,9 +1124,8 @@ module topo_framework::coin {
         mint_internal<CoinType>(amount)
     }
 
-    public fun register<CoinType>(account: &signer) acquires CoinInfo, CoinConversionMap {
+    public fun register<CoinType>(account: &signer) {
         let account_addr = signer::address_of(account);
-        assert_signer_has_permission<CoinType>(account);
         // Short-circuit and do nothing if account is already registered for CoinType.
         if (is_account_registered<CoinType>(account_addr)) { return };
 
@@ -1242,7 +1262,7 @@ module topo_framework::coin {
     #[test_only]
     fun initialize_fake_money(
         account: &signer, decimals: u8, monitor_supply: bool
-    ): (BurnCapability<FakeMoney>, FreezeCapability<FakeMoney>, MintCapability<FakeMoney>) acquires CoinInfo, CoinConversionMap {
+    ): (BurnCapability<FakeMoney>, FreezeCapability<FakeMoney>, MintCapability<FakeMoney>) {
         use topo_framework::aggregator_factory;
         aggregator_factory::initialize_aggregator_factory_for_test(account);
         initialize<FakeMoney>(
@@ -1257,7 +1277,7 @@ module topo_framework::coin {
     #[test_only]
     public fun initialize_and_register_fake_money(
         account: &signer, decimals: u8, monitor_supply: bool
-    ): (BurnCapability<FakeMoney>, FreezeCapability<FakeMoney>, MintCapability<FakeMoney>) acquires CoinInfo, CoinConversionMap {
+    ): (BurnCapability<FakeMoney>, FreezeCapability<FakeMoney>, MintCapability<FakeMoney>) {
         let (burn_cap, freeze_cap, mint_cap) =
             initialize_fake_money(account, decimals, monitor_supply);
         create_coin_conversion_map(account);
@@ -1359,7 +1379,7 @@ module topo_framework::coin {
 
     #[test(source = @0x2, framework = @topo_framework)]
     #[expected_failure(abort_code = 0x10001, location = Self)]
-    public fun fail_initialize(source: signer, framework: signer) acquires CoinInfo, CoinConversionMap {
+    public fun fail_initialize(source: signer, framework: signer) {
         use topo_framework::aggregator_factory;
         aggregator_factory::initialize_aggregator_factory_for_test(&framework);
         let (burn_cap, freeze_cap, mint_cap) =
@@ -1410,7 +1430,7 @@ module topo_framework::coin {
 
     #[test(source = @0x1)]
     #[expected_failure(abort_code = 0x10007, location = Self)]
-    public fun test_destroy_non_zero(source: signer) acquires CoinInfo, CoinConversionMap {
+    public fun test_destroy_non_zero(source: signer) acquires CoinInfo {
         account::create_account_for_test(signer::address_of(&source));
         let (burn_cap, freeze_cap, mint_cap) =
             initialize_and_register_fake_money(&source, 1, true);
@@ -1448,7 +1468,7 @@ module topo_framework::coin {
     }
 
     #[test(source = @0x1)]
-    public fun test_is_coin_initialized(source: signer) acquires CoinInfo, CoinConversionMap {
+    public fun test_is_coin_initialized(source: signer) {
         assert!(!is_coin_initialized<FakeMoney>(), 0);
 
         let (burn_cap, freeze_cap, mint_cap) = initialize_fake_money(&source, 1, true);
@@ -1541,7 +1561,7 @@ module topo_framework::coin {
     }
 
     #[test_only]
-    fun initialize_with_aggregator(account: &signer) acquires CoinInfo, CoinConversionMap {
+    fun initialize_with_aggregator(account: &signer) {
         let (burn_cap, freeze_cap, mint_cap) =
             initialize_with_parallelizable_supply<FakeMoney>(
                 account,
@@ -1557,7 +1577,7 @@ module topo_framework::coin {
     }
 
     #[test_only]
-    fun initialize_with_integer(account: &signer) acquires CoinInfo, CoinConversionMap {
+    fun initialize_with_integer(account: &signer) {
         let (burn_cap, freeze_cap, mint_cap) =
             initialize<FakeMoney>(
                 account,
@@ -1576,7 +1596,7 @@ module topo_framework::coin {
     #[expected_failure(abort_code = 0x50003, location = topo_framework::system_addresses)]
     fun test_supply_initialize_fails(
         framework: signer, other: signer
-    ) acquires CoinInfo, CoinConversionMap {
+    ) {
         use topo_framework::aggregator_factory;
         aggregator_factory::initialize_aggregator_factory_for_test(&framework);
         initialize_with_aggregator(&other);
@@ -1586,7 +1606,7 @@ module topo_framework::coin {
     #[expected_failure(abort_code = 0x10003, location = Self)]
     fun test_create_coin_store_with_non_coin_type(
         other: signer
-    ) acquires CoinInfo, CoinConversionMap {
+    ) {
         register<String>(&other);
     }
 
@@ -1598,7 +1618,7 @@ module topo_framework::coin {
     }
 
     #[test(framework = @topo_framework)]
-    fun test_supply_initialize(framework: signer) acquires CoinInfo, CoinConversionMap {
+    fun test_supply_initialize(framework: signer) acquires CoinInfo {
         use topo_framework::aggregator_factory;
         aggregator_factory::initialize_aggregator_factory_for_test(&framework);
         initialize_with_aggregator(&framework);
@@ -1622,7 +1642,7 @@ module topo_framework::coin {
 
     #[test(framework = @topo_framework)]
     #[expected_failure(abort_code = 0x20001, location = topo_framework::aggregator)]
-    fun test_supply_overflow(framework: signer) acquires CoinInfo, CoinConversionMap {
+    fun test_supply_overflow(framework: signer) acquires CoinInfo {
         use topo_framework::aggregator_factory;
         aggregator_factory::initialize_aggregator_factory_for_test(&framework);
         initialize_with_aggregator(&framework);
@@ -1712,6 +1732,35 @@ module topo_framework::coin {
         assert!(paired_mint_ref_exists<FakeMoney>(), 0);
         assert!(paired_transfer_ref_exists<FakeMoney>(), 0);
         assert!(paired_burn_ref_exists<FakeMoney>(), 0);
+
+        move_to(
+            account,
+            FakeMoneyCapabilities { burn_cap, freeze_cap, mint_cap }
+        );
+    }
+
+    #[test(account = @topo_framework)]
+    fun test_get_paired_mint_copy_ref(
+        account: &signer
+    ) acquires CoinConversionMap, CoinInfo, PairedFungibleAssetRefs {
+        let account_addr = signer::address_of(account);
+        account::create_account_for_test(account_addr);
+        let (burn_cap, freeze_cap, mint_cap) =
+            initialize_and_register_fake_money(account, 1, true);
+        let metadata = ensure_paired_metadata<FakeMoney>();
+
+        // Copying the mint ref must NOT take it out of the pairing.
+        assert!(paired_mint_ref_exists<FakeMoney>(), 0);
+        let mint_ref = get_paired_mint_copy_ref(&mint_cap);
+        assert!(paired_mint_ref_exists<FakeMoney>(), 0);
+
+        // The copy mints the same FA as the original pairing.
+        let fa = mint_ref.mint(100);
+        assert!(fungible_asset::asset_metadata(&fa) == metadata, 0);
+        primary_fungible_store::deposit(account_addr, fa);
+        assert!(
+            primary_fungible_store::balance(account_addr, metadata) == 100, 0
+        );
 
         move_to(
             account,
@@ -1915,7 +1964,7 @@ module topo_framework::coin {
     #[test(account = @topo_framework, bob = @0xb0b)]
     fun test_is_account_registered(
         account: &signer, bob: &signer
-    ) acquires CoinConversionMap, CoinInfo {
+    ) {
         let account_addr = signer::address_of(account);
         let bob_addr = signer::address_of(bob);
         account::create_account_for_test(account_addr);
@@ -1960,257 +2009,4 @@ module topo_framework::coin {
     #[resource_group_member(group = topo_framework::object::ObjectGroup)]
     /// The flag the existence of which indicates the primary fungible store is created by the migration from CoinStore.
     struct MigrationFlag has key {}
-
-    #[test(account = @topo_framework)]
-    #[expected_failure(abort_code = 0x50024, location = topo_framework::fungible_asset)]
-    fun test_withdraw_with_permissioned_signer_no_migration(
-        account: &signer
-    ) acquires CoinConversionMap, CoinInfo, PairedCoinType {
-        account::create_account_for_test(signer::address_of(account));
-        let account_addr = signer::address_of(account);
-        let (burn_cap, freeze_cap, mint_cap) = initialize_fake_money(account, 1, true);
-        create_coin_conversion_map(account);
-
-        let coin = mint<FakeMoney>(100, &mint_cap);
-        deposit(account_addr, coin);
-
-        let permissioned_handle =
-            permissioned_signer::create_permissioned_handle(account);
-        let permissioned_signer =
-            permissioned_signer::signer_from_permissioned_handle(&permissioned_handle);
-
-        // Withdraw from permissioned signer with no migration rules set
-        //
-        // Aborted with error.
-        let coin_2 = withdraw<FakeMoney>(&permissioned_signer, 10);
-        permissioned_signer::destroy_permissioned_handle(permissioned_handle);
-
-        burn(coin_2, &burn_cap);
-        move_to(
-            account,
-            FakeMoneyCapabilities { burn_cap, freeze_cap, mint_cap }
-        );
-    }
-
-    #[test(account = @topo_framework)]
-    #[expected_failure(abort_code = 0x50024, location = topo_framework::fungible_asset)]
-    fun test_withdraw_with_permissioned_signer(
-        account: &signer
-    ) acquires CoinConversionMap, CoinInfo, PairedCoinType {
-        account::create_account_for_test(signer::address_of(account));
-        let account_addr = signer::address_of(account);
-        let (burn_cap, freeze_cap, mint_cap) = initialize_fake_money(account, 1, true);
-        create_coin_conversion_map(account);
-
-        let coin = mint<FakeMoney>(100, &mint_cap);
-        deposit(account_addr, coin);
-
-        let permissioned_handle =
-            permissioned_signer::create_permissioned_handle(account);
-        let permissioned_signer =
-            permissioned_signer::signer_from_permissioned_handle(&permissioned_handle);
-
-        // Withdraw from permissioned signer with no migration rules set
-        //
-        // Aborted with error.
-        let coin_2 = withdraw<FakeMoney>(&permissioned_signer, 10);
-        permissioned_signer::destroy_permissioned_handle(permissioned_handle);
-
-        burn(coin_2, &burn_cap);
-        move_to(
-            account,
-            FakeMoneyCapabilities { burn_cap, freeze_cap, mint_cap }
-        );
-    }
-
-    #[test(account = @topo_framework)]
-    #[expected_failure(abort_code = 0x50024, location = topo_framework::fungible_asset)]
-    fun test_withdraw_with_permissioned_signer_no_capacity(
-        account: &signer
-    ) acquires CoinConversionMap, CoinInfo, PairedCoinType {
-        account::create_account_for_test(signer::address_of(account));
-        let account_addr = signer::address_of(account);
-        let (burn_cap, freeze_cap, mint_cap) =
-            initialize_and_register_fake_money(account, 1, true);
-        ensure_paired_metadata<FakeMoney>();
-
-        let coin = mint<FakeMoney>(100, &mint_cap);
-        deposit(account_addr, coin);
-
-        let permissioned_handle =
-            permissioned_signer::create_permissioned_handle(account);
-        let permissioned_signer =
-            permissioned_signer::signer_from_permissioned_handle(&permissioned_handle);
-
-        // Withdraw from permissioned signer with no permissions granted.
-        let coin_2 = withdraw<FakeMoney>(&permissioned_signer, 10);
-        permissioned_signer::destroy_permissioned_handle(permissioned_handle);
-
-        burn(coin_2, &burn_cap);
-        move_to(
-            account,
-            FakeMoneyCapabilities { burn_cap, freeze_cap, mint_cap }
-        );
-    }
-
-    #[test(account = @topo_framework)]
-    fun test_e2e_withdraw_with_permissioned_signer_and_migration(
-        account: &signer
-    ) acquires CoinConversionMap, CoinInfo, CoinStore, PairedCoinType {
-        account::create_account_for_test(signer::address_of(account));
-        let account_addr = signer::address_of(account);
-        let (burn_cap, freeze_cap, mint_cap) =
-            initialize_and_register_fake_money(account, 1, true);
-        let metadata = ensure_paired_metadata<FakeMoney>();
-
-        let coin = mint<FakeMoney>(100, &mint_cap);
-        deposit(account_addr, coin);
-
-        let permissioned_handle =
-            permissioned_signer::create_permissioned_handle(account);
-        let permissioned_signer =
-            permissioned_signer::signer_from_permissioned_handle(&permissioned_handle);
-        primary_fungible_store::grant_permission(
-            account, &permissioned_signer, metadata, 10
-        );
-
-        // Withdraw from permissioned signer with proper permissions.
-        let coin_2 = withdraw<FakeMoney>(&permissioned_signer, 10);
-        burn(coin_2, &burn_cap);
-
-        // Withdraw with some funds from CoinStore and some from PFS.
-        primary_fungible_store::deposit(
-            account_addr,
-            coin_to_fungible_asset(mint<FakeMoney>(100, &mint_cap))
-        );
-        primary_fungible_store::grant_permission(
-            account, &permissioned_signer, metadata, 100
-        );
-        let coin_2 = withdraw<FakeMoney>(&permissioned_signer, 100);
-        burn(coin_2, &burn_cap);
-
-        // Withdraw funds from PFS only.
-        assert!(coin_balance<FakeMoney>(account_addr) == 0, 1);
-        primary_fungible_store::grant_permission(
-            account, &permissioned_signer, metadata, 10
-        );
-        let coin_2 = withdraw<FakeMoney>(&permissioned_signer, 10);
-        burn(coin_2, &burn_cap);
-
-        permissioned_signer::destroy_permissioned_handle(permissioned_handle);
-        move_to(
-            account,
-            FakeMoneyCapabilities { burn_cap, freeze_cap, mint_cap }
-        );
-    }
-
-    #[test(account = @topo_framework)]
-    #[expected_failure(abort_code = 0x50024, location = topo_framework::fungible_asset)]
-    fun test_e2e_withdraw_with_permissioned_signer_no_permission_1(
-        account: &signer
-    ) acquires CoinConversionMap, CoinInfo, PairedCoinType {
-        account::create_account_for_test(signer::address_of(account));
-        let account_addr = signer::address_of(account);
-        let (burn_cap, freeze_cap, mint_cap) =
-            initialize_and_register_fake_money(account, 1, true);
-        let metadata = ensure_paired_metadata<FakeMoney>();
-
-        let coin = mint<FakeMoney>(100, &mint_cap);
-        deposit(account_addr, coin);
-
-        let permissioned_handle =
-            permissioned_signer::create_permissioned_handle(account);
-        let permissioned_signer =
-            permissioned_signer::signer_from_permissioned_handle(&permissioned_handle);
-        primary_fungible_store::grant_permission(
-            account, &permissioned_signer, metadata, 10
-        );
-
-        let coin_2 = withdraw<FakeMoney>(&permissioned_signer, 20);
-        burn(coin_2, &burn_cap);
-
-        permissioned_signer::destroy_permissioned_handle(permissioned_handle);
-        move_to(
-            account,
-            FakeMoneyCapabilities { burn_cap, freeze_cap, mint_cap }
-        );
-    }
-
-    #[test(account = @topo_framework)]
-    #[expected_failure(abort_code = 0x50024, location = topo_framework::fungible_asset)]
-    fun test_e2e_withdraw_with_permissioned_signer_no_permission_2(
-        account: &signer
-    ) acquires CoinConversionMap, CoinInfo, PairedCoinType {
-        account::create_account_for_test(signer::address_of(account));
-        let account_addr = signer::address_of(account);
-        let (burn_cap, freeze_cap, mint_cap) =
-            initialize_and_register_fake_money(account, 1, true);
-        let metadata = ensure_paired_metadata<FakeMoney>();
-
-        let coin = mint<FakeMoney>(100, &mint_cap);
-        deposit(account_addr, coin);
-
-        let permissioned_handle =
-            permissioned_signer::create_permissioned_handle(account);
-        let permissioned_signer =
-            permissioned_signer::signer_from_permissioned_handle(&permissioned_handle);
-        primary_fungible_store::grant_permission(
-            account, &permissioned_signer, metadata, 10
-        );
-
-        // Withdraw from permissioned signer with proper permissions.
-        let coin_2 = withdraw<FakeMoney>(&permissioned_signer, 10);
-        burn(coin_2, &burn_cap);
-
-        // Withdraw with some funds from CoinStore and some from PFS.
-        primary_fungible_store::deposit(
-            account_addr,
-            coin_to_fungible_asset(mint<FakeMoney>(100, &mint_cap))
-        );
-        primary_fungible_store::grant_permission(
-            account, &permissioned_signer, metadata, 90
-        );
-        let coin_2 = withdraw<FakeMoney>(&permissioned_signer, 100);
-        burn(coin_2, &burn_cap);
-
-        permissioned_signer::destroy_permissioned_handle(permissioned_handle);
-        move_to(
-            account,
-            FakeMoneyCapabilities { burn_cap, freeze_cap, mint_cap }
-        );
-    }
-
-    #[test(account = @topo_framework)]
-    #[expected_failure(abort_code = 0x50024, location = topo_framework::fungible_asset)]
-    fun test_e2e_withdraw_with_permissioned_signer_no_permission_3(
-        account: &signer
-    ) acquires CoinConversionMap, CoinInfo, PairedCoinType {
-        account::create_account_for_test(signer::address_of(account));
-        let account_addr = signer::address_of(account);
-        let (burn_cap, freeze_cap, mint_cap) =
-            initialize_and_register_fake_money(account, 1, true);
-        let metadata = ensure_paired_metadata<FakeMoney>();
-
-        let permissioned_handle =
-            permissioned_signer::create_permissioned_handle(account);
-        let permissioned_signer =
-            permissioned_signer::signer_from_permissioned_handle(&permissioned_handle);
-
-        // Withdraw with some funds from PFS only.
-        primary_fungible_store::deposit(
-            account_addr,
-            coin_to_fungible_asset(mint<FakeMoney>(100, &mint_cap))
-        );
-        primary_fungible_store::grant_permission(
-            account, &permissioned_signer, metadata, 90
-        );
-        let coin_2 = withdraw<FakeMoney>(&permissioned_signer, 100);
-        burn(coin_2, &burn_cap);
-
-        permissioned_signer::destroy_permissioned_handle(permissioned_handle);
-        move_to(
-            account,
-            FakeMoneyCapabilities { burn_cap, freeze_cap, mint_cap }
-        );
-    }
 }

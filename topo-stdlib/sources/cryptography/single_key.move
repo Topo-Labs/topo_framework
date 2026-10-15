@@ -7,7 +7,7 @@ module topo_std::single_key {
     use topo_std::keyless;
     use topo_std::secp256k1;
     use topo_std::secp256r1;
-    use std::bcs;
+    use topo_std::bcs;
     use topo_std::federated_keyless;
     use std::error;
     use std::hash;
@@ -105,6 +105,11 @@ module topo_std::single_key {
     /// Converts an unvalidated Ed25519 public key to an AnyPublicKey.
     public fun from_ed25519_public_key_unvalidated(pk: ed25519::UnvalidatedPublicKey): AnyPublicKey {
         AnyPublicKey::Ed25519 { pk }
+    }
+
+    /// Converts an unvalidated Ed25519 public key to an AnyPublicKey.
+    public fun from_ed25519_public_key(pk: ed25519::ValidatedPublicKey): AnyPublicKey {
+        AnyPublicKey::Ed25519 { pk: pk.public_key_to_unvalidated() }
     }
 
     /// Gets the authentication key for the AnyPublicKey.

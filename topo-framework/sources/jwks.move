@@ -22,6 +22,7 @@ module topo_framework::jwks {
     use topo_framework::event::emit;
     use topo_framework::reconfiguration;
     use topo_framework::system_addresses;
+    use topo_framework::reconfiguration_state;
     #[test_only]
     use topo_framework::account::create_account_for_test;
 
@@ -30,7 +31,7 @@ module topo_framework::jwks {
 
     /// We limit the size of a `PatchedJWKs` resource installed by a dapp owner for federated keyless accounts.
     /// Note: If too large, validators waste work reading it for invalid TXN signatures.
-    const MAX_FEDERATED_JWKS_SIZE_BYTES: u64 = 2 * 1024; // 2 KiB
+    const MAX_FEDERATED_JWKS_SIZE_BYTES: u64 = 4 * 1024; // 4 KiB
 
     const EUNEXPECTED_EPOCH: u64 = 1;
     const EUNEXPECTED_VERSION: u64 = 2;
@@ -182,7 +183,7 @@ module topo_framework::jwks {
     /// reusing `PatchedJWKs { jwks: AllProviderJWKs }`, which is a JWK-consensus-specific struct.
     public fun patch_federated_jwks(jwk_owner: &signer, patches: vector<Patch>) acquires FederatedJWKs {
         // Prevents accidental calls in 0x1::jwks that install federated JWKs at the Aptos framework address.
-        assert!(!system_addresses::is_aptos_framework_address(signer::address_of(jwk_owner)),
+        assert!(!system_addresses::is_topo_framework_address(signer::address_of(jwk_owner)),
             error::invalid_argument(EINSTALL_FEDERATED_JWKS_AT_APTOS_FRAMEWORK)
         );
 
@@ -294,7 +295,7 @@ module topo_framework::jwks {
     ///
     /// TODO: update all the tests that reference this function, then disable this function.
     public fun upsert_oidc_provider(fx: &signer, name: vector<u8>, config_url: vector<u8>): Option<vector<u8>> acquires SupportedOIDCProviders {
-        system_addresses::assert_aptos_framework(fx);
+        system_addresses::assert_topo_framework(fx);
         chain_status::assert_genesis();
 
         let provider_set = borrow_global_mut<SupportedOIDCProviders>(@topo_framework);
@@ -315,7 +316,7 @@ module topo_framework::jwks {
     /// topo_framework::topo_governance::reconfigure(&framework_signer);
     /// ```
     public fun upsert_oidc_provider_for_next_epoch(fx: &signer, name: vector<u8>, config_url: vector<u8>): Option<vector<u8>> acquires SupportedOIDCProviders {
-        system_addresses::assert_aptos_framework(fx);
+        system_addresses::assert_topo_framework(fx);
 
         let provider_set = if (config_buffer::does_exist<SupportedOIDCProviders>()) {
             config_buffer::extract_v2<SupportedOIDCProviders>()
@@ -333,7 +334,7 @@ module topo_framework::jwks {
     ///
     /// TODO: update all the tests that reference this function, then disable this function.
     public fun remove_oidc_provider(fx: &signer, name: vector<u8>): Option<vector<u8>> acquires SupportedOIDCProviders {
-        system_addresses::assert_aptos_framework(fx);
+        system_addresses::assert_topo_framework(fx);
         chain_status::assert_genesis();
 
         let provider_set = borrow_global_mut<SupportedOIDCProviders>(@topo_framework);
@@ -350,7 +351,7 @@ module topo_framework::jwks {
     /// topo_framework::topo_governance::reconfigure(&framework_signer);
     /// ```
     public fun remove_oidc_provider_for_next_epoch(fx: &signer, name: vector<u8>): Option<vector<u8>> acquires SupportedOIDCProviders {
-        system_addresses::assert_aptos_framework(fx);
+        system_addresses::assert_topo_framework(fx);
 
         let provider_set = if (config_buffer::does_exist<SupportedOIDCProviders>()) {
             config_buffer::extract_v2<SupportedOIDCProviders>()
@@ -364,7 +365,7 @@ module topo_framework::jwks {
 
     /// Only used in reconfigurations to apply the pending `SupportedOIDCProviders`, if there is any.
     public(friend) fun on_new_epoch(framework: &signer) acquires SupportedOIDCProviders {
-        system_addresses::assert_aptos_framework(framework);
+        system_addresses::assert_topo_framework(framework);
         if (config_buffer::does_exist<SupportedOIDCProviders>()) {
             let new_config = config_buffer::extract_v2<SupportedOIDCProviders>();
             if (exists<SupportedOIDCProviders>(@topo_framework)) {
@@ -377,7 +378,8 @@ module topo_framework::jwks {
 
     /// Set the `Patches`. Only called in governance proposals.
     public fun set_patches(fx: &signer, patches: vector<Patch>) acquires Patches, PatchedJWKs, ObservedJWKs {
-        system_addresses::assert_aptos_framework(fx);
+        reconfiguration_state::assert_not_in_progress();
+        system_addresses::assert_topo_framework(fx);
         borrow_global_mut<Patches>(@topo_framework).patches = patches;
         regenerate_patched_jwks();
     }
@@ -432,11 +434,21 @@ module topo_framework::jwks {
 
     /// Initialize some JWK resources. Should only be invoked by genesis.
     public fun initialize(fx: &signer) {
-        system_addresses::assert_aptos_framework(fx);
+        system_addresses::assert_topo_framework(fx);
         move_to(fx, SupportedOIDCProviders { providers: vector[] });
         move_to(fx, ObservedJWKs { jwks: AllProvidersJWKs { entries: vector[] } });
         move_to(fx, Patches { patches: vector[] });
         move_to(fx, PatchedJWKs { jwks: AllProvidersJWKs { entries: vector[] } });
+    }
+
+    /// Initialize some JWK resources. Should only be invoked by genesis.
+    public fun initialize_with_defaults(fx: &signer, providers: vector<OIDCProvider>, patches: vector<Patch>) {
+        system_addresses::assert_topo_framework(fx);
+        move_to(fx, SupportedOIDCProviders { providers });
+        move_to(fx, ObservedJWKs { jwks: AllProvidersJWKs { entries: vector[] } });
+        move_to(fx, Patches { patches });
+        move_to(fx, PatchedJWKs { jwks: AllProvidersJWKs { entries: vector[] } });
+        regenerate_patched_jwks();
     }
 
     /// Helper function that removes an OIDC provider from the `SupportedOIDCProviders`.
@@ -460,7 +472,7 @@ module topo_framework::jwks {
     /// NOTE: It is assumed verification has been done to ensure each update is quorum-certified,
     /// and its `version` equals to the on-chain version + 1.
     public fun upsert_into_observed_jwks(fx: &signer, provider_jwks_vec: vector<ProviderJWKs>) acquires ObservedJWKs, PatchedJWKs, Patches {
-        system_addresses::assert_aptos_framework(fx);
+        system_addresses::assert_topo_framework(fx);
         let observed_jwks = borrow_global_mut<ObservedJWKs>(@topo_framework);
 
         if (features::is_jwk_consensus_per_key_mode_enabled()) {
@@ -508,7 +520,7 @@ module topo_framework::jwks {
     ///
     /// Return the potentially existing `ProviderJWKs` of the given issuer.
     public fun remove_issuer_from_observed_jwks(fx: &signer, issuer: vector<u8>): Option<ProviderJWKs> acquires ObservedJWKs, PatchedJWKs, Patches {
-        system_addresses::assert_aptos_framework(fx);
+        system_addresses::assert_topo_framework(fx);
         let observed_jwks = borrow_global_mut<ObservedJWKs>(@topo_framework);
         let old_value = remove_issuer(&mut observed_jwks.jwks, issuer);
 

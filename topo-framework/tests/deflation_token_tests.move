@@ -1,21 +1,23 @@
 #[test_only]
-module 0xcafe::deflation_token_tests {
+module topo_framework::deflation_token_tests {
     use topo_framework::account;
     use topo_framework::dispatchable_fungible_asset;
     use topo_framework::function_info;
     use topo_framework::fungible_asset::{Self, Metadata, TestToken};
     use topo_framework::object;
     use topo_framework::primary_fungible_store;
-    use 0xcafe::deflation_token;
+    use topo_framework::deflation_token;
+    use std::features;
     use std::option;
     use std::string;
     use std::signer;
 
-    #[test(creator = @0xcafe, aaron = @0xface)]
+    #[test(creator = @topo_framework, aaron = @0xface)]
     fun test_deflation_e2e_basic_flow(
         creator: &signer,
         aaron: &signer,
     ) {
+        features::change_feature_flags_for_testing(creator, vector[features::get_function_value_dispatch_feature()], vector[]);
         let (creator_ref, token_object) = fungible_asset::create_test_token(creator);
         let (mint, _, _, _) = fungible_asset::init_test_metadata(&creator_ref);
         let metadata = token_object.convert<TestToken, Metadata>();
@@ -57,12 +59,13 @@ module 0xcafe::deflation_token_tests {
         assert!(fungible_asset::balance(aaron_store) == 35, 42);
     }
 
-    #[test(creator = @0xcafe, aaron = @0xface)]
+    #[test(creator = @topo_framework, aaron = @0xface)]
     #[expected_failure(abort_code = 0x70002, location = topo_framework::dispatchable_fungible_asset)]
     fun test_deflation_assert_min_deposit(
         creator: &signer,
         aaron: &signer,
     ) {
+        features::change_feature_flags_for_testing(creator, vector[features::get_function_value_dispatch_feature()], vector[]);
         let (creator_ref, token_object) = fungible_asset::create_test_token(creator);
         let (mint, _, _, _) = fungible_asset::init_test_metadata(&creator_ref);
         let metadata = token_object.convert<TestToken, Metadata>();
@@ -81,11 +84,12 @@ module 0xcafe::deflation_token_tests {
         dispatchable_fungible_asset::transfer_assert_minimum_deposit(creator, creator_store, aaron_store, 10, 11);
     }
 
-    #[test(creator = @0xcafe)]
+    #[test(creator = @topo_framework)]
     #[expected_failure(abort_code = 0x1001C, location = topo_framework::fungible_asset)]
     fun test_deflation_fa_deposit(
         creator: &signer,
     ) {
+        features::change_feature_flags_for_testing(creator, vector[features::get_function_value_dispatch_feature()], vector[]);
         let (creator_ref, token_object) = fungible_asset::create_test_token(creator);
         let (mint, _, _, _) = fungible_asset::init_test_metadata(&creator_ref);
         let metadata = token_object.convert<TestToken, Metadata>();
@@ -105,12 +109,13 @@ module 0xcafe::deflation_token_tests {
         fungible_asset::deposit(creator_store, fa);
     }
 
-    #[test(creator = @0xcafe, aaron = @0xface)]
+    #[test(creator = @topo_framework, aaron = @0xface)]
     #[expected_failure(abort_code = 0x1001C, location = topo_framework::fungible_asset)]
     fun test_deflation_fa_withdraw(
         creator: &signer,
         aaron: &signer,
     ) {
+        features::change_feature_flags_for_testing(creator, vector[features::get_function_value_dispatch_feature()], vector[]);
         let (creator_ref, token_object) = fungible_asset::create_test_token(creator);
         let (mint, _, _, _) = fungible_asset::init_test_metadata(&creator_ref);
         let metadata = token_object.convert<TestToken, Metadata>();
@@ -132,7 +137,7 @@ module 0xcafe::deflation_token_tests {
         dispatchable_fungible_asset::deposit(aaron_store, fa);
     }
 
-    #[test(creator = @0xcafe, aaron = @0xface)]
+    #[test(creator = @topo_framework, aaron = @0xface)]
     #[expected_failure(abort_code = 0x8001D, location = topo_framework::fungible_asset)]
     fun test_double_init(
         creator: &signer,
@@ -156,7 +161,7 @@ module 0xcafe::deflation_token_tests {
         );
     }
 
-    #[test(creator = @0xcafe)]
+    #[test(creator = @topo_framework)]
     #[expected_failure(abort_code = 0x10019, location = topo_framework::fungible_asset)]
     fun test_register_bad_withdraw(
         creator: &signer,
@@ -178,7 +183,7 @@ module 0xcafe::deflation_token_tests {
         );
     }
 
-    #[test(creator = @0xcafe)]
+    #[test(creator = @topo_framework)]
     #[expected_failure(abort_code = 0x1001A, location = topo_framework::fungible_asset)]
     fun test_register_bad_deposit(
         creator: &signer,
@@ -200,7 +205,7 @@ module 0xcafe::deflation_token_tests {
         );
     }
 
-    #[test(creator = @0xcafe)]
+    #[test(creator = @topo_framework)]
     #[expected_failure(abort_code = 0x1001B, location = topo_framework::fungible_asset)]
     fun test_register_bad_value(
         creator: &signer,
@@ -222,7 +227,7 @@ module 0xcafe::deflation_token_tests {
         );
     }
 
-    #[test(creator = @0xcafe, aaron = @0xface)]
+    #[test(creator = @topo_framework, aaron = @0xface)]
     #[expected_failure(major_status=1081, location = topo_framework::function_info)]
     fun test_register_bad_withdraw_non_exist(
         creator: &signer,
@@ -245,7 +250,7 @@ module 0xcafe::deflation_token_tests {
         );
     }
 
-    #[test(creator = @0xcafe)]
+    #[test(creator = @topo_framework)]
     #[expected_failure(abort_code=2, location = topo_framework::function_info)]
     fun test_register_bad_withdraw_non_exist_2(
         creator: &signer,
@@ -267,7 +272,7 @@ module 0xcafe::deflation_token_tests {
         );
     }
 
-    #[test(creator = @0xcafe)]
+    #[test(creator = @topo_framework)]
     fun test_calling_overloadable_api_on_regular_fa(
         creator: &signer,
     ) {
@@ -285,7 +290,7 @@ module 0xcafe::deflation_token_tests {
         dispatchable_fungible_asset::deposit(creator_store, fa);
     }
 
-    #[test(creator = @0xcafe)]
+    #[test(creator = @topo_framework)]
     #[expected_failure(abort_code=0x6001E, location = topo_framework::fungible_asset)]
     fun test_register_on_non_metadata_object(
         creator: &signer,
@@ -307,11 +312,12 @@ module 0xcafe::deflation_token_tests {
         );
     }
 
-    #[test(creator = @0xcafe, aaron = @0xface)]
+    #[test(creator = @topo_framework, aaron = @0xface)]
     fun test_basic_flow_primary_fa(
         creator: &signer,
         aaron: &signer,
     ) {
+        features::change_feature_flags_for_testing(creator, vector[features::get_function_value_dispatch_feature()], vector[]);
         let (creator_ref, token_object) = fungible_asset::create_test_token(creator);
         let (mint_ref, transfer_ref, burn_ref) = primary_fungible_store::init_test_metadata_with_primary_store_enabled(&creator_ref);
         let metadata = token_object.convert<TestToken, Metadata>();
@@ -353,12 +359,13 @@ module 0xcafe::deflation_token_tests {
         assert!(primary_fungible_store::balance(aaron_address, metadata) == 0, 7);
     }
 
-    #[test(creator = @0xcafe, aaron = @0xface)]
+    #[test(creator = @topo_framework, aaron = @0xface)]
     #[expected_failure(abort_code = 0x50003, location = topo_framework::fungible_asset)]
     fun test_deflation_set_frozen(
         creator: &signer,
         aaron: &signer,
     ) {
+        features::change_feature_flags_for_testing(creator, vector[features::get_function_value_dispatch_feature()], vector[]);
         let (creator_ref, token_object) = fungible_asset::create_test_token(creator);
         let (mint, transfer_ref, _, _) = fungible_asset::init_test_metadata(&creator_ref);
         let metadata = token_object.convert<TestToken, Metadata>();
@@ -388,12 +395,13 @@ module 0xcafe::deflation_token_tests {
         dispatchable_fungible_asset::deposit(aaron_store, fa);
     }
 
-    #[test(creator = @0xcafe, aaron = @0xface)]
+    #[test(creator = @topo_framework, aaron = @0xface)]
     #[expected_failure(abort_code = 0x50008, location = topo_framework::fungible_asset)]
     fun test_deflation_wrong_withdraw(
         creator: &signer,
         aaron: &signer,
     ) {
+        features::change_feature_flags_for_testing(creator, vector[features::get_function_value_dispatch_feature()], vector[]);
         let (creator_ref, token_object) = fungible_asset::create_test_token(creator);
         fungible_asset::init_test_metadata(&creator_ref);
         let metadata = token_object.convert<TestToken, Metadata>();

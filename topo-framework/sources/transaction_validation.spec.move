@@ -28,16 +28,12 @@ spec topo_framework::transaction_validation {
         pragma aborts_if_is_strict;
     }
 
-    spec grant_gas_permission(
-        master: &signer,
-        permissioned: &signer,
-        gas_amount: u64
-    ) {
-        pragma aborts_if_is_partial;
+    spec grant_gas_permission {
+        aborts_if true;
     }
 
-    spec revoke_gas_permission(permissioned: &signer) {
-        pragma aborts_if_is_partial;
+    spec revoke_gas_permission {
+        aborts_if true;
     }
 
     /// Ensure caller is `topo_framework`.
@@ -51,7 +47,7 @@ spec topo_framework::transaction_validation {
     ) {
         use std::signer;
         let addr = signer::address_of(topo_framework);
-        aborts_if !system_addresses::is_aptos_framework_address(addr);
+        aborts_if !system_addresses::is_topo_framework_address(addr);
         aborts_if exists<TransactionValidation>(addr);
 
         ensures exists<TransactionValidation>(addr);
@@ -90,6 +86,7 @@ spec topo_framework::transaction_validation {
         txn_expiration_time: u64,
         chain_id: u8,
         is_simulation: bool,
+        txn_limits_request: Option<UserTxnLimitsRequest>,
     ) {
         // TODO(fa_migration)
         pragma verify = false;
@@ -208,7 +205,6 @@ spec topo_framework::transaction_validation {
         chain_id: u8,
         is_simulation: bool,
     ) {
-        pragma verify_duration_estimate = 120;
         let gas_payer = sender;
         // TODO(fa_migration)
         pragma verify = false;
@@ -442,6 +438,15 @@ spec topo_framework::transaction_validation {
         pragma verify = false;
     }
 
+    spec versioned_prologue(sender: signer, fee_payer: signer, args: PrologueArgs) {
+        // TODO: temporary mockup
+        pragma verify = false;
+    }
+
+    spec versioned_epilogue(sender: signer, fee_payer: signer, args: EpilogueArgs) {
+        // TODO: temporary mockup
+        pragma verify = false;
+    }
 
     spec schema EpilogueGasPayerAbortsIf {
         use std::option;
@@ -484,19 +489,19 @@ spec topo_framework::transaction_validation {
         // Check burning.
         //   (Check the total supply aggregator when enabled.)
         let amount_to_burn = transaction_fee_amount - storage_fee_refunded;
-        let topo_addr = type_info::type_of<TopoCoin>().account_address;
-        let maybe_topo_supply = global<CoinInfo<TopoCoin>>(topo_addr).supply;
-        let total_supply_enabled = option::is_some(maybe_topo_supply);
-        let topo_supply = option::borrow(maybe_topo_supply);
-        let topo_supply_value = optional_aggregator::optional_aggregator_value(topo_supply);
-        let post post_maybe_topo_supply = global<CoinInfo<TopoCoin>>(topo_addr).supply;
-        let post post_topo_supply = option::borrow(post_maybe_topo_supply);
-        let post post_topo_supply_value = optional_aggregator::optional_aggregator_value(post_topo_supply);
+        let apt_addr = type_info::type_of<TopoCoin>().account_address;
+        let maybe_apt_supply = global<CoinInfo<TopoCoin>>(apt_addr).supply;
+        let total_supply_enabled = option::is_some(maybe_apt_supply);
+        let apt_supply = option::borrow(maybe_apt_supply);
+        let apt_supply_value = optional_aggregator::optional_aggregator_value(apt_supply);
+        let post post_maybe_apt_supply = global<CoinInfo<TopoCoin>>(apt_addr).supply;
+        let post post_apt_supply = option::borrow(post_maybe_apt_supply);
+        let post post_apt_supply_value = optional_aggregator::optional_aggregator_value(post_apt_supply);
 
         aborts_if amount_to_burn > 0 && !exists<TopoCoinCapabilities>(@topo_framework);
-        aborts_if amount_to_burn > 0 && !exists<CoinInfo<TopoCoin>>(topo_addr);
-        aborts_if amount_to_burn > 0 && total_supply_enabled && topo_supply_value < amount_to_burn;
-        ensures total_supply_enabled ==> topo_supply_value - amount_to_burn == post_topo_supply_value;
+        aborts_if amount_to_burn > 0 && !exists<CoinInfo<TopoCoin>>(apt_addr);
+        aborts_if amount_to_burn > 0 && total_supply_enabled && apt_supply_value < amount_to_burn;
+        ensures total_supply_enabled ==> apt_supply_value - amount_to_burn == post_apt_supply_value;
 
         // Check minting.
         let amount_to_mint = storage_fee_refunded - transaction_fee_amount;

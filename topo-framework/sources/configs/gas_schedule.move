@@ -9,6 +9,7 @@ module topo_framework::gas_schedule {
     use topo_framework::config_buffer;
 
     use topo_framework::reconfiguration;
+    use topo_framework::poc_accounting;
     use topo_framework::system_addresses;
     use topo_framework::util::from_bytes;
     use topo_framework::storage_gas::StorageGasConfig;
@@ -23,6 +24,7 @@ module topo_framework::gas_schedule {
     const EINVALID_GAS_SCHEDULE: u64 = 1;
     const EINVALID_GAS_FEATURE_VERSION: u64 = 2;
     const EINVALID_GAS_SCHEDULE_HASH: u64 = 3;
+    const EPOC_REQUIRES_GOVERNANCE_TRANSITION: u64 = 4;
 
     struct GasEntry has store, copy, drop {
         key: String,
@@ -40,7 +42,7 @@ module topo_framework::gas_schedule {
 
     /// Only called during genesis.
     public(friend) fun initialize(topo_framework: &signer, gas_schedule_blob: vector<u8>) {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
         assert!(!gas_schedule_blob.is_empty(), error::invalid_argument(EINVALID_GAS_SCHEDULE));
 
         // TODO(Gas): check if gas schedule is consistent
@@ -54,7 +56,7 @@ module topo_framework::gas_schedule {
     ///
     /// TODO: update all the tests that reference this function, then disable this function.
     public fun set_gas_schedule(topo_framework: &signer, gas_schedule_blob: vector<u8>) acquires GasSchedule, GasScheduleV2 {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
         assert!(!gas_schedule_blob.is_empty(), error::invalid_argument(EINVALID_GAS_SCHEDULE));
         chain_status::assert_genesis();
 
@@ -88,7 +90,7 @@ module topo_framework::gas_schedule {
     /// topo_framework::topo_governance::reconfigure(&framework_signer);
     /// ```
     public fun set_for_next_epoch(topo_framework: &signer, gas_schedule_blob: vector<u8>) acquires GasScheduleV2 {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
         assert!(!gas_schedule_blob.is_empty(), error::invalid_argument(EINVALID_GAS_SCHEDULE));
         let new_gas_schedule: GasScheduleV2 = from_bytes(gas_schedule_blob);
         if (exists<GasScheduleV2>(@topo_framework)) {
@@ -109,7 +111,7 @@ module topo_framework::gas_schedule {
         old_gas_schedule_hash: vector<u8>,
         new_gas_schedule_blob: vector<u8>
     ) acquires GasScheduleV2 {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
         assert!(!new_gas_schedule_blob.is_empty(), error::invalid_argument(EINVALID_GAS_SCHEDULE));
 
         let new_gas_schedule: GasScheduleV2 = from_bytes(new_gas_schedule_blob);
@@ -132,7 +134,7 @@ module topo_framework::gas_schedule {
 
     /// Only used in reconfigurations to apply the pending `GasScheduleV2`, if there is any.
     public(friend) fun on_new_epoch(framework: &signer) acquires GasScheduleV2 {
-        system_addresses::assert_aptos_framework(framework);
+        system_addresses::assert_topo_framework(framework);
         if (config_buffer::does_exist<GasScheduleV2>()) {
             let new_gas_schedule = config_buffer::extract_v2<GasScheduleV2>();
             if (exists<GasScheduleV2>(@topo_framework)) {
@@ -143,7 +145,10 @@ module topo_framework::gas_schedule {
         }
     }
 
+    /// PoC 准备后，在同一事务中先调用 set_storage_gas_config_for_next_epoch，
+    /// 再调用 topo_governance::reconfigure，确保完整安装冻结的配置。
     public fun set_storage_gas_config(topo_framework: &signer, config: StorageGasConfig) {
+        assert!(!poc_accounting::is_prepared(), error::invalid_state(EPOC_REQUIRES_GOVERNANCE_TRANSITION));
         storage_gas::set_config(topo_framework, config);
         // Need to trigger reconfiguration so the VM is guaranteed to load the new gas fee starting from the next
         // transaction.

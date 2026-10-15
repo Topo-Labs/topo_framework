@@ -12,10 +12,8 @@ module topo_framework::code {
     use std::option::Option;
     use std::string;
     use topo_framework::event;
+    use topo_framework::init;
     use topo_framework::object::{Self, Object};
-    use topo_framework::permissioned_signer;
-
-    friend topo_framework::object_code_deployment;
 
     // ----------------------------------------------------------------------
     // Code Publishing
@@ -108,22 +106,15 @@ module topo_framework::code {
     /// `code_object` does not exist.
     const ECODE_OBJECT_DOES_NOT_EXIST: u64 = 0xA;
 
-    /// Current permissioned signer cannot publish codes.
-    const ENO_CODE_PERMISSION: u64 = 0xB;
+    /// The permissioned signer feature has been removed.
+    const EPERMISSIONED_SIGNER_REMOVED: u64 = 0xC;
 
+    #[deprecated]
     struct CodePublishingPermission has copy, drop, store {}
 
-    /// Permissions
-    public(friend) fun check_code_publishing_permission(s: &signer) {
-        assert!(
-            permissioned_signer::check_permission_exists(s, CodePublishingPermission {}),
-            error::permission_denied(ENO_CODE_PERMISSION),
-        );
-    }
-
-    /// Grant permission to publish code on behalf of the master signer.
-    public fun grant_permission(master: &signer, permissioned_signer: &signer) {
-        permissioned_signer::authorize_unlimited(master, permissioned_signer, CodePublishingPermission {})
+    #[deprecated]
+    public fun grant_permission(_master: &signer, _permissioned_signer: &signer) {
+        abort error::unavailable(EPERMISSIONED_SIGNER_REMOVED)
     }
 
     /// Whether unconditional code upgrade with no compatibility check is allowed. This
@@ -154,7 +145,7 @@ module topo_framework::code {
     /// Initialize package metadata for Genesis.
     fun initialize(topo_framework: &signer, package_owner: &signer, metadata: PackageMetadata)
     acquires PackageRegistry {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
         let addr = signer::address_of(package_owner);
         if (!exists<PackageRegistry>(addr)) {
             move_to(package_owner, PackageRegistry { packages: vector[metadata] })
@@ -166,7 +157,6 @@ module topo_framework::code {
     /// Publishes a package at the given signer's address. The caller must provide package metadata describing the
     /// package.
     public fun publish_package(owner: &signer, pack: PackageMetadata, code: vector<vector<u8>>) acquires PackageRegistry {
-        check_code_publishing_permission(owner);
         // Disallow incompatible upgrade mode. Governance can decide later if this should be reconsidered.
         assert!(
             pack.upgrade_policy.policy > upgrade_policy_arbitrary().policy,
@@ -185,6 +175,16 @@ module topo_framework::code {
         // To avoid prover compiler error on spec
         // the package need to be an immutable variable
         let module_names = get_module_names(&pack);
+
+        // Record, per module in this package, the object's transitive root owner at (re)publish, so
+        // lazy self-init can detect a later transfer of the object or an ancestor since that module
+        // was published (see `init::internal_maybe_initialize`). Objects only; feature-gated.
+        if (features::is_lazy_module_initialization_enabled() && object::is_object(addr)) {
+            let owner = object::address_to_object<object::ObjectCore>(addr).root_owner();
+            module_names.for_each_ref(|name| {
+                init::record_deploy_owner(addr, *name.bytes(), owner);
+            });
+        };
         let package_immutable = &borrow_global<PackageRegistry>(addr).packages;
         let len = package_immutable.length();
         let index = len;
@@ -207,6 +207,10 @@ module topo_framework::code {
         // Update registry
         let policy = pack.upgrade_policy;
         if (index < len) {
+            pack.modules.for_each_ref(|m| {
+                let m: &ModuleMetadata = m;
+                init::reset_initialized(addr, *m.name.bytes());
+            });
             *packages.borrow_mut(index) = pack
         } else {
             packages.push_back(pack)
@@ -227,11 +231,10 @@ module topo_framework::code {
     }
 
     public fun freeze_code_object(publisher: &signer, code_object: Object<PackageRegistry>) acquires PackageRegistry {
-        check_code_publishing_permission(publisher);
         let code_object_addr = code_object.object_address();
         assert!(exists<PackageRegistry>(code_object_addr), error::not_found(ECODE_OBJECT_DOES_NOT_EXIST));
         assert!(
-            code_object.is_owner(signer::address_of(publisher)),
+            object::is_owner(code_object, signer::address_of(publisher)),
             error::permission_denied(ENOT_PACKAGE_OWNER)
         );
 

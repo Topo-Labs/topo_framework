@@ -149,6 +149,7 @@
 module topo_framework::storage_gas {
 
     use topo_framework::system_addresses;
+    use topo_framework::reconfiguration_state;
     use std::error;
     use topo_framework::state_storage;
     #[test_only]
@@ -362,7 +363,8 @@ module topo_framework::storage_gas {
     }
 
     public(friend) fun set_config(topo_framework: &signer, config: StorageGasConfig) acquires StorageGasConfig {
-        system_addresses::assert_aptos_framework(topo_framework);
+        reconfiguration_state::assert_not_in_progress();
+        system_addresses::assert_topo_framework(topo_framework);
         *borrow_global_mut<StorageGasConfig>(@topo_framework) = config;
     }
 
@@ -388,7 +390,7 @@ module topo_framework::storage_gas {
     /// See `base_8192_exponential_curve()` fore more information on
     /// target utilization.
     public fun initialize(topo_framework: &signer) {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
         assert!(
             !exists<StorageGasConfig>(@topo_framework),
             error::already_exists(ESTORAGE_GAS_CONFIG)
@@ -436,11 +438,17 @@ module topo_framework::storage_gas {
         let i = 0;
         while ({
             spec {
-                invariant forall j in 0..i: {
-                    let cur = if (j == 0) { Point { x: 0, y: 0 } } else { points[j - 1] };
-                    let next = if (j == len) { Point { x: BASIS_POINT_DENOMINATION, y: BASIS_POINT_DENOMINATION } } else { points[j] };
-                    cur.x < next.x && cur.y <= next.y
-                };
+                invariant i <= len + 1;
+                // Two adjacent points (and the sentinel pair around `points`) are strictly
+                // increasing in `x` and non-decreasing in `y`, for every adjacency the loop
+                // has already checked.
+                invariant forall j in 1..i where j < len:
+                    points[j - 1].x < points[j].x && points[j - 1].y <= points[j].y;
+                invariant i > 0 && len > 0 ==>
+                    0 < points[0].x;
+                invariant i > len && len > 0 ==>
+                    points[len - 1].x < BASIS_POINT_DENOMINATION
+                    && points[len - 1].y <= BASIS_POINT_DENOMINATION;
             };
             i <= len
         }) {

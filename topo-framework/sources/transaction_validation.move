@@ -1,4 +1,5 @@
 module topo_framework::transaction_validation {
+    use std::bcs;
     use std::error;
     use std::features;
     use std::option;
@@ -9,10 +10,12 @@ module topo_framework::transaction_validation {
     use topo_framework::account_abstraction;
     use topo_framework::chain_id;
     use topo_framework::create_signer;
-    use topo_framework::permissioned_signer;
     use topo_framework::system_addresses;
     use topo_framework::timestamp;
     use topo_framework::transaction_fee;
+    use topo_framework::transaction_fee::FeeStatement;
+    use topo_framework::transaction_limits;
+    use topo_framework::transaction_limits::UserTxnLimitsRequest;
     use topo_framework::nonce_validation;
 
     friend topo_framework::genesis;
@@ -44,6 +47,7 @@ module topo_framework::transaction_validation {
         user_epilogue_name: vector<u8>,
     }
 
+    #[deprecated]
     struct GasPermission has copy, drop, store {}
 
     /// MSB is used to indicate a gas payer tx
@@ -51,6 +55,8 @@ module topo_framework::transaction_validation {
 
     /// Transaction exceeded its allocated max gas
     const EOUT_OF_GAS: u64 = 6;
+    /// The permissioned signer feature has been removed.
+    const EPERMISSIONED_SIGNER_REMOVED: u64 = 7;
 
     /// Prologue errors. These are separated out from the other errors in this
     /// module since they are mapped separately to major VM statuses, and are
@@ -65,29 +71,21 @@ module topo_framework::transaction_validation {
     const PROLOGUE_ESEQUENCE_NUMBER_TOO_BIG: u64 = 1008;
     const PROLOGUE_ESECONDARY_KEYS_ADDRESSES_COUNT_MISMATCH: u64 = 1009;
     const PROLOGUE_EFEE_PAYER_NOT_ENABLED: u64 = 1010;
-    const PROLOGUE_PERMISSIONED_GAS_LIMIT_INSUFFICIENT: u64 = 1011;
     const PROLOGUE_ENONCE_ALREADY_USED: u64 = 1012;
     const PROLOGUE_ETRANSACTION_EXPIRATION_TOO_FAR_IN_FUTURE: u64 = 1013;
 
-    /// Permission management
-    ///
-    /// Master signer grant permissioned signer ability to consume a given amount of gas in octas.
+    #[deprecated]
     public fun grant_gas_permission(
-        master: &signer,
-        permissioned: &signer,
-        gas_amount: u64
+        _master: &signer,
+        _permissioned: &signer,
+        _gas_amount: u64
     ) {
-        permissioned_signer::authorize_increase(
-            master,
-            permissioned,
-            (gas_amount as u256),
-            GasPermission {}
-        )
+        abort error::unavailable(EPERMISSIONED_SIGNER_REMOVED)
     }
 
-    /// Removing permissions from permissioned signer.
-    public fun revoke_gas_permission(permissioned: &signer) {
-        permissioned_signer::revoke_permission(permissioned, GasPermission {})
+    #[deprecated]
+    public fun revoke_gas_permission(_permissioned: &signer) {
+        abort error::unavailable(EPERMISSIONED_SIGNER_REMOVED)
     }
 
     /// Only called during genesis to initialize system resources for this module.
@@ -99,7 +97,7 @@ module topo_framework::transaction_validation {
         multi_agent_prologue_name: vector<u8>,
         user_epilogue_name: vector<u8>,
     ) {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
 
         move_to(topo_framework, TransactionValidation {
             module_addr: @topo_framework,
@@ -129,6 +127,7 @@ module topo_framework::transaction_validation {
         txn_expiration_time: u64,
         chain_id: u8,
         is_simulation: bool,
+        txn_limits_request: Option<UserTxnLimitsRequest>,
     ) {
         let sender_address = signer::address_of(sender);
         let gas_payer_address = signer::address_of(gas_payer);
@@ -144,16 +143,21 @@ module topo_framework::transaction_validation {
         // Check if the authentication key is valid
         if (!skip_auth_key_check(is_simulation, &txn_authentication_key)) {
             if (txn_authentication_key.is_some()) {
-                if (
-                    sender_address == gas_payer_address ||
-                    account::exists_at(sender_address) ||
-                    !features::sponsored_automatic_account_creation_enabled()
+                let authentication_key = if (
+                    sender_address != gas_payer_address &&
+                        !account::exists_at(sender_address) &&
+                        features::sponsored_automatic_account_creation_enabled()
                 ) {
-                    assert!(
-                        txn_authentication_key == option::some(account::get_authentication_key(sender_address)),
-                        error::invalid_argument(PROLOGUE_EINVALID_ACCOUNT_AUTH_KEY),
-                    );
+                    // This is a sponsored transaction with account that does
+                    // not exist and there is no default account resource.
+                    bcs::to_bytes(&sender_address)
+                } else {
+                    account::get_authentication_key(sender_address)
                 };
+                assert!(
+                    txn_authentication_key.destroy_some() == authentication_key,
+                    error::invalid_argument(PROLOGUE_EINVALID_ACCOUNT_AUTH_KEY),
+                );
             } else {
                 assert!(
                     allow_missing_txn_authentication_key(sender_address),
@@ -180,20 +184,19 @@ module topo_framework::transaction_validation {
             }
         };
 
+        if (txn_limits_request.is_some()) {
+            transaction_limits::validate_high_txn_limits(
+                gas_payer_address,
+                txn_limits_request.destroy_some(),
+            );
+        };
+
         // Check if the gas payer has enough balance to pay for the transaction
         let max_transaction_fee = txn_gas_price * txn_max_gas_units;
         if (!skip_gas_payment(
             is_simulation,
             gas_payer_address
         )) {
-            assert!(
-                permissioned_signer::check_permission_capacity_above(
-                    gas_payer,
-                    (max_transaction_fee as u256),
-                    GasPermission {}
-                ),
-                error::permission_denied(PROLOGUE_PERMISSIONED_GAS_LIMIT_INSUFFICIENT)
-            );
             assert!(
                 topo_account::is_fungible_balance_at_least(gas_payer_address, max_transaction_fee),
                 error::invalid_argument(PROLOGUE_ECANT_PAY_GAS_DEPOSIT)
@@ -272,6 +275,7 @@ module topo_framework::transaction_validation {
             txn_expiration_time,
             chain_id,
             false,
+            option::none(),
         )
     }
 
@@ -299,6 +303,7 @@ module topo_framework::transaction_validation {
             txn_expiration_time,
             chain_id,
             is_simulation,
+            option::none(),
         )
     }
 
@@ -325,6 +330,7 @@ module topo_framework::transaction_validation {
             txn_expiration_time,
             chain_id,
             false,
+            option::none(),
         );
         multi_agent_common_prologue(
             secondary_signer_addresses,
@@ -358,6 +364,7 @@ module topo_framework::transaction_validation {
             txn_expiration_time,
             chain_id,
             is_simulation,
+            option::none(),
         );
         multi_agent_common_prologue(
             secondary_signer_addresses,
@@ -451,6 +458,7 @@ module topo_framework::transaction_validation {
             txn_expiration_time,
             chain_id,
             false,
+            option::none(),
         );
         multi_agent_common_prologue(
             secondary_signer_addresses,
@@ -490,6 +498,7 @@ module topo_framework::transaction_validation {
             txn_expiration_time,
             chain_id,
             is_simulation,
+            option::none(),
         );
         multi_agent_common_prologue(
             secondary_signer_addresses,
@@ -649,7 +658,6 @@ module topo_framework::transaction_validation {
             txn_expiration_time,
             chain_id,
             is_simulation,
-
         )
     }
 
@@ -734,6 +742,7 @@ module topo_framework::transaction_validation {
             txn_expiration_time,
             chain_id,
             is_simulation,
+            option::none(),
         );
         multi_agent_common_prologue(secondary_signer_addresses, secondary_signer_public_key_hashes, is_simulation);
     }
@@ -763,6 +772,7 @@ module topo_framework::transaction_validation {
             txn_expiration_time,
             chain_id,
             is_simulation,
+            option::none(),
         );
         multi_agent_common_prologue(secondary_signer_addresses, secondary_signer_public_key_hashes, is_simulation);
         if (!skip_auth_key_check(is_simulation, &fee_payer_public_key_hash)) {
@@ -815,19 +825,9 @@ module topo_framework::transaction_validation {
             if (transaction_fee_amount > storage_fee_refunded) {
                 let burn_amount = transaction_fee_amount - storage_fee_refunded;
                 transaction_fee::burn_fee(gas_payer_address, burn_amount);
-                permissioned_signer::check_permission_consume(
-                    &gas_payer,
-                    (burn_amount as u256),
-                    GasPermission {}
-                );
             } else if (transaction_fee_amount < storage_fee_refunded) {
                 let mint_amount = storage_fee_refunded - transaction_fee_amount;
                 transaction_fee::mint_and_refund(gas_payer_address, mint_amount);
-                permissioned_signer::increase_limit(
-                    &gas_payer,
-                    (mint_amount as u256),
-                    GasPermission {}
-                );
             };
         };
 
@@ -835,6 +835,128 @@ module topo_framework::transaction_validation {
             // Increment sequence number
             let addr = signer::address_of(&account);
             account::increment_sequence_number(addr);
+        }
+    }
+
+    ///////////////////////////////////////////////////////////
+    /// Versioned enum-based prologue and epilogue
+    ///////////////////////////////////////////////////////////
+
+    /// Arguments for `versioned_prologue`. A new field becomes a new enum variant.
+    ///
+    /// - Old variants are kept for compatibility; their on-chain layout must remain stable.
+    /// - Only the most recent variant needs real handling here — old variants were executed
+    ///   against the framework version that shipped them and are not reached from this code.
+    enum PrologueArgs {
+        V1 {
+            needs_fee_payer_auth_check: bool,
+            txn_sender_public_key: Option<vector<u8>>,
+            fee_payer_public_key_hash: Option<vector<u8>>,
+            replay_protector: ReplayProtector,
+            secondary_signer_addresses: vector<address>,
+            secondary_signer_public_key_hashes: vector<Option<vector<u8>>>,
+            txn_gas_price: u64,
+            txn_max_gas_units: u64,
+            txn_expiration_time: u64,
+            chain_id: u8,
+            is_simulation: bool,
+            txn_limits_request: Option<UserTxnLimitsRequest>,
+        },
+    }
+
+    fun versioned_prologue(sender: signer, fee_payer: signer, args: PrologueArgs) {
+        match (args) {
+            V1 {
+                needs_fee_payer_auth_check,
+                txn_sender_public_key,
+                fee_payer_public_key_hash,
+                replay_protector,
+                secondary_signer_addresses,
+                secondary_signer_public_key_hashes,
+                txn_gas_price,
+                txn_max_gas_units,
+                txn_expiration_time,
+                chain_id,
+                is_simulation,
+                txn_limits_request,
+            } => {
+                prologue_common(
+                    &sender,
+                    &fee_payer,
+                    replay_protector,
+                    txn_sender_public_key,
+                    txn_gas_price,
+                    txn_max_gas_units,
+                    txn_expiration_time,
+                    chain_id,
+                    is_simulation,
+                    txn_limits_request,
+                );
+                multi_agent_common_prologue(
+                    secondary_signer_addresses,
+                    secondary_signer_public_key_hashes,
+                    is_simulation,
+                );
+
+                if (needs_fee_payer_auth_check) {
+                    let fee_payer_address = signer::address_of(&fee_payer);
+                    if (!skip_auth_key_check(is_simulation, &fee_payer_public_key_hash)) {
+                        if (fee_payer_public_key_hash.is_some()) {
+                            let fee_payer_public_key_hash = fee_payer_public_key_hash.destroy_some();
+                            assert!(
+                                fee_payer_public_key_hash == account::get_authentication_key(fee_payer_address),
+                                error::invalid_argument(PROLOGUE_EINVALID_ACCOUNT_AUTH_KEY),
+                            );
+                        } else {
+                            assert!(
+                                allow_missing_txn_authentication_key(fee_payer_address),
+                                error::invalid_argument(PROLOGUE_EINVALID_ACCOUNT_AUTH_KEY),
+                            );
+                        };
+                    };
+                };
+            },
+        }
+    }
+
+    /// Arguments for `versioned_epilogue`. A new field becomes a new enum variant.
+    ///
+    /// - Old variants are kept for compatibility; their on-chain layout must remain stable.
+    /// - Only the most recent variant needs real handling here — old variants were executed
+    ///   against the framework version that shipped them and are not reached from this code.
+    enum EpilogueArgs {
+        V1 {
+            fee_statement: FeeStatement,
+            txn_gas_price: u64,
+            txn_max_gas_units: u64,
+            gas_units_remaining: u64,
+            is_simulation: bool,
+            is_orderless_txn: bool,
+        },
+    }
+
+    fun versioned_epilogue(sender: signer, fee_payer: signer, args: EpilogueArgs) {
+        match (args) {
+            V1 {
+                fee_statement,
+                txn_gas_price,
+                txn_max_gas_units,
+                gas_units_remaining,
+                is_simulation,
+                is_orderless_txn,
+            } => {
+                unified_epilogue_v2(
+                    sender,
+                    fee_payer,
+                    fee_statement.storage_fee_refund_octas(),
+                    txn_gas_price,
+                    txn_max_gas_units,
+                    gas_units_remaining,
+                    is_simulation,
+                    is_orderless_txn,
+                );
+                transaction_fee::emit_fee_statement(fee_statement);
+            },
         }
     }
 }

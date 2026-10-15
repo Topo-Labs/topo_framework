@@ -44,7 +44,7 @@ module topo_framework::dkg {
 
     /// Called in genesis to initialize on-chain states.
     public fun initialize(topo_framework: &signer) {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
         if (!exists<DKGState>(@topo_framework)) {
             move_to<DKGState>(
                 topo_framework,
@@ -57,13 +57,17 @@ module topo_framework::dkg {
     }
 
     /// Mark on-chain DKG state as in-progress. Notify validators to start DKG.
-    /// Abort if a DKG is already in progress.
+    /// Idempotent for `dealer_epoch`: if a session for this epoch has already
+    /// been started (in_progress or last_completed), returns without
+    /// overwriting state or re-emitting an event. This enforces the
+    /// invariant "at most one DKGStartEvent per epoch."
     public(friend) fun start(
         dealer_epoch: u64,
         randomness_config: RandomnessConfig,
         dealer_validator_set: vector<ValidatorConsensusInfo>,
         target_validator_set: vector<ValidatorConsensusInfo>,
     ) acquires DKGState {
+        if (is_session_started(dealer_epoch)) { return };
         let dkg_state = borrow_global_mut<DKGState>(@topo_framework);
         let new_session_metadata = DKGSessionMetadata {
             dealer_epoch,
@@ -98,7 +102,7 @@ module topo_framework::dkg {
 
     /// Delete the currently incomplete session, if it exists.
     public fun try_clear_incomplete_session(fx: &signer) acquires DKGState {
-        system_addresses::assert_aptos_framework(fx);
+        system_addresses::assert_topo_framework(fx);
         if (exists<DKGState>(@topo_framework)) {
             let dkg_state = borrow_global_mut<DKGState>(@topo_framework);
             dkg_state.in_progress = option::none();
@@ -114,8 +118,37 @@ module topo_framework::dkg {
         }
     }
 
+    /// Return the last completed DKG session state, if any.
+    public fun last_completed_session(): Option<DKGSessionState> acquires DKGState {
+        if (exists<DKGState>(@topo_framework)) {
+            borrow_global<DKGState>(@topo_framework).last_completed
+        } else {
+            option::none()
+        }
+    }
+
+    /// 只读返回会话目标，接收 DKG 结果前用它核对冻结计划的地址、顺序、密钥和权重。
+    public fun session_target_validators(session: &DKGSessionState): vector<ValidatorConsensusInfo> {
+        session.metadata.target_validator_set
+    }
+
     /// Return the dealer epoch of a `DKGSessionState`.
     public fun session_dealer_epoch(session: &DKGSessionState): u64 {
         session.metadata.dealer_epoch
+    }
+
+    /// True iff a DKG session has ever been started for `epoch` (in_progress
+    /// for `epoch` OR last_completed for `epoch`). Used by `dkg::start` to
+    /// enforce "at most one DKGStartEvent per epoch".
+    public fun is_session_started(epoch: u64): bool acquires DKGState {
+        let in_prog = incomplete_session();
+        if (in_prog.is_some() && session_dealer_epoch(in_prog.borrow()) == epoch) {
+            return true
+        };
+        let last = last_completed_session();
+        if (last.is_some() && session_dealer_epoch(last.borrow()) == epoch) {
+            return true
+        };
+        false
     }
 }

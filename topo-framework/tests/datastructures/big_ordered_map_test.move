@@ -426,7 +426,7 @@ module topo_framework::big_ordered_map_test {
     }
 
     #[test]
-    #[expected_failure(abort_code = 0x10002, location = topo_framework::ordered_map)] /// EKEY_NOT_FOUND
+    #[expected_failure(abort_code = 0x10002, location = topo_std::ordered_map)] /// EKEY_NOT_FOUND
     fun test_abort_remove_missing_value() {
         let map = new_from(vector[1], vector[1]);
         map.remove(&2);
@@ -434,7 +434,7 @@ module topo_framework::big_ordered_map_test {
     }
 
     #[test]
-    #[expected_failure(abort_code = 0x10002, location = topo_framework::big_ordered_map)] /// EKEY_NOT_FOUND
+    #[expected_failure(abort_code = 0x10002, location = topo_std::big_ordered_map)] /// EKEY_NOT_FOUND
     fun test_abort_remove_missing_value_to_non_leaf() {
         let map = new_with_config(4, 4, false);
         map.add_all(vector_range(1, 10), vector_range(1, 10));

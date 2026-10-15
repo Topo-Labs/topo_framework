@@ -44,7 +44,7 @@ module topo_framework::chunky_dkg {
 
     /// Called in genesis to initialize on-chain states.
     public fun initialize(topo_framework: &signer) {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
         if (!exists<ChunkyDKGState>(@topo_framework)) {
             move_to<ChunkyDKGState>(
                 topo_framework,
@@ -57,12 +57,17 @@ module topo_framework::chunky_dkg {
     }
 
     /// Mark on-chain Chunky DKG state as in-progress. Notify validators to start Chunky DKG.
+    /// Idempotent for `dealer_epoch`: if a session for this epoch has already
+    /// been started (in_progress or last_completed), returns without
+    /// overwriting state or re-emitting an event. This enforces the
+    /// invariant "at most one ChunkyDKGStartEvent per epoch."
     public(friend) fun start(
         dealer_epoch: u64,
         chunky_dkg_config: ChunkyDKGConfig,
         dealer_validator_set: vector<ValidatorConsensusInfo>,
         target_validator_set: vector<ValidatorConsensusInfo>
     ) acquires ChunkyDKGState {
+        if (is_session_started(dealer_epoch)) { return };
         let chunky_dkg_state = borrow_global_mut<ChunkyDKGState>(@topo_framework);
         let new_session_metadata = ChunkyDKGSessionMetadata {
             dealer_epoch,
@@ -101,7 +106,7 @@ module topo_framework::chunky_dkg {
 
     /// Delete the currently incomplete session, if it exists.
     public fun try_clear_incomplete_session(fx: &signer) acquires ChunkyDKGState {
-        system_addresses::assert_aptos_framework(fx);
+        system_addresses::assert_topo_framework(fx);
         if (exists<ChunkyDKGState>(@topo_framework)) {
             let chunky_dkg_state = borrow_global_mut<ChunkyDKGState>(@topo_framework);
             chunky_dkg_state.in_progress = option::none();
@@ -117,8 +122,43 @@ module topo_framework::chunky_dkg {
         }
     }
 
+    /// Return the last completed Chunky DKG session state, if any.
+    public fun last_completed_session(): Option<ChunkyDKGSessionState> acquires ChunkyDKGState {
+        if (exists<ChunkyDKGState>(@topo_framework)) {
+            borrow_global<ChunkyDKGState>(@topo_framework).last_completed
+        } else {
+            option::none()
+        }
+    }
+
+    /// 只读返回会话目标，确保 Chunky DKG 结果与冻结计划及普通 DKG 使用同一委员会。
+    public fun session_target_validators(session: &ChunkyDKGSessionState): vector<ValidatorConsensusInfo> {
+        session.metadata.target_validator_set
+    }
+
     /// Return the dealer epoch of a `ChunkyDKGSessionState`.
     public fun session_dealer_epoch(session: &ChunkyDKGSessionState): u64 {
         session.metadata.dealer_epoch
+    }
+
+    /// Return the start time in microseconds of a `ChunkyDKGSessionState`.
+    public fun session_start_time(session: &ChunkyDKGSessionState): u64 {
+        session.start_time_us
+    }
+
+    /// True iff a Chunky DKG session has ever been started for `epoch`
+    /// (in_progress for `epoch` OR last_completed for `epoch`). Used by
+    /// `chunky_dkg::start` to enforce "at most one ChunkyDKGStartEvent per
+    /// epoch".
+    public fun is_session_started(epoch: u64): bool acquires ChunkyDKGState {
+        let in_prog = incomplete_session();
+        if (in_prog.is_some() && session_dealer_epoch(in_prog.borrow()) == epoch) {
+            return true
+        };
+        let last = last_completed_session();
+        if (last.is_some() && session_dealer_epoch(last.borrow()) == epoch) {
+            return true
+        };
+        false
     }
 }

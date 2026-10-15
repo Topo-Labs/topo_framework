@@ -67,7 +67,7 @@ spec topo_framework::transaction_fee {
         invariant burn_percentage <= 100;
     }
 
-    spec initialize_fee_collection_and_distribution(_aptos_framework: &signer, _burn_percentage: u8) {
+    spec initialize_fee_collection_and_distribution(_topo_framework: &signer, _burn_percentage: u8) {
     }
 
     /// `TopoCoinCapabilities` should be exists.
@@ -149,7 +149,7 @@ spec topo_framework::transaction_fee {
         pragma verify = false;
 
         let addr = signer::address_of(topo_framework);
-        aborts_if !system_addresses::is_aptos_framework_address(addr);
+        aborts_if !system_addresses::is_topo_framework_address(addr);
 
         aborts_if exists<AptosFABurnCapabilities>(addr);
         aborts_if exists<TopoCoinCapabilities>(addr);
@@ -158,13 +158,33 @@ spec topo_framework::transaction_fee {
     }
 
     /// Ensure caller is admin.
-    /// Aborts if `TopoCoinMintCapability` already exists.
+    /// Aborts if `AptosFAMintCapabilities` or `TopoCoinMintCapability` already exists.
     spec store_topo_coin_mint_cap(topo_framework: &signer, mint_cap: MintCapability<TopoCoin>) {
         use std::signer;
+
+        // TODO(fa_migration)
+        pragma verify = false;
+
         let addr = signer::address_of(topo_framework);
-        aborts_if !system_addresses::is_aptos_framework_address(addr);
+        aborts_if !system_addresses::is_topo_framework_address(addr);
+        aborts_if exists<AptosFAMintCapabilities>(addr);
         aborts_if exists<TopoCoinMintCapability>(addr);
+        ensures exists<AptosFAMintCapabilities>(addr);
         ensures exists<TopoCoinMintCapability>(addr);
+    }
+
+    /// Ensure caller is admin.
+    spec convert_to_aptos_fa_mint_ref(topo_framework: &signer) {
+        use std::signer;
+
+        // TODO(fa_migration)
+        pragma verify = false;
+
+        let addr = signer::address_of(topo_framework);
+        aborts_if !system_addresses::is_topo_framework_address(addr);
+        aborts_if !exists<TopoCoinMintCapability>(addr);
+        aborts_if exists<AptosFAMintCapabilities>(addr);
+        ensures exists<AptosFAMintCapabilities>(addr);
     }
 
     /// Historical. Aborts.

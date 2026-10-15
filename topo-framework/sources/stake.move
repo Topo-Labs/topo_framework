@@ -1,50 +1,22 @@
 ///
 /// Validator lifecycle:
-/// 1. Prepare validator metadata by calling `stake::initialize_validator`.
-/// 2. Manage principal and delegation through `staking_registry`.
-/// 3. Call `stake::join_validator_set` to enter the validator set. Changes are effective in the next epoch.
-/// 4. Rewards and transaction fees are accounted in `staking_registry`; `stake.move` only maintains validator-set state.
-/// 5. Operators may still rotate consensus keys and network/fullnode addresses through this module.
-/// 6. Owners may switch operators through `stake::set_operator`.
-///
-/// ## Architecture Overview
-///
-/// `stake.move` is the validator-set manager for the Topo chain. It owns the canonical `ValidatorSet`
-/// resource and orchestrates the epoch transition (`on_new_epoch`). Economic accounting (deposits,
-/// rewards, fees, power) has been fully delegated to `staking_registry` and `poc_power_store`.
-///
-/// ## Separation of Concerns
-///
-/// | Concern                        | Module              |
-/// |--------------------------------|---------------------|
-/// | Validator set membership       | stake.move          |
-/// | Consensus key / network addr   | stake.move          |
-/// | Operator / owner management    | stake.move          |
-/// | Deposit escrow & delegation    | staking_registry    |
-/// | Reward & fee distribution      | staking_registry    |
-/// | POC power versioning & decay   | poc_power_store     |
-/// | Contribution event gating      | poc_contribution    |
-/// | App identity & whitelist       | poc_registry        |
-///
-/// ## Epoch Transition (`on_new_epoch`) Flow
-///
-/// 1. For each active + pending_inactive validator:
-///    a. Merge pending_active coins into active (update_stake_pool)
-///    b. Distribute transaction fees (staking_registry::distribute_transaction_fees)
-///    c. Distribute epoch rewards (staking_registry::distribute_epoch_rewards)
-/// 2. Advance the POC power period if at a boundary (poc_power_store::commit_next_period_if_boundary)
-/// 3. Force-undelegate users below the maintain threshold across all pools
-/// 4. Activate pending_active validators; deactivate pending_inactive validators
-/// 5. Recompute voting power for all active validators; drop those below minimum_stake
-/// 6. Emergency liveness fallback: if the new active set would be empty, retain the previous
-///    positive-voting-power active snapshot
-/// 7. Reset performance counters; renew lockups; rebuild the PendingTransactionFee aggregator map
-///
-/// ## Voting Power Model
-///
-/// A validator's voting_power in ValidatorSet = staking_registry::get_validator_total_power(pool_address)
-/// = sum of effective_power for all delegators in the pool
-/// = sum of min(poc_power_i, deposit_i * 1,000,000 / octas_per_million_power) for each delegator i
+/// 1. Prepare a validator node set up and call stake::initialize_validator
+/// 2. Once ready to deposit stake (or have funds assigned by a staking service in exchange for ownership capability),
+/// call stake::add_stake (or *_with_cap versions if called from the staking service)
+/// 3. Call stake::join_validator_set (or _with_cap version) to join the active validator set. Changes are effective in
+/// the next epoch.
+/// 4. Validate and gain rewards. The stake will automatically be locked up for a fixed duration (set by governance) and
+/// automatically renewed at expiration.
+/// 5. At any point, if the validator operator wants to update the consensus key or network/fullnode addresses, they can
+/// call stake::rotate_consensus_key and stake::update_network_and_fullnode_addresses. Similar to changes to stake, the
+/// changes to consensus key/network/fullnode addresses are only effective in the next epoch.
+/// 6. Validator can request to unlock their stake at any time. However, their stake will only become withdrawable when
+/// their current lockup expires. This can be at most as long as the fixed lockup duration.
+/// 7. After exiting, the validator can either explicitly leave the validator set by calling stake::leave_validator_set
+/// or if their stake drops below the min required, they would get removed at the end of the epoch.
+/// 8. Validator can always rejoin the validator set by going through steps 2-3 again.
+/// 9. An owner can always switch operators by calling stake::set_operator.
+/// 10. An owner can always switch designated voter by calling stake::set_designated_voter.
 module topo_framework::stake {
     use std::error;
     use std::features;
@@ -52,27 +24,871 @@ module topo_framework::stake {
     use std::signer;
     use std::vector;
     use topo_std::bls12381;
-    use topo_framework::big_ordered_map::{Self, BigOrderedMap};
-    use topo_std::simple_map::{Self, SimpleMap};
+    use topo_std::math64::min;
+    use topo_std::big_ordered_map::{Self, BigOrderedMap};
+    use topo_std::table::{Self, Table};
+    use topo_framework::poc_accounting::{Self, PowerParams};
+    use topo_framework::poc_power_store;
+    use topo_framework::poc_reward_split;
     use topo_framework::aggregator_v2::{Self, Aggregator};
     use topo_framework::topo_coin::TopoCoin;
     use topo_framework::account;
     use topo_framework::coin::{Self, Coin, MintCapability};
-    use topo_framework::event;
-    use topo_framework::poc_power_store;
+    use topo_framework::event::{Self, EventHandle};
     use topo_framework::timestamp;
     use topo_framework::system_addresses;
-    use topo_framework::staking_registry;
     use topo_framework::staking_config::{Self, StakingConfig, StakingRewardsConfig};
-    use topo_framework::validator_consensus_info::ValidatorConsensusInfo;
     use topo_framework::chain_status;
-    use topo_framework::permissioned_signer;
+    use topo_framework::create_signer;
 
     friend topo_framework::block;
     friend topo_framework::genesis;
     friend topo_framework::reconfiguration;
     friend topo_framework::reconfiguration_with_dkg;
     friend topo_framework::transaction_fee;
+    friend topo_framework::poc_allocation;
+
+    // 用旁路资源保存 PoC 状态，不改变已发布的质押资源和 PVS 布局。
+    /// 保存当前 Epoch 的奖励配置；治理修改在下次安装上下文时生效。
+    struct RewardContext has copy, drop, store {
+        epoch: u64,
+        poc_enabled: bool,
+        rewards_rate: u64,
+        rewards_rate_denominator: u64,
+        distribute_transaction_fee: bool,
+        fee_limit_per_pool: u64,
+    }
+
+    struct InstalledRewardContext has key { context: RewardContext }
+    /// 记录当前 Epoch 的自主退出申请；治理移除的成员不能自行恢复。
+    struct VoluntaryLeaves has key { requests: Table<address, u64> }
+
+    /// units 为标准化算力单位，power 为 BFT 整数权重，reward_base_octa 为 Octa 金额。
+    struct PoolTarget has copy, drop, store {
+        pool: address,
+        units: u128,
+        power: u64,
+        reward_base_octa: u64,
+    }
+
+    /// 只读预检结果，可以安全丢弃；reason == 0 表示 Ready，其余值表示延期原因。
+    struct EpochPreview has copy, drop, store {
+        reason: u64,
+        epoch: u64,
+        period: u64,
+        period_index: u128,
+        cutoff_secs: u64,
+        poc_enabled: bool,
+        params: PowerParams,
+        closing_rewards: RewardContext,
+        targets: vector<PoolTarget>,
+        validator_set: ValidatorSet,
+        is_liveness_fallback: bool,
+    }
+
+    /// 委员会和回退标记只存于 PVS；这里保存提交期间必须保持不变的其余数据。
+    struct EpochPlanData has copy, drop, store {
+        epoch: u64,
+        period: u64,
+        period_index: u128,
+        cutoff_secs: u64,
+        poc_enabled: bool,
+        params: PowerParams,
+        closing_rewards: RewardContext,
+        targets: vector<PoolTarget>,
+    }
+
+    struct EpochPlan has key {
+        data: EpochPlanData,
+        feature_token: features::FeatureFreezeToken,
+        // 0：已缓存；1：旧 Epoch 奖励已结算；2：目标已安装。仅换届提交函数推进阶段。
+        stage: u8,
+    }
+
+    #[event]
+    struct PoCRewardCredited has drop, store {
+        pool: address,
+        closing_epoch: u64,
+        reward_base_octa: u64,
+        inflation: u64,
+        fee: u64,
+        delta_index: u256,
+    }
+
+    #[event]
+    /// 记录通胀总额，以及分给原生质押路径和 PoC 奖励金库的通胀金额。
+    /// PoCRewardCredited 记录 PoC 奖励金库的实际入账。
+    struct PoCRewardSplit has drop, store {
+        pool: address,
+        closing_epoch: u64,
+        native_reward_bps: u64,
+        total_inflation_octa: u64,
+        active_native_reward_octa: u64,
+        pending_inactive_native_reward_octa: u64,
+        poc_inflation_octa: u64,
+    }
+
+    #[event]
+    struct PoCEpochInstalled has drop, store {
+        epoch: u64, period: u64, selected_count: u64, total_power: u64,
+    }
+
+    #[event]
+    struct VoluntaryLeaveCancelled has drop, store { pool: address, request_epoch: u64 }
+
+    const EPLAN_MISMATCH: u64 = 32;
+    const EPOC_NOT_PREPARED: u64 = 33;
+    const EINVALID_POC_TARGET: u64 = 34;
+    const ENO_VOLUNTARY_LEAVE: u64 = 35;
+    const ECOUNTER_OVERFLOW: u64 = 36;
+    const INSUFFICIENT_VALIDATORS: u64 = 1;
+    const ZERO_TARGET_POWER: u64 = 2;
+    const TARGET_OUT_OF_RANGE: u64 = 4;
+    const ZERO_CURRENT_POWER: u64 = 5;
+
+    #[view]
+    /// 准备完成不等于已启用；当前 Epoch 仍可能使用原生权重和奖励。
+    public fun is_poc_prepared(): bool { poc_accounting::is_prepared() }
+
+    #[view]
+    /// 从已安装的上下文读取当前模式，不用计划启用时间推断。
+    public fun is_poc_enabled(): bool acquires InstalledRewardContext {
+        if (!is_poc_prepared()) { return false };
+        get_installed_reward_context().poc_enabled
+    }
+
+    /// 准备后缺少奖励上下文即为状态错误，不能用当前治理配置代替旧 Epoch 的配置。
+    public fun get_installed_reward_context(): RewardContext acquires InstalledRewardContext {
+        assert!(exists<InstalledRewardContext>(@topo_framework), error::invalid_state(EPOC_NOT_PREPARED));
+        borrow_global<InstalledRewardContext>(@topo_framework).context
+    }
+
+    /// 返回绝对 Epoch、模式、奖励率分子和分母、费用分发开关及每池限额（代币最小单位）。
+    public fun get_reward_context_fields(context: &RewardContext): (u64, bool, u64, u64, bool, u64) {
+        (context.epoch, context.poc_enabled, context.rewards_rate, context.rewards_rate_denominator,
+            context.distribute_transaction_fee, context.fee_limit_per_pool)
+    }
+
+    #[view]
+    /// 委托入池费使用当前 Epoch 的奖励率快照；准备前直接读取原生配置。
+    public fun get_installed_reward_rate(): (bool, u64, u64) acquires InstalledRewardContext {
+        if (is_poc_prepared()) {
+            let c = get_installed_reward_context();
+            (c.poc_enabled, c.rewards_rate, c.rewards_rate_denominator)
+        } else {
+            let (n, d) = staking_config::get_reward_rate(&staking_config::get());
+            (false, n, d)
+        }
+    }
+
+    /// 治理可设置下一 Epoch 或更晚生效的原生奖励占比；覆盖待生效配置不影响当期占比。
+    public entry fun schedule_reward_split(framework: &signer, native_reward_bps: u64, activation_epoch: u64) {
+        poc_reward_split::schedule_change(framework, native_reward_bps, activation_epoch);
+    }
+
+    public entry fun cancel_pending_reward_split(framework: &signer) {
+        poc_reward_split::cancel_pending_change(framework);
+    }
+
+    #[view]
+    /// 返回当期 PoC 原生奖励占比；原生模式返回 0 表示未启用 PoC 分成，奖励仍全部按原生质押路径分发。
+    public fun get_installed_native_reward_bps(): u64 {
+        if (!is_poc_prepared()) { return 0 };
+        poc_reward_split::get_installed_native_reward_bps(poc_accounting::current_epoch())
+    }
+
+    #[view]
+    /// 依次返回当期 Epoch、当期原生奖励占比、配置占比、待生效占比及其生效 Epoch；后两项为可选值。
+    /// 尚未准备 PoC 时返回空配置；准备后必须存在完整的分流配置。
+    public fun get_reward_split_configuration(): (u64, u64, u64, Option<u64>, Option<u64>) {
+        if (!is_poc_prepared()) { return (0, 0, 0, option::none(), option::none()) };
+        poc_reward_split::get_configuration(poc_accounting::current_epoch())
+    }
+
+    #[view]
+    /// PoC 模式下的当期原生总收益上限：最优出块通胀与已安装费用限额分别分流后相加。
+    /// 用于委托入池费的保守估算；关闭费用分发时不计交易费，估算金额封顶 u64。
+    public fun get_native_reward_upper_bound(pool_address: address): u64 acquires InstalledRewardContext, ValidatorSet {
+        if (!is_poc_enabled() || !poc_accounting::pool_enabled(pool_address)
+            || !is_current_epoch_validator(pool_address)) { return 0 };
+        let reward_context = get_installed_reward_context();
+        calculate_native_reward_upper_bound(pool_address, &reward_context)
+    }
+
+    fun calculate_native_reward_upper_bound(pool_address: address, reward_context: &RewardContext): u64 {
+        let inflation_upper_bound_octa = reward_amount_wide(poc_accounting::pool_reward_base_octa(pool_address), 1, 1,
+            reward_context.rewards_rate, reward_context.rewards_rate_denominator);
+        let native_reward_bps = poc_reward_split::get_installed_native_reward_bps(reward_context.epoch);
+        let (native_inflation_upper_bound_octa, _) =
+            poc_reward_split::split_reward(inflation_upper_bound_octa, native_reward_bps);
+        let (native_fee_upper_bound_octa, _) = poc_reward_split::split_reward(
+            if (reward_context.distribute_transaction_fee) { reward_context.fee_limit_per_pool } else { 0 },
+            native_reward_bps);
+        // 费用限额是政策上限，并非实际待分发余额。实际 Octa 总量长期低于 u64 上限，
+        // 因此封顶后的估算仍覆盖实际奖励，且不让巨大费用配置导致查询或入池费计算溢出。
+        let upper_bound = (native_inflation_upper_bound_octa as u128) + (native_fee_upper_bound_octa as u128);
+        if (upper_bound > MAX_U64) { MAX_U64 as u64 } else { upper_bound as u64 }
+    }
+
+    #[view]
+    /// 这里只检查质押池注册状态；PoC 启用状态另行检查，查询不会创建账本。
+    public fun validator_registered(pool: address): bool {
+        exists<StakePool>(pool) && exists<ValidatorConfig>(pool)
+    }
+
+    /// 返回每池每 Epoch 可分发的交易费用上限，以代币最小单位计量。
+    /// 未配置时使用原生上限；PoC 准备和预检仍须校验部署上限。
+    public fun transaction_fee_limit(): u64 acquires TransactionFeeConfig {
+        if (exists<TransactionFeeConfig>(@topo_framework)) {
+            let TransactionFeeConfig::V0 { max_fee_octa_allowed_per_epoch_per_pool } =
+                borrow_global<TransactionFeeConfig>(@topo_framework);
+            *max_fee_octa_allowed_per_epoch_per_pool
+        } else { MAX_U64 as u64 }
+    }
+
+    /// 治理降低上限时，须容纳当前/候选委员会以及仍用于结算的当期费用快照。
+    public(friend) fun validate_poc_deployment_limits() acquires ValidatorSet, TransactionFeeConfig, InstalledRewardContext {
+        let set = borrow_global<ValidatorSet>(@topo_framework);
+        let limit = poc_accounting::validator_limit();
+        assert!(set.active_validators.length() + set.pending_active.length() <= limit
+            && set.active_validators.length() + set.pending_inactive.length() <= limit,
+            error::invalid_argument(EVALIDATOR_SET_TOO_LARGE));
+        poc_accounting::validate_fee_limit(transaction_fee_limit());
+        poc_accounting::validate_fee_limit(get_installed_reward_context().fee_limit_per_pool);
+    }
+
+    /// 在准备或安装 Epoch 时保存奖励配置；结算旧 Epoch 时不能重新读取当前配置。
+    fun reward_context(epoch: u64, poc_enabled: bool): RewardContext acquires TransactionFeeConfig {
+        let (rewards_rate, rewards_rate_denominator) = staking_config::get_reward_rate(&staking_config::get());
+        assert!(rewards_rate_denominator > 0, error::invalid_state(EPLAN_MISMATCH));
+        let fee_limit_per_pool = transaction_fee_limit();
+        if (poc_enabled) {
+            poc_accounting::validate_fee_limit(fee_limit_per_pool);
+        };
+        RewardContext {
+            epoch, poc_enabled, rewards_rate, rewards_rate_denominator,
+            distribute_transaction_fee: features::is_distribute_transaction_fee_enabled(),
+            fee_limit_per_pool,
+        }
+    }
+
+    /// 确认没有遗留计划后，保存当前原生 Epoch 的奖励配置，并初始化自主退出申请表。
+    public(friend) fun prepare_poc_context(framework: &signer, epoch: u64) acquires PendingTransactionFee, TransactionFeeConfig, ValidatorSet {
+        system_addresses::assert_topo_framework(framework);
+        assert_reconfig_not_in_progress();
+        assert!(!exists<PrecomputedValidatorSet>(@topo_framework)
+            && !exists<EpochPlan>(@topo_framework)
+            && !exists<InstalledRewardContext>(@topo_framework), error::invalid_state(EPLAN_MISMATCH));
+        assert!(epoch == poc_accounting::current_epoch(), error::invalid_state(EPLAN_MISMATCH));
+        assert!(!features::is_reconfiguration_frozen(), error::invalid_state(EPLAN_MISMATCH));
+        staking_config::validate_poc_configuration();
+        let context = reward_context(epoch, false);
+        poc_accounting::validate_fee_limit(context.fee_limit_per_pool);
+        // 将费用累加器替换为有上限的版本，保留已经累计且允许分发的费用。
+        if (exists<PendingTransactionFee>(@topo_framework)) {
+            let set = borrow_global<ValidatorSet>(@topo_framework);
+            let count = set.active_validators.length() + set.pending_inactive.length();
+            let fees = &mut borrow_global_mut<PendingTransactionFee>(@topo_framework).pending_fee_by_validator;
+            for (i in 0..count) {
+                if (fees.contains(&i)) {
+                    let amount = min(fees.remove(&i).read(), context.fee_limit_per_pool);
+                    fees.add(i, aggregator_v2::create_aggregator_with_value(amount, context.fee_limit_per_pool));
+                }
+            }
+        };
+        move_to(framework, InstalledRewardContext { context });
+        move_to(framework, VoluntaryLeaves { requests: table::new() });
+        poc_reward_split::initialize(framework, epoch);
+    }
+
+    /// 只对地址副本做堆排序以查重，不改变委员会顺序。
+    fun assert_unique_validators(infos: &vector<ValidatorInfo>) {
+        let addresses = addresses_from_validator_infos(infos);
+        let n = addresses.length();
+        if (n < 2) { return };
+        let start = n / 2;
+        while (start > 0) {
+            start -= 1;
+            sift_addresses(&mut addresses, start, n);
+        };
+        let end = n;
+        while (end > 1) {
+            end -= 1;
+            addresses.swap(0, end);
+            sift_addresses(&mut addresses, 0, end);
+        };
+        for (i in 1..n) {
+            assert!(addresses[i - 1] != addresses[i], error::invalid_state(EPLAN_MISMATCH));
+        }
+    }
+
+    /// 在地址副本的 [0, end) 内恢复堆序，不修改验证者配置或当前 Epoch 的索引。
+    fun sift_addresses(addresses: &mut vector<address>, root: u64, end: u64) {
+        while (root < end / 2) {
+            let child = root * 2 + 1;
+            if (child + 1 < end && addresses[child] < addresses[child + 1]) { child += 1 };
+            if (addresses[root] >= addresses[child]) { return };
+            addresses.swap(root, child);
+            root = child;
+        }
+    }
+
+    /// 待退出成员仍参与当前 Epoch 投票；旧索引或总权重不一致时按状态错误处理。
+    fun validate_current_set(set: &ValidatorSet) acquires ValidatorPerformance {
+        let voters = set.active_validators;
+        voters.append(set.pending_inactive);
+        let all = voters;
+        all.append(set.pending_active);
+        assert_unique_validators(&all);
+        let count = voters.length();
+        assert!(count == borrow_global<ValidatorPerformance>(@topo_framework).validators.length(),
+            error::invalid_state(EPLAN_MISMATCH));
+        let seen = vector[];
+        for (_i in 0..count) { seen.push_back(false) };
+        let total = 0u256;
+        let i = 0;
+        while ({
+            spec {
+                invariant i <= count;
+                invariant forall j in 0..i: voters[j].config.validator_index < count;
+                invariant forall j in 0..len(set.active_validators):
+                    j < i ==> set.active_validators[j].config.validator_index < count;
+            };
+            i < count
+        }) {
+            let v = &voters[i];
+            assert!(v.config.validator_index < count, error::invalid_state(EPLAN_MISMATCH));
+            let used = seen.borrow_mut(v.config.validator_index);
+            assert!(!*used, error::invalid_state(EPLAN_MISMATCH));
+            *used = true;
+            total += (v.voting_power as u256);
+            i += 1;
+        };
+        assert!(total == (set.total_voting_power as u256), error::invalid_state(EPLAN_MISMATCH));
+    }
+
+    /// DKG 启动前按实际入选权重校验总和，不使用人数乘以配置上限估算。
+    fun validate_target_powers(powers: &vector<u64>, minimum: u64, limit: u64): (u64, u256) {
+        let total = 0u256;
+        powers.for_each_ref(|p| total += (*p as u256));
+        if (powers.length() < minimum) { return (INSUFFICIENT_VALIDATORS, total) };
+        if (powers.length() > limit || powers.length() > MAX_VALIDATOR_SET_SIZE
+            || total > (MAX_U64 as u256)) { return (TARGET_OUT_OF_RANGE, total) };
+        if (total == 0) { return (ZERO_TARGET_POWER, total) };
+        (0, total)
+    }
+
+    /// 按各池增量占比分配增长预算并向下取整，不再分配未用额度或舍入余量。
+    /// 首次安装 PoC 时不与原生代币权重比较；后续增长比例按百分数计算，分母为 100。
+    fun allocate_growth(candidates: &vector<u64>, bases: &vector<u64>, current_total: u128,
+        increase_limit: u64, first: bool): vector<u64> {
+        assert!(candidates.length() == bases.length(), error::invalid_state(EPLAN_MISMATCH));
+        if (first) { return *candidates };
+        let growth = 0u256;
+        for (i in 0..candidates.length()) {
+            if (candidates[i] > bases[i]) { growth += ((candidates[i] - bases[i]) as u256) }
+        };
+        let budget = (current_total as u256) * (increase_limit as u256) / 100;
+        if (growth <= budget) { return *candidates };
+        let result = vector[];
+        let i = 0;
+        while ({
+            spec {
+                invariant i <= len(candidates);
+                invariant len(result) == i;
+                invariant forall j in 0..i: result[j] <= candidates[j];
+            };
+            i < candidates.length()
+        }) {
+            let delta = if (candidates[i] > bases[i]) { candidates[i] - bases[i] } else { 0 };
+            result.push_back(((min(candidates[i], bases[i]) as u256)
+                + (delta as u256) * budget / growth) as u64);
+            i += 1;
+        };
+        result
+    }
+
+    #[view]
+    /// 冻结前只读生成目标；冻结后只返回原计划，不再按实时状态重选。
+    public fun preview_epoch_transition(target_epoch: u64, cutoff_secs: u64): EpochPreview acquires EpochPlan, InstalledRewardContext, PrecomputedValidatorSet, StakePool, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        if (exists<EpochPlan>(@topo_framework)) {
+            validate_epoch_plan(poc_accounting::current_epoch() + 1);
+            return cached_epoch_preview()
+        };
+        assert!(!exists<PrecomputedValidatorSet>(@topo_framework)
+            && !reconfiguration_state::is_in_progress() && !features::is_reconfiguration_frozen(),
+            error::invalid_state(EPLAN_MISMATCH));
+        preview_transition(target_epoch, cutoff_secs, option::none())
+    }
+
+    /// 保持公开预览布局不变；冻结后的查询从计划数据和唯一的 PVS 组装结果。
+    fun cached_epoch_preview(): EpochPreview acquires EpochPlan, PrecomputedValidatorSet {
+        let data = &borrow_global<EpochPlan>(@topo_framework).data;
+        let pvs = borrow_global<PrecomputedValidatorSet>(@topo_framework);
+        EpochPreview {
+            reason: 0,
+            epoch: data.epoch, period: data.period, period_index: data.period_index,
+            cutoff_secs: data.cutoff_secs, poc_enabled: data.poc_enabled, params: data.params,
+            closing_rewards: data.closing_rewards, targets: data.targets,
+            validator_set: pvs.validator_set, is_liveness_fallback: pvs.is_liveness_fallback,
+        }
+    }
+
+    /// 换届和自主退出共用此只读构建器；excluded 仅从本地候选列表中排除指定池。
+    /// 资格不足返回延期原因，缓存损坏或账本不一致则中止事务。
+    fun preview_transition(target_epoch: u64, cutoff_secs: u64, excluded: Option<address>): EpochPreview acquires InstalledRewardContext, StakePool, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        let closing_rewards = get_installed_reward_context();
+        poc_reward_split::get_installed_native_reward_bps(closing_rewards.epoch);
+        // 校验原生锁仓时长；奖励率沿用原生配置的校验与旧期快照。
+        staking_config::validate_poc_configuration();
+        poc_accounting::validate_fee_limit(transaction_fee_limit());
+        let epoch = poc_accounting::current_epoch();
+        assert!((target_epoch as u256) == (epoch as u256) + 1
+            && closing_rewards.epoch == epoch, error::invalid_state(EPLAN_MISMATCH));
+        let cur = *borrow_global<ValidatorSet>(@topo_framework);
+        validate_current_set(&cur);
+        let (clock_valid, period, period_index) = poc_power_store::preview_next_period();
+        let params = poc_accounting::get_target_params(target_epoch);
+        let poc_enabled = poc_accounting::target_poc_enabled(target_epoch);
+        let preview = EpochPreview {
+            reason: 0, epoch: target_epoch, period, period_index, cutoff_secs, poc_enabled, params,
+            closing_rewards, targets: vector[],
+            validator_set: ValidatorSet { consensus_scheme: cur.consensus_scheme, active_validators: vector[],
+                pending_active: vector[], pending_inactive: vector[], total_voting_power: 0, total_joining_power: 0 },
+            is_liveness_fallback: false,
+        };
+        if (!clock_valid) {
+            preview.reason = TARGET_OUT_OF_RANGE;
+            return preview
+        };
+        let config = staking_config::get();
+        let duration = staking_config::get_recurring_lockup_duration(&config);
+        if ((cutoff_secs as u256) + (duration as u256) > (MAX_U64 as u256)) {
+            preview.reason = TARGET_OUT_OF_RANGE;
+            return preview
+        };
+        let candidates = cur.active_validators;
+        let excluded_info = option::none();
+        if (excluded.is_some()) {
+            let index = find_validator(&candidates, *excluded.borrow());
+            assert!(index.is_some(), error::invalid_state(EPLAN_MISMATCH));
+            // 使用与实际退出相同的 swap_remove，确保预检时的候选顺序一致。
+            excluded_info = option::some(candidates.swap_remove(index.extract()));
+        };
+        let num_current_candidates = candidates.length();
+        let pending = cur.pending_active;
+        // append 用 pop_back 反向追加待加入者，顺序须与原生选举一致。
+        append(&mut candidates, &mut pending);
+        let num_candidates = candidates.length();
+        // 只处理当前投票池与下一 Epoch 候选池的并集；退出池的目标计奖基数设为零。
+        candidates.append(cur.pending_inactive);
+        if (excluded_info.is_some()) { candidates.push_back(excluded_info.extract()) };
+        if (!poc_enabled) {
+            // 准备期间继续原生选举，只同步已启用池的 units，不提前产生 PoC 奖励。
+            let (set, fallback) = compute_native_next_validator_set(
+                closing_rewards.rewards_rate, closing_rewards.rewards_rate_denominator, cutoff_secs);
+            preview.validator_set = set;
+            preview.is_liveness_fallback = fallback;
+            let targets = vector[];
+            candidates.for_each_ref(|c| {
+                if (poc_accounting::pool_enabled(c.addr)) {
+                    targets.push_back(PoolTarget { pool: c.addr,
+                        units: poc_accounting::preview_pool_units(c.addr, target_epoch), power: 0, reward_base_octa: 0 });
+                }
+            });
+            preview.targets = targets;
+            return preview
+        };
+        let increase = staking_config::get_voting_power_increase_limit(&config);
+        poc_accounting::validate_config(&params, increase, staking_config::get_allow_validator_set_change(&config));
+        let (bond_octa_per_ohmp, min_power, max_power, min_validators) = poc_accounting::get_power_params_fields(&params);
+        let power_per_ohmp = poc_accounting::power_per_ohmp();
+        let (minimum_stake, _) = staking_config::get_required_stake(&config);
+        if (num_candidates > poc_accounting::validator_limit()
+            || cur.active_validators.length() + cur.pending_inactive.length() > poc_accounting::validator_limit()) {
+            preview.reason = TARGET_OUT_OF_RANGE;
+            return preview
+        };
+        if (closing_rewards.poc_enabled && cur.total_voting_power == 0) {
+            preview.reason = ZERO_CURRENT_POWER;
+            return preview
+        };
+        let eligible = vector[];
+        let target_indices = vector[];
+        let candidate_powers = vector[];
+        let bases = vector[];
+        let visited = 0;
+        while ({
+            spec {
+                invariant visited <= len(candidates);
+                invariant preview.epoch == target_epoch && preview.cutoff_secs == cutoff_secs
+                    && preview.closing_rewards == closing_rewards && preview.poc_enabled == poc_enabled;
+                invariant len(eligible) == len(bases);
+                invariant len(eligible) == len(candidate_powers);
+                invariant len(eligible) == len(target_indices);
+                invariant len(eligible) <= visited;
+                invariant forall j in 0..len(target_indices): target_indices[j] < len(preview.targets);
+            };
+            visited < candidates.length()
+        }) {
+            let i = visited;
+            visited += 1;
+            let c = candidates[i];
+            if (!poc_accounting::pool_enabled(c.addr)) { continue };
+            let units = poc_accounting::preview_pool_units(c.addr, target_epoch);
+            let target_index = preview.targets.length();
+            preview.targets.push_back(PoolTarget { pool: c.addr, units, power: 0, reward_base_octa: 0 });
+            if (i >= num_candidates || !validator_registered(c.addr)) { continue };
+            let pool = borrow_global<StakePool>(c.addr);
+            // 保证金只包含预检时已有的本金；截止时间已到期的 pending_inactive 不计入。
+            // 最后一个原生 Epoch 尚未结算的收益，也不能提前作为首个 PoC Epoch 的保证金。
+            let bond_octa = (coin::value(&pool.active) as u256) + (coin::value(&pool.pending_active) as u256);
+            if (pool.locked_until_secs > cutoff_secs) { bond_octa += (coin::value(&pool.pending_inactive) as u256) };
+            let cfg = *borrow_global<ValidatorConfig>(c.addr);
+            if (bond_octa < (minimum_stake as u256) || cfg.consensus_pubkey.is_empty()) { continue };
+            // 用 u256 计算池算力和保证金上限，确定最终权重后再转换为 u64。
+            let pool_power = poc_accounting::pool_power(units, period_index);
+            let bond_cap_power = bond_octa * (power_per_ohmp as u256) / (bond_octa_per_ohmp as u256);
+            let power = pool_power;
+            if (power > bond_cap_power) { power = bond_cap_power };
+            if (power > (max_power as u256)) { power = (max_power as u256) };
+            if (power < (min_power as u256)) { continue };
+            eligible.push_back(ValidatorInfo { addr: c.addr, voting_power: 0, config: cfg });
+            target_indices.push_back(target_index);
+            candidate_powers.push_back(power as u64);
+            bases.push_back(if (i < num_current_candidates) { c.voting_power } else { 0 });
+        };
+        // 先筛选合格候选，再分配增长预算；当前总权重仍包含待退出成员的投票权重。
+        let powers = allocate_growth(&candidate_powers, &bases, cur.total_voting_power, increase, !closing_rewards.poc_enabled);
+        let selected_powers = vector[];
+        let selected = 0;
+        while ({
+            spec {
+                invariant selected <= len(eligible);
+                invariant preview.epoch == target_epoch && preview.cutoff_secs == cutoff_secs
+                    && preview.closing_rewards == closing_rewards && preview.poc_enabled == poc_enabled;
+            };
+            selected < eligible.length()
+        }) {
+            let i = selected;
+            selected += 1;
+            let power = powers[i];
+            if (power < min_power) { continue };
+            let reward_base_octa = (power as u256) * (bond_octa_per_ohmp as u256) / (power_per_ohmp as u256);
+            if (reward_base_octa > (MAX_U64 as u256)) {
+                preview.reason = TARGET_OUT_OF_RANGE;
+                return preview
+            };
+            let target = preview.targets.borrow_mut(target_indices[i]);
+            target.power = power;
+            target.reward_base_octa = reward_base_octa as u64;
+            let vi = eligible[i];
+            vi.voting_power = power;
+            // 这里只修改本地目标索引，旧 Epoch 的费用结清前不改链上索引。
+            vi.config.validator_index = preview.validator_set.active_validators.length();
+            preview.validator_set.active_validators.push_back(vi);
+            selected_powers.push_back(power);
+        };
+        let (reason, total) = validate_target_powers(&selected_powers, min_validators,
+            poc_accounting::validator_limit());
+        preview.reason = reason;
+        if (total <= (MAX_U64 as u256)) { preview.validator_set.total_voting_power = total as u128 };
+        preview
+    }
+
+    /// 仅 Ready 时同时缓存计划和 PVS，并取得冻结令牌；延期不会冻结或推进 Epoch。
+    /// 重复启动只校验已有计划，不更新截止时间或重新选举。
+    public(friend) fun try_cache_epoch_plan(target_epoch: u64, cutoff_secs: u64): u64 acquires EpochPlan, InstalledRewardContext, StakePool, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        if (exists<EpochPlan>(@topo_framework)) { validate_epoch_plan(target_epoch); return 0 };
+        assert!(!exists<PrecomputedValidatorSet>(@topo_framework)
+            && !reconfiguration_state::is_in_progress(), error::invalid_state(EPLAN_MISMATCH));
+        let preview = preview_transition(target_epoch, cutoff_secs, option::none());
+        if (preview.reason != 0) { return preview.reason };
+        let EpochPreview {
+            reason: _, epoch, period, period_index, cutoff_secs, poc_enabled, params,
+            closing_rewards, targets, validator_set, is_liveness_fallback,
+        } = preview;
+        let framework = create_signer::create_signer(@topo_framework);
+        let feature_token = features::begin_reconfiguration_freeze(&framework);
+        move_to(&framework, PrecomputedValidatorSet { validator_set, is_liveness_fallback });
+        move_to(&framework, EpochPlan {
+            data: EpochPlanData {
+                epoch, period, period_index, cutoff_secs, poc_enabled, params, closing_rewards, targets,
+            },
+            feature_token, stage: 0,
+        });
+        0
+    }
+
+    /// 核对目标 Epoch、旧奖励上下文、PVS 存在性及冻结状态；委员会只有 PVS 一份。
+    public(friend) fun validate_epoch_plan(target_epoch: u64) acquires EpochPlan, InstalledRewardContext {
+        assert!(exists<EpochPlan>(@topo_framework) && exists<PrecomputedValidatorSet>(@topo_framework),
+            error::invalid_state(EPLAN_MISMATCH));
+        let plan = borrow_global<EpochPlan>(@topo_framework);
+        let epoch = poc_accounting::current_epoch();
+        assert!(plan.stage < 2 && (target_epoch as u256) == (epoch as u256) + 1
+            && plan.data.epoch == target_epoch && plan.data.closing_rewards.epoch == epoch
+            && plan.data.closing_rewards == get_installed_reward_context(),
+            error::invalid_state(EPLAN_MISMATCH));
+        poc_reward_split::get_installed_native_reward_bps(plan.data.closing_rewards.epoch);
+        assert!(reconfiguration_state::is_in_progress() && features::is_reconfiguration_frozen()
+            && plan.data.cutoff_secs == reconfiguration_state::start_time_secs(), error::invalid_state(EPLAN_MISMATCH));
+    }
+
+    /// 普通 DKG、Chunky DKG 和 Epoch 安装均从同一个已校验计划读取目标集合。
+    public(friend) fun cached_validator_set(): ValidatorSet acquires EpochPlan, InstalledRewardContext, PrecomputedValidatorSet {
+        validate_epoch_plan(poc_accounting::current_epoch() + 1);
+        borrow_global<PrecomputedValidatorSet>(@topo_framework).validator_set
+    }
+
+    /// 结算旧 Epoch 奖励后，才凭计划令牌应用功能开关；期间始终保持冻结。
+    public(friend) fun apply_cached_features(framework: &signer) acquires EpochPlan {
+        let plan = borrow_global<EpochPlan>(@topo_framework);
+        assert!(plan.stage == 1, error::invalid_state(EPLAN_MISMATCH));
+        features::on_new_epoch_with_freeze_token(framework, &plan.feature_token);
+    }
+
+    /// 按旧索引读取并删除费用记录；即使旧奖励配置关闭费用分发，也必须清空记录。
+    fun take_epoch_fee(index: u64, context: &RewardContext): u64 acquires PendingTransactionFee {
+        if (!exists<PendingTransactionFee>(@topo_framework)) { return 0 };
+        let fees = &mut borrow_global_mut<PendingTransactionFee>(@topo_framework).pending_fee_by_validator;
+        if (!fees.contains(&index)) { return 0 };
+        let amount = fees.remove(&index).read();
+        if (context.distribute_transaction_fee) { min(amount, context.fee_limit_per_pool) } else { 0 }
+    }
+
+    /// 基数以代币最小单位计量；用 u256 计算提案总数和乘积，最后对奖励向下取整。
+    fun reward_amount_wide(base: u64, success: u64, total: u256, rate: u64, denominator: u64): u64 {
+        assert!(denominator > 0, error::invalid_state(EPLAN_MISMATCH));
+        if (total == 0) { return 0 };
+        let result = (base as u256) * (rate as u256) * (success as u256) / ((denominator as u256) * total);
+        assert!(result <= (MAX_U64 as u256), error::invalid_state(EPLAN_MISMATCH));
+        result as u64
+    }
+
+    /// 按当期 active 和 pending_inactive 余额分配原生奖励；pending_inactive 部分向下取整，余数归 active。
+    fun split_native_reward_by_stake(native_reward_octa: u64, active_stake_octa: u64, pending_inactive_stake_octa: u64): (u64, u64) {
+        let reward_eligible_stake_octa = (active_stake_octa as u256) + (pending_inactive_stake_octa as u256);
+        assert!(reward_eligible_stake_octa > 0 || native_reward_octa == 0, error::invalid_state(EPLAN_MISMATCH));
+        let pending_inactive_reward_octa = if (reward_eligible_stake_octa > 0) {
+            ((native_reward_octa as u256) * (pending_inactive_stake_octa as u256) / reward_eligible_stake_octa) as u64
+        } else { 0 };
+        (native_reward_octa - pending_inactive_reward_octa, pending_inactive_reward_octa)
+    }
+
+    /// 使用旧委员会原有的 units、权重和索引结算奖励，待加入者不参与旧 Epoch 分配。
+    /// 检查计划阶段以防重复结算；奖励结算完成后，才能应用新配置和到期持仓变更。
+    public(friend) fun settle_closing_epoch() acquires EpochPlan, InstalledRewardContext, PendingTransactionFee, StakePool, TopoCoinCapabilities, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        validate_epoch_plan(poc_accounting::current_epoch() + 1);
+        assert!(borrow_global<EpochPlan>(@topo_framework).stage == 0, error::invalid_state(EPLAN_MISMATCH));
+        let context = borrow_global<EpochPlan>(@topo_framework).data.closing_rewards;
+        let set = borrow_global<ValidatorSet>(@topo_framework);
+        let voters = set.active_validators;
+        voters.append(set.pending_inactive);
+        let i = 0;
+        while ({
+            spec {
+                invariant i <= len(voters);
+                invariant global<poc_accounting::AccountingState>(@topo_framework).epoch == context.epoch;
+            };
+            i < voters.length()
+        }) {
+            settle_voting_pool(&voters[i], &context);
+            i += 1;
+        };
+        if (exists<PendingTransactionFee>(@topo_framework)) {
+            assert!(borrow_global<PendingTransactionFee>(@topo_framework).pending_fee_by_validator.is_empty(),
+                error::internal(ETRANSACTION_FEE_NOT_FULLY_DISTRIBUTED));
+        };
+        borrow_global_mut<EpochPlan>(@topo_framework).stage = 1;
+    }
+
+    /// 按待结束 Epoch 的模式结算奖励；PoC 模式下只计算一笔通胀，再按当期原生奖励占比拆分。
+    /// 可分发交易费使用同一旧期占比分流；通胀与费用各自取整、各自守恒。
+    fun settle_voting_pool(v: &ValidatorInfo, context: &RewardContext) acquires PendingTransactionFee, StakePool, TopoCoinCapabilities, ValidatorConfig, ValidatorPerformance {
+        assert!(borrow_global<ValidatorConfig>(v.addr).validator_index == v.config.validator_index,
+            error::invalid_state(EPLAN_MISMATCH));
+        let perf = borrow_global<ValidatorPerformance>(@topo_framework).validators.borrow(v.config.validator_index);
+        let total = (perf.successful_proposals as u256) + (perf.failed_proposals as u256);
+        let fee = take_epoch_fee(v.config.validator_index, context);
+        let mint_cap = &borrow_global<TopoCoinCapabilities>(@topo_framework).mint_cap;
+        if (context.poc_enabled) {
+            assert!(poc_accounting::preview_pool_units(v.addr, context.epoch) > 0, error::invalid_state(EPLAN_MISMATCH));
+            // 使用当期固定的计奖基数计算通胀总额，随后再拆分奖励。
+            let reward_base_octa = poc_accounting::pool_reward_base_octa(v.addr);
+            let total_inflation_octa = reward_amount_wide(reward_base_octa, perf.successful_proposals, total,
+                context.rewards_rate, context.rewards_rate_denominator);
+            // 实际 Octa 总量长期低于 u64 上限；只校验实际结算金额，不把费用政策上限当作余额。
+            let total_reward_octa = (total_inflation_octa as u256) + (fee as u256);
+            assert!(total_reward_octa <= (MAX_U64 as u256) && v.voting_power > 0,
+                error::invalid_state(EPLAN_MISMATCH));
+            let native_reward_bps = poc_reward_split::get_installed_native_reward_bps(context.epoch);
+            let (native_inflation_octa, poc_inflation_octa) = poc_reward_split::split_reward(
+                total_inflation_octa, native_reward_bps);
+            let (native_fee_octa, poc_fee_octa) = poc_reward_split::split_reward(fee, native_reward_bps);
+            let stake_pool = borrow_global_mut<StakePool>(v.addr);
+            let active_stake_octa = coin::value(&stake_pool.active);
+            let pending_inactive_stake_octa = coin::value(&stake_pool.pending_inactive);
+            let (active_native_reward_octa, pending_inactive_native_reward_octa) = split_native_reward_by_stake(
+                native_inflation_octa, active_stake_octa, pending_inactive_stake_octa);
+            let (active_native_fee_octa, pending_inactive_native_fee_octa) = split_native_reward_by_stake(
+                native_fee_octa, active_stake_octa, pending_inactive_stake_octa);
+            coin::merge(&mut stake_pool.active, coin::mint(active_native_reward_octa + active_native_fee_octa, mint_cap));
+            coin::merge(&mut stake_pool.pending_inactive,
+                coin::mint(pending_inactive_native_reward_octa + pending_inactive_native_fee_octa, mint_cap));
+            if (native_inflation_octa > 0) {
+                event::emit(DistributeRewards { pool_address: v.addr, rewards_amount: native_inflation_octa });
+            };
+            if (native_fee_octa > 0) {
+                event::emit(DistributeTransactionFee { pool_address: v.addr, fee_amount: native_fee_octa });
+            };
+            let poc_rewards = coin::mint(poc_inflation_octa + poc_fee_octa, mint_cap);
+            let delta_index = poc_accounting::credit_epoch_reward(v.addr, context.epoch, poc_rewards);
+            event::emit(PoCRewardCredited { pool: v.addr, closing_epoch: context.epoch,
+                reward_base_octa, inflation: poc_inflation_octa, fee: poc_fee_octa, delta_index });
+            event::emit(PoCRewardSplit { pool: v.addr, closing_epoch: context.epoch, native_reward_bps,
+                total_inflation_octa, active_native_reward_octa, pending_inactive_native_reward_octa, poc_inflation_octa });
+        } else {
+            let pool = borrow_global_mut<StakePool>(v.addr);
+            // 最后一个原生 Epoch 仍对两部分收益分别取整，避免切换时改变历史份额归属。
+            let active = coin::value(&pool.active);
+            let pending_inactive = coin::value(&pool.pending_inactive);
+            let active_reward = reward_amount_wide(active, perf.successful_proposals, total,
+                context.rewards_rate, context.rewards_rate_denominator);
+            let inactive_reward = reward_amount_wide(pending_inactive, perf.successful_proposals, total,
+                context.rewards_rate, context.rewards_rate_denominator);
+            let bond_octa = (active as u256) + (pending_inactive as u256);
+            assert!(bond_octa > 0 || fee == 0, error::invalid_state(EPLAN_MISMATCH));
+            let inactive_fee = if (bond_octa > 0) { ((fee as u256) * (pending_inactive as u256) / bond_octa) as u64 } else { 0 };
+            coin::merge(&mut pool.active, coin::mint(active_reward, mint_cap));
+            coin::merge(&mut pool.pending_inactive, coin::mint(inactive_reward, mint_cap));
+            coin::merge(&mut pool.active, coin::mint(fee - inactive_fee, mint_cap));
+            coin::merge(&mut pool.pending_inactive, coin::mint(inactive_fee, mint_cap));
+            event::emit(DistributeRewards { pool_address: v.addr, rewards_amount: active_reward + inactive_reward });
+            if (fee > 0) { event::emit(DistributeTransactionFee { pool_address: v.addr, fee_amount: fee }) }
+        }
+    }
+
+    /// 按计划截止时间处理本金，避免 DKG 等待改变计入保证金的本金范围。
+    fun apply_stake_transitions(pool: address, cutoff_secs: u64) acquires StakePool {
+        let p = borrow_global_mut<StakePool>(pool);
+        coin::merge(&mut p.active, coin::extract_all(&mut p.pending_active));
+        if (p.locked_until_secs <= cutoff_secs) {
+            coin::merge(&mut p.inactive, coin::extract_all(&mut p.pending_inactive));
+        }
+    }
+
+    /// 结算旧 Epoch 奖励并应用缓冲配置后，在同一事务中安装原计划，不重新选举。
+    /// 时钟、池目标、委员会和奖励上下文必须对应同一个目标 Epoch。
+    public(friend) fun install_epoch_plan(target_epoch: u64) acquires EpochPlan, InstalledRewardContext, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        // 由链 Epoch 指定目标，同时核对账本 Epoch，避免两个时钟不一致时安装。
+        validate_epoch_plan(target_epoch);
+        assert!(borrow_global<EpochPlan>(@topo_framework).stage == 1, error::invalid_state(EPLAN_MISMATCH));
+        let p = borrow_global<EpochPlan>(@topo_framework).data;
+        let set = borrow_global<PrecomputedValidatorSet>(@topo_framework).validator_set;
+        let is_liveness_fallback = borrow_global<PrecomputedValidatorSet>(@topo_framework).is_liveness_fallback;
+        let old_set = *borrow_global<ValidatorSet>(@topo_framework);
+        let pools = old_set.active_validators;
+        pools.append(old_set.pending_active);
+        pools.append(old_set.pending_inactive);
+        pools.for_each_ref(|v| apply_stake_transitions(v.addr, p.cutoff_secs));
+        let leaves = &mut borrow_global_mut<VoluntaryLeaves>(@topo_framework).requests;
+        old_set.pending_inactive.for_each_ref(|v| { if (leaves.contains(v.addr)) { leaves.remove(v.addr); } });
+        if (features::periodical_reward_rate_decrease_enabled()) {
+            staking_config::calculate_and_save_latest_epoch_rewards_rate();
+        };
+        let context = reward_context(p.epoch, p.poc_enabled);
+        let (clock_valid, period, index) = poc_power_store::preview_next_period();
+        assert!(clock_valid && period == p.period && index == p.period_index, error::invalid_state(EPLAN_MISMATCH));
+        // 先推进源周期，再更新账本绝对 Epoch；两步之间不能查询用户算力快照或重建版本。
+        poc_power_store::commit_next_period_if_boundary();
+        // 检查点记录旧 Epoch 奖励入账后的指数，再核对实际 units 是否等于冻结目标。
+        p.targets.for_each_ref(|t| poc_accounting::install_pool_target(t.pool, p.epoch, t.units, t.reward_base_octa));
+        let powers = set.active_validators.map_ref(|v| v.voting_power);
+        if (p.poc_enabled) {
+            let (_, _, _, minimum) = poc_accounting::get_power_params_fields(&p.params);
+            let (reason, total) = validate_target_powers(&powers, minimum, poc_accounting::validator_limit());
+            assert!(reason == 0 && total == (set.total_voting_power as u256), error::invalid_state(EPLAN_MISMATCH));
+        };
+        // 旧 Epoch 费用已清空，现在才重建索引、表现数组和费用表。
+        let performance = &mut borrow_global_mut<ValidatorPerformance>(@topo_framework).validators;
+        *performance = vector[];
+        let duration = staking_config::get_recurring_lockup_duration(&staking_config::get());
+        let now = timestamp::now_seconds();
+        let fees_exist = exists<PendingTransactionFee>(@topo_framework);
+        let i = 0;
+        while ({
+            spec {
+                invariant i <= len(set.active_validators);
+                invariant len(performance) == i;
+                invariant forall j in 0..i:
+                    exists<StakePool>(set.active_validators[j].addr)
+                        && exists<ValidatorConfig>(set.active_validators[j].addr)
+                        && global<ValidatorConfig>(set.active_validators[j].addr).validator_index < i
+                        && set.active_validators[j].config.validator_index < i;
+            };
+            i < set.active_validators.length()
+        }) {
+            let v = set.active_validators[i];
+            assert!(v.config.validator_index == i, error::invalid_state(EPLAN_MISMATCH));
+            borrow_global_mut<ValidatorConfig>(v.addr).validator_index = i;
+            performance.push_back(IndividualValidatorPerformance { successful_proposals: 0, failed_proposals: 0 });
+            let pool = borrow_global_mut<StakePool>(v.addr);
+            if (pool.locked_until_secs <= p.cutoff_secs) {
+                // 锁仓续期从换届完成时起算，但本金是否到期仍以计划截止时间判断。
+                let until = (now as u256) + (duration as u256);
+                assert!(until <= (MAX_U64 as u256), error::invalid_state(EPLAN_MISMATCH));
+                pool.locked_until_secs = until as u64;
+            };
+            if (fees_exist) {
+                borrow_global_mut<PendingTransactionFee>(@topo_framework).pending_fee_by_validator.add(
+                    i, aggregator_v2::create_aggregator(context.fee_limit_per_pool));
+            };
+            i += 1;
+        };
+        *borrow_global_mut<ValidatorSet>(@topo_framework) = set;
+        borrow_global_mut<InstalledRewardContext>(@topo_framework).context = context;
+        poc_reward_split::install_epoch(p.epoch, p.poc_enabled);
+        poc_accounting::advance_epoch(p.epoch, p.poc_enabled);
+        borrow_global_mut<EpochPlan>(@topo_framework).stage = 2;
+        if (is_liveness_fallback) {
+            let (minimum_stake, _) = staking_config::get_required_stake(&staking_config::get());
+            event::emit(ValidatorSetLivenessFallback { minimum_stake,
+                emergency_validator_count: set.active_validators.length(), total_emergency_voting_power: set.total_voting_power });
+        };
+        if (p.poc_enabled) {
+            event::emit(PoCEpochInstalled { epoch: p.epoch, period: p.period,
+                selected_count: set.active_validators.length(), total_power: set.total_voting_power as u64 });
+        }
+    }
+
+    /// 确认目标已安装后，同时移除计划和 PVS、消耗唯一令牌，解除标准库冻结。
+    public(friend) fun finish_epoch_plan() acquires EpochPlan, InstalledRewardContext, PrecomputedValidatorSet {
+        let EpochPlan { data, feature_token, stage } = move_from<EpochPlan>(@topo_framework);
+        let PrecomputedValidatorSet { validator_set: _, is_liveness_fallback: _ } =
+            move_from<PrecomputedValidatorSet>(@topo_framework);
+        assert!(stage == 2 && data.epoch == poc_accounting::current_epoch()
+            && get_installed_reward_context().epoch == data.epoch, error::invalid_state(EPLAN_MISMATCH));
+        features::end_reconfiguration_freeze(feature_token);
+    }
+
+    /// 只撤销当前 Epoch 的自主退出，恢复原 ValidatorInfo 和索引，保留当前权重与奖励。
+    /// 恢复后候选人数不能超过部署上限；其他不合格条件可稍后修复。
+    public entry fun cancel_leave_validator_set(operator: &signer, pool: address) acquires StakePool, ValidatorSet, VoluntaryLeaves {
+        assert_reconfig_not_in_progress();
+        assert!(get_operator(pool) == signer::address_of(operator), error::unauthenticated(ENOT_OPERATOR));
+        let epoch = poc_accounting::current_epoch();
+        let requests = &mut borrow_global_mut<VoluntaryLeaves>(@topo_framework).requests;
+        assert!(requests.contains(pool) && *requests.borrow(pool) == epoch, error::invalid_state(ENO_VOLUNTARY_LEAVE));
+        let set = borrow_global_mut<ValidatorSet>(@topo_framework);
+        assert!(set.active_validators.length() + set.pending_active.length() < poc_accounting::validator_limit(),
+            error::invalid_argument(EVALIDATOR_SET_TOO_LARGE));
+        let index = find_validator(&set.pending_inactive, pool);
+        assert!(index.is_some(), error::invalid_state(ENO_VOLUNTARY_LEAVE));
+        set.active_validators.push_back(set.pending_inactive.swap_remove(index.extract()));
+        requests.remove(pool);
+        event::emit(VoluntaryLeaveCancelled { pool, request_epoch: epoch });
+    }
 
     /// Validator Config not published.
     const EVALIDATOR_CONFIG: u64 = 1;
@@ -110,14 +926,16 @@ module topo_framework::stake {
     const EINELIGIBLE_VALIDATOR: u64 = 17;
     /// Cannot update stake pool's lockup to earlier than current lockup.
     const EINVALID_LOCKUP: u64 = 18;
+    /// Table to store collected transaction fees for each validator already exists.
+    const EFEES_TABLE_ALREADY_EXISTS: u64 = 19;
     /// Validator set change temporarily disabled because of in-progress reconfiguration. Please retry after 1 minute.
     const ERECONFIGURATION_IN_PROGRESS: u64 = 20;
-    /// Signer does not have permission to perform stake logic.
-    const ENO_STAKE_PERMISSION: u64 = 28;
     /// Transaction fee is not fully distributed at epoch ending.
     const ETRANSACTION_FEE_NOT_FULLY_DISTRIBUTED: u64 = 29;
-    /// `initialize_stake_owner` no longer accepts an inline principal deposit.
-    const EINITIAL_STAKE_NOT_SUPPORTED: u64 = 30;
+    /// Deprecated function call.
+    const EDEPRECATED: u64 = 30;
+    /// The permissioned signer feature has been removed.
+    const EPERMISSIONED_SIGNER_REMOVED: u64 = 31;
 
     /// Validator status enum. We can switch to proper enum later once Move supports it.
     const VALIDATOR_STATUS_PENDING_ACTIVE: u64 = 1;
@@ -137,104 +955,97 @@ module topo_framework::stake {
     /// Capability that represents ownership and can be used to control the validator and the associated stake pool.
     /// Having this be separate from the signer for the account that the validator resources are hosted at allows
     /// modules to have control over a validator.
-    ///
-    /// Holding this capability grants the right to:
-    /// - Change the operator address (set_operator / set_operator_with_cap)
-    /// - Extend the lockup period (increase_lockup / increase_lockup_with_cap)
-    /// - Transfer ownership to another account (extract_owner_cap / deposit_owner_cap)
     struct OwnerCapability has key, store {
         pool_address: address
     }
 
-    /// Per-validator stake pool resource, stored at the validator's address.
+    /// Each validator has a separate StakePool resource and can provide a stake.
+    /// Changes in stake for an active validator:
+    /// 1. If a validator calls add_stake, the newly added stake is moved to pending_active.
+    /// 2. If validator calls unlock, their stake is moved to pending_inactive.
+    /// 2. When the next epoch starts, any pending_inactive stake is moved to inactive and can be withdrawn.
+    ///    Any pending_active stake is moved to active and adds to the validator's voting power.
     ///
-    /// NOTE: In the Topo POC redesign, actual economic balances (deposits, rewards) are managed
-    /// by `staking_registry`. The coin buckets here are retained for lockup tracking and
-    /// backward-compatible scaffolding only. They do NOT represent the validator's true stake.
-    ///
-    /// Coin lifecycle within this struct:
-    ///   pending_active → active  (at epoch boundary, via update_stake_pool)
-    ///   active → pending_inactive (when leave_validator_set is called)
-    ///   pending_inactive → inactive (at epoch boundary, if lockup has expired)
+    /// Changes in stake for an inactive validator:
+    /// 1. If a validator calls add_stake, the newly added stake is moved directly to active.
+    /// 2. If validator calls unlock, their stake is moved directly to inactive.
+    /// 3. When the next epoch starts, the validator can be activated if their active stake is more than the minimum.
     struct StakePool has key {
-        // Active stake (kept for lockup tracking; economic value is in staking_registry)
+        // active stake
         active: Coin<TopoCoin>,
-        // Inactive stake that can be withdrawn (post-lockup)
+        // inactive stake, can be withdrawn
         inactive: Coin<TopoCoin>,
-        // Stake pending activation in the next epoch
+        // pending activation for next epoch
         pending_active: Coin<TopoCoin>,
-        // Stake pending deactivation in the next epoch
+        // pending deactivation for next epoch
         pending_inactive: Coin<TopoCoin>,
-        // Unix timestamp (seconds) until which the stake is locked.
-        // Automatically renewed for validators that remain active across epoch boundaries.
         locked_until_secs: u64,
-        // The operator address authorized to manage consensus keys and network addresses.
-        // Separated from the owner to allow professional node operators to run validators
-        // on behalf of token holders without holding the owner's private key.
-        operator_address: address
+        // Track the current operator of the validator node.
+        // This allows the operator to be different from the original account and allow for separation of
+        // the validator operations and ownership.
+        // Only the account holding OwnerCapability of the staking pool can update this.
+        operator_address: address,
+
+        // Track the current vote delegator of the staking pool.
+        // Only the account holding OwnerCapability of the staking pool can update this.
+        delegated_voter: address,
+
+        // The events emitted for the entire StakePool's lifecycle.
+        initialize_validator_events: EventHandle<RegisterValidatorCandidateEvent>,
+        set_operator_events: EventHandle<SetOperatorEvent>,
+        add_stake_events: EventHandle<AddStakeEvent>,
+        reactivate_stake_events: EventHandle<ReactivateStakeEvent>,
+        rotate_consensus_key_events: EventHandle<RotateConsensusKeyEvent>,
+        update_network_and_fullnode_addresses_events: EventHandle<
+            UpdateNetworkAndFullnodeAddressesEvent>,
+        increase_lockup_events: EventHandle<IncreaseLockupEvent>,
+        join_validator_set_events: EventHandle<JoinValidatorSetEvent>,
+        distribute_rewards_events: EventHandle<DistributeRewardsEvent>,
+        unlock_stake_events: EventHandle<UnlockStakeEvent>,
+        withdraw_stake_events: EventHandle<WithdrawStakeEvent>,
+        leave_validator_set_events: EventHandle<LeaveValidatorSetEvent>
     }
 
-    /// Validator configuration stored at the validator's address.
-    /// Contains the BLS12-381 consensus public key and network addresses.
+    /// Validator info stored in validator address.
     struct ValidatorConfig has key, copy, store, drop {
         consensus_pubkey: vector<u8>,
         network_addresses: vector<u8>,
         // to make it compatible with previous definition, remove later
         fullnode_addresses: vector<u8>,
         // Index in the active set if the validator corresponding to this stake pool is active.
-        // Used to look up performance stats in ValidatorPerformance.validators[validator_index].
         validator_index: u64
     }
 
-    /// Snapshot of a validator's identity and voting power, stored inside ValidatorSet.
-    /// Refreshed at each epoch boundary from the live ValidatorConfig and staking_registry power.
+    /// Consensus information per validator, stored in ValidatorSet.
     struct ValidatorInfo has copy, store, drop {
         addr: address,
         voting_power: u64,
         config: ValidatorConfig
     }
 
-    /// The canonical validator set, stored at @topo_framework.
-    ///
-    /// State machine:
-    ///   join_validator_set  → pending_active
-    ///   on_new_epoch        → pending_active becomes active (if power >= minimum_stake)
-    ///   leave_validator_set → active becomes pending_inactive
-    ///   on_new_epoch        → pending_inactive is removed (rewards distributed first)
-    ///
-    /// total_voting_power and total_joining_power are used to enforce the
-    /// voting_power_increase_limit: no single epoch can increase total power by more than
-    /// voting_power_increase_limit% of the current total, preventing sudden validator set takeovers.
+    /// Full ValidatorSet, stored in @topo_framework.
+    /// 1. join_validator_set adds to pending_active queue.
+    /// 2. leave_valdiator_set moves from active to pending_inactive queue.
+    /// 3. on_new_epoch processes two pending queues and refresh ValidatorInfo from the owner's address.
     struct ValidatorSet has copy, key, drop, store {
         consensus_scheme: u8,
         // Active validators for the current epoch.
         active_validators: vector<ValidatorInfo>,
-        // Pending validators to leave in next epoch (still active for rewards/voting).
+        // Pending validators to leave in next epoch (still active).
         pending_inactive: vector<ValidatorInfo>,
         // Pending validators to join in next epoch.
         pending_active: vector<ValidatorInfo>,
-        // Current total voting power (sum of all active + pending_inactive validators).
+        // Current total voting power.
         total_voting_power: u128,
-        // Total voting power of validators waiting to join in the next epoch.
-        // Used to enforce the per-epoch voting power increase limit.
+        // Total voting power waiting to join in the next epoch.
         total_joining_power: u128
     }
 
-    /// Per-epoch transaction fee accumulator, indexed by validator_index.
-    ///
-    /// The VM calls `record_fee` during block execution to credit each validator's share
-    /// of transaction fees. At epoch end, `collect_transaction_fee_for_validator` drains
-    /// each entry and passes the amount to `staking_registry::distribute_transaction_fees`.
-    ///
-    /// Uses `BigOrderedMap<u64, Aggregator<u64>>` so that concurrent transactions can
-    /// increment fee counters without write conflicts (aggregators are conflict-free).
+    /// Transaction fee that is collected in current epoch, indexed by validator_index.
     struct PendingTransactionFee has key, store {
         pending_fee_by_validator: BigOrderedMap<u64, Aggregator<u64>>
     }
 
-    /// Optional cap on how many octas of transaction fees a single validator pool can
-    /// receive per epoch. Prevents a single high-traffic validator from accumulating
-    /// disproportionate fees relative to its staking contribution.
     enum TransactionFeeConfig has drop, key, store {
         V0 {
             max_fee_octa_allowed_per_epoch_per_pool: u64
@@ -262,7 +1073,32 @@ module topo_framework::stake {
         validators: vector<IndividualValidatorPerformance>
     }
 
+    /// A system resource holding the pre-computed validator set for the next epoch.
+    /// Created by `next_validator_consensus_infos_v2()` when reconfig starts.
+    /// Consumed (destroyed) by `on_new_epoch()`.
+    /// Resource existence is the "ready" flag — no Option wrapper needed.
+    struct PrecomputedValidatorSet has key {
+        validator_set: ValidatorSet,
+        is_liveness_fallback: bool,
+    }
+
+    struct RegisterValidatorCandidateEvent has drop, store {
+        pool_address: address
+    }
+
+    #[deprecated]
     struct StakeManagementPermission has copy, drop, store {}
+
+    #[event]
+    struct RegisterValidatorCandidate has drop, store {
+        pool_address: address
+    }
+
+    struct SetOperatorEvent has drop, store {
+        pool_address: address,
+        old_operator: address,
+        new_operator: address
+    }
 
     #[event]
     struct SetOperator has drop, store {
@@ -271,11 +1107,47 @@ module topo_framework::stake {
         new_operator: address
     }
 
+    struct AddStakeEvent has drop, store {
+        pool_address: address,
+        amount_added: u64
+    }
+
+    #[event]
+    struct AddStake has drop, store {
+        pool_address: address,
+        amount_added: u64
+    }
+
+    struct ReactivateStakeEvent has drop, store {
+        pool_address: address,
+        amount: u64
+    }
+
+    #[event]
+    struct ReactivateStake has drop, store {
+        pool_address: address,
+        amount: u64
+    }
+
+    struct RotateConsensusKeyEvent has drop, store {
+        pool_address: address,
+        old_consensus_pubkey: vector<u8>,
+        new_consensus_pubkey: vector<u8>
+    }
+
     #[event]
     struct RotateConsensusKey has drop, store {
         pool_address: address,
         old_consensus_pubkey: vector<u8>,
         new_consensus_pubkey: vector<u8>
+    }
+
+    struct UpdateNetworkAndFullnodeAddressesEvent has drop, store {
+        pool_address: address,
+        old_network_addresses: vector<u8>,
+        new_network_addresses: vector<u8>,
+        old_fullnode_addresses: vector<u8>,
+        new_fullnode_addresses: vector<u8>
     }
 
     #[event]
@@ -287,6 +1159,12 @@ module topo_framework::stake {
         new_fullnode_addresses: vector<u8>
     }
 
+    struct IncreaseLockupEvent has drop, store {
+        pool_address: address,
+        old_locked_until_secs: u64,
+        new_locked_until_secs: u64
+    }
+
     #[event]
     struct IncreaseLockup has drop, store {
         pool_address: address,
@@ -294,8 +1172,50 @@ module topo_framework::stake {
         new_locked_until_secs: u64
     }
 
+    struct JoinValidatorSetEvent has drop, store {
+        pool_address: address
+    }
+
     #[event]
     struct JoinValidatorSet has drop, store {
+        pool_address: address
+    }
+
+    struct DistributeRewardsEvent has drop, store {
+        pool_address: address,
+        rewards_amount: u64
+    }
+
+    #[event]
+    /// The amount includes transaction fee and staking rewards.
+    struct DistributeRewards has drop, store {
+        pool_address: address,
+        rewards_amount: u64
+    }
+
+    struct UnlockStakeEvent has drop, store {
+        pool_address: address,
+        amount_unlocked: u64
+    }
+
+    #[event]
+    struct UnlockStake has drop, store {
+        pool_address: address,
+        amount_unlocked: u64
+    }
+
+    struct WithdrawStakeEvent has drop, store {
+        pool_address: address,
+        amount_withdrawn: u64
+    }
+
+    #[event]
+    struct WithdrawStake has drop, store {
+        pool_address: address,
+        amount_withdrawn: u64
+    }
+
+    struct LeaveValidatorSetEvent has drop, store {
         pool_address: address
     }
 
@@ -304,7 +1224,6 @@ module topo_framework::stake {
         pool_address: address
     }
 
-    // Emitted when the validator election would otherwise produce an empty active set.
     #[event]
     struct ValidatorSetLivenessFallback has drop, store {
         minimum_stake: u64,
@@ -312,21 +1231,17 @@ module topo_framework::stake {
         total_emergency_voting_power: u128
     }
 
-    /// Permissions
-    inline fun check_stake_permission(s: &signer) {
-        assert!(
-            permissioned_signer::check_permission_exists(s, StakeManagementPermission {}),
-            error::permission_denied(ENO_STAKE_PERMISSION)
-        );
+    #[deprecated]
+    /// DEPRECATED
+    struct ValidatorFees has key {
+        fees_table: Table<address, Coin<TopoCoin>>
     }
 
-    /// Grant permission to mutate staking on behalf of the master signer.
+    #[deprecated]
     public fun grant_permission(
-        master: &signer, permissioned_signer: &signer
+        _master: &signer, _permissioned_signer: &signer
     ) {
-        permissioned_signer::authorize_unlimited(
-            master, permissioned_signer, StakeManagementPermission {}
-        )
+        abort error::unavailable(EPERMISSIONED_SIGNER_REMOVED)
     }
 
     #[view]
@@ -380,19 +1295,35 @@ module topo_framework::stake {
 
     #[view]
     /// Return the voting power of the validator in the current epoch.
-    /// This is the validator's total effective power in staking_registry.
+    /// PoC 读取已安装 ValidatorInfo 的当前权重；原生模式继续查询代币余额。
     public fun get_current_epoch_voting_power(
         pool_address: address
-    ): u64 acquires ValidatorSet {
+    ): u64 acquires InstalledRewardContext, StakePool, ValidatorSet {
         assert_stake_pool_exists(pool_address);
+        if (is_poc_enabled()) {
+            let set = borrow_global<ValidatorSet>(@topo_framework);
+            let active = find_validator(&set.active_validators, pool_address);
+            if (active.is_some()) { return set.active_validators[*active.borrow()].voting_power };
+            let leaving = find_validator(&set.pending_inactive, pool_address);
+            return if (leaving.is_some()) { set.pending_inactive[*leaving.borrow()].voting_power } else { 0 }
+        };
         let validator_state = get_validator_state(pool_address);
         // Both active and pending inactive validators can still vote in the current epoch.
         if (validator_state == VALIDATOR_STATUS_ACTIVE
             || validator_state == VALIDATOR_STATUS_PENDING_INACTIVE) {
-            let (_, maximum_stake) =
-                staking_config::get_required_stake(&staking_config::get());
-            min_u64(staking_registry::get_validator_total_power(pool_address), maximum_stake)
+            let active_stake =
+                coin::value(&borrow_global<StakePool>(pool_address).active);
+            let pending_inactive_stake =
+                coin::value(&borrow_global<StakePool>(pool_address).pending_inactive);
+            active_stake + pending_inactive_stake
         } else { 0 }
+    }
+
+    #[view]
+    /// Return the delegated voter of the validator at `pool_address`.
+    public fun get_delegated_voter(pool_address: address): address acquires StakePool {
+        assert_stake_pool_exists(pool_address);
+        borrow_global<StakePool>(pool_address).delegated_voter
     }
 
     #[view]
@@ -405,6 +1336,19 @@ module topo_framework::stake {
     /// Return the pool address in `owner_cap`.
     public fun get_owned_pool_address(owner_cap: &OwnerCapability): address {
         owner_cap.pool_address
+    }
+
+    #[view]
+    /// Return true if `owner` has an `OwnerCapability` resource.
+    public fun owner_cap_exists(owner: address): bool {
+        exists<OwnerCapability>(owner)
+    }
+
+    #[view]
+    /// Return the pool address controlled by the `OwnerCapability` at `owner`.
+    public fun get_pool_address_for_owner(owner: address): address acquires OwnerCapability {
+        assert_owner_cap_exists(owner);
+        OwnerCapability[owner].pool_address
     }
 
     #[view]
@@ -463,84 +1407,9 @@ module topo_framework::stake {
         result
     }
 
-    #[view]
-    /// Return the number of active validators in the current epoch.
-    public fun get_active_validator_count(): u64 acquires ValidatorSet {
-        borrow_global<ValidatorSet>(@topo_framework).active_validators.length()
-    }
-
-    #[view]
-    /// Return the number of validators waiting to become active next epoch.
-    public fun get_pending_active_validator_count(): u64 acquires ValidatorSet {
-        borrow_global<ValidatorSet>(@topo_framework).pending_active.length()
-    }
-
-    #[view]
-    /// Return the number of validators still active this epoch but leaving next epoch.
-    public fun get_pending_inactive_validator_count(): u64 acquires ValidatorSet {
-        borrow_global<ValidatorSet>(@topo_framework).pending_inactive.length()
-    }
-
-    #[view]
-    /// Return active validator pool addresses in current-epoch order.
-    public fun get_active_validators(
-        offset: u64,
-        limit: u64
-    ): vector<address> acquires ValidatorSet {
-        let validator_set = borrow_global<ValidatorSet>(@topo_framework);
-        get_validator_addresses(&validator_set.active_validators, offset, limit)
-    }
-
-    #[view]
-    /// Return pending-active validator pool addresses.
-    public fun get_pending_active_validators(
-        offset: u64,
-        limit: u64
-    ): vector<address> acquires ValidatorSet {
-        let validator_set = borrow_global<ValidatorSet>(@topo_framework);
-        get_validator_addresses(&validator_set.pending_active, offset, limit)
-    }
-
-    #[view]
-    /// Return pending-inactive validator pool addresses.
-    public fun get_pending_inactive_validators(
-        offset: u64,
-        limit: u64
-    ): vector<address> acquires ValidatorSet {
-        let validator_set = borrow_global<ValidatorSet>(@topo_framework);
-        get_validator_addresses(&validator_set.pending_inactive, offset, limit)
-    }
-
-    #[view]
-    /// Return validator addresses that can vote in the current epoch:
-    /// active validators followed by pending-inactive validators.
-    public fun get_current_epoch_validators(
-        offset: u64,
-        limit: u64
-    ): vector<address> acquires ValidatorSet {
-        let validator_set = borrow_global<ValidatorSet>(@topo_framework);
-        let addresses = vector[];
-        let total = validator_set.active_validators.length()
-            + validator_set.pending_inactive.length();
-        let i = offset;
-        let end = range_end(offset, limit, total);
-        while (i < end) {
-            if (i < validator_set.active_validators.length()) {
-                addresses.push_back(validator_set.active_validators.borrow(i).addr);
-            } else {
-                let pending_index = i - validator_set.active_validators.length();
-                addresses.push_back(
-                    validator_set.pending_inactive.borrow(pending_index).addr
-                );
-            };
-            i += 1;
-        };
-        addresses
-    }
-
     /// Initialize validator set to the core resource account.
     public(friend) fun initialize(topo_framework: &signer) {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
 
         move_to(
             topo_framework,
@@ -562,16 +1431,16 @@ module topo_framework::stake {
     public(friend) fun store_topo_coin_mint_cap(
         topo_framework: &signer, mint_cap: MintCapability<TopoCoin>
     ) {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
         move_to(topo_framework, TopoCoinCapabilities { mint_cap })
     }
 
     /// Allow on chain governance to remove validators from the validator set.
     public fun remove_validators(
         topo_framework: &signer, validators: &vector<address>
-    ) acquires ValidatorSet {
+    ) acquires ValidatorSet, VoluntaryLeaves {
         assert_reconfig_not_in_progress();
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
         let validator_set = borrow_global_mut<ValidatorSet>(@topo_framework);
         let active_validators = &mut validator_set.active_validators;
         let pending_inactive = &mut validator_set.pending_inactive;
@@ -589,18 +1458,26 @@ module topo_framework::stake {
                 invariant spec_validator_indices_are_valid(active_validators);
                 invariant spec_validators_are_initialized(pending_inactive);
                 invariant spec_validator_indices_are_valid(pending_inactive);
+                invariant ghost_active_num == len(active_validators);
+                invariant ghost_pending_inactive_num == len(pending_inactive);
                 invariant ghost_active_num + ghost_pending_inactive_num
                     == len(active_validators) + len(pending_inactive);
+                invariant len(active_validators) + len(pending_inactive)
+                    == spec_validator_index_upper_bound();
             };
             i < len_validators
         }) {
             let validator = validators[i];
+            // 池已在待退出队列时也要清除自主退出标记，防止运营者撤销治理移除。
+            if (exists<VoluntaryLeaves>(@topo_framework)) {
+                let requests = &mut borrow_global_mut<VoluntaryLeaves>(@topo_framework).requests;
+                if (requests.contains(validator)) { requests.remove(validator); }
+            };
             let validator_index = find_validator(active_validators, validator);
             if (validator_index.is_some()) {
                 let validator_info =
                     active_validators.swap_remove(*validator_index.borrow());
                 pending_inactive.push_back(validator_info);
-                staking_registry::set_validator_pending_inactive(validator);
                 spec {
                     update ghost_active_num = ghost_active_num - 1;
                     update ghost_pending_inactive_num = ghost_pending_inactive_num + 1;
@@ -611,7 +1488,8 @@ module topo_framework::stake {
     }
 
     public fun initialize_pending_transaction_fee(framework: &signer) {
-        system_addresses::assert_aptos_framework(framework);
+        assert_reconfig_not_in_progress();
+        system_addresses::assert_topo_framework(framework);
 
         if (!exists<PendingTransactionFee>(@topo_framework)) {
             move_to(
@@ -630,7 +1508,7 @@ module topo_framework::stake {
     public fun set_transaction_fee_limit_per_epoch_per_pool(
         framework: &signer, limit_octa: u64
     ) acquires TransactionFeeConfig {
-        system_addresses::assert_aptos_framework(framework);
+        system_addresses::assert_topo_framework(framework);
 
         let config = TransactionFeeConfig::V0 {
             max_fee_octa_allowed_per_epoch_per_pool: limit_octa
@@ -639,10 +1517,17 @@ module topo_framework::stake {
         set_transaction_fee_config(framework, config);
     }
 
+    /// 准备后校验部署费用上限；当前 Epoch 仍按已安装上下文的费用限额分发。
     public fun set_transaction_fee_config(
         framework: &signer, config: TransactionFeeConfig
     ) acquires TransactionFeeConfig {
-        system_addresses::assert_aptos_framework(framework);
+        assert_reconfig_not_in_progress();
+        system_addresses::assert_topo_framework(framework);
+
+        if (is_poc_prepared()) {
+            let TransactionFeeConfig::V0 { max_fee_octa_allowed_per_epoch_per_pool } = &config;
+            poc_accounting::validate_fee_limit(*max_fee_octa_allowed_per_epoch_per_pool);
+        };
 
         if (exists<TransactionFeeConfig>(@topo_framework)) {
             *borrow_global_mut<TransactionFeeConfig>(@topo_framework) = config;
@@ -669,9 +1554,17 @@ module topo_framework::stake {
         while (i < num_validators_to_distribute) {
             let validator_index = fee_distribution_validator_indices[i];
             let fee_octa = fee_amounts_octa[i];
-            pending_fee.pending_fee_by_validator.borrow_mut(&validator_index).add(
-                fee_octa
-            );
+            let fee = pending_fee.pending_fee_by_validator.borrow_mut(&validator_index);
+            if (is_poc_prepared()) {
+                // 累加器上限取自当前 Epoch 的奖励配置。优先并行累加，触顶时只补齐剩余额度，
+                // 避免长期 Deferred 导致溢出；只限制可分发金额，不改变实际收费。
+                if (!fee.try_add(fee_octa)) {
+                    let remaining = fee.max_value() - fee.read();
+                    fee.add(remaining);
+                }
+            } else {
+                fee.add(fee_octa);
+            };
             i += 1;
         }
     }
@@ -683,23 +1576,31 @@ module topo_framework::stake {
     public entry fun initialize_stake_owner(
         owner: &signer,
         initial_stake_amount: u64,
-        operator: address
-    ) acquires AllowedValidators, OwnerCapability, StakePool {
-        initialize_stake_pool_with_empty_config(owner, operator);
-        assert!(
-            initial_stake_amount == 0,
-            error::invalid_argument(EINITIAL_STAKE_NOT_SUPPORTED)
+        operator: address,
+        voter: address
+    ) acquires AllowedValidators, InstalledRewardContext, OwnerCapability, StakePool, ValidatorSet {
+        initialize_owner(owner);
+        move_to(
+            owner,
+            ValidatorConfig {
+                consensus_pubkey: vector::empty(),
+                network_addresses: vector::empty(),
+                fullnode_addresses: vector::empty(),
+                validator_index: 0
+            }
         );
-        register_self_owned_validator(signer::address_of(owner));
-    }
 
-    /// Initializes a stake pool plus empty validator config for a resource-account backed pool.
-    /// The caller is responsible for registering the correct owner in `staking_registry`.
-    public(friend) fun initialize_stake_pool(
-        owner: &signer,
-        operator: address
-    ) acquires AllowedValidators, OwnerCapability, StakePool {
-        initialize_stake_pool_with_empty_config(owner, operator);
+        if (initial_stake_amount > 0) {
+            add_stake(owner, initial_stake_amount);
+        };
+
+        let account_address = signer::address_of(owner);
+        if (account_address != operator) {
+            set_operator(owner, operator)
+        };
+        if (account_address != voter) {
+            set_delegated_voter(owner, voter)
+        };
     }
 
     /// Initialize the validator account and give ownership to the signing account.
@@ -710,7 +1611,6 @@ module topo_framework::stake {
         network_addresses: vector<u8>,
         fullnode_addresses: vector<u8>
     ) acquires AllowedValidators {
-        check_stake_permission(account);
         // Checks the public key has a valid proof-of-possession to prevent rogue-key attacks.
         let pubkey_from_pop =
             &bls12381::public_key_from_bytes_with_pop(
@@ -731,11 +1631,9 @@ module topo_framework::stake {
                 validator_index: 0
             }
         );
-        register_self_owned_validator(signer::address_of(account));
     }
 
     fun initialize_owner(owner: &signer) acquires AllowedValidators {
-        check_stake_permission(owner);
         let owner_address = signer::address_of(owner);
         assert!(is_allowed(owner_address), error::not_found(EINELIGIBLE_VALIDATOR));
         assert!(
@@ -751,49 +1649,41 @@ module topo_framework::stake {
                 pending_inactive: coin::zero<TopoCoin>(),
                 inactive: coin::zero<TopoCoin>(),
                 locked_until_secs: 0,
-                operator_address: owner_address
+                operator_address: owner_address,
+                delegated_voter: owner_address,
+                // Events.
+                initialize_validator_events: account::new_event_handle<
+                    RegisterValidatorCandidateEvent>(owner),
+                set_operator_events: account::new_event_handle<SetOperatorEvent>(owner),
+                add_stake_events: account::new_event_handle<AddStakeEvent>(owner),
+                reactivate_stake_events: account::new_event_handle<ReactivateStakeEvent>(
+                    owner
+                ),
+                rotate_consensus_key_events: account::new_event_handle<
+                    RotateConsensusKeyEvent>(owner),
+                update_network_and_fullnode_addresses_events: account::new_event_handle<
+                    UpdateNetworkAndFullnodeAddressesEvent>(owner),
+                increase_lockup_events: account::new_event_handle<IncreaseLockupEvent>(
+                    owner
+                ),
+                join_validator_set_events: account::new_event_handle<JoinValidatorSetEvent>(
+                    owner
+                ),
+                distribute_rewards_events: account::new_event_handle<DistributeRewardsEvent>(
+                    owner
+                ),
+                unlock_stake_events: account::new_event_handle<UnlockStakeEvent>(owner),
+                withdraw_stake_events: account::new_event_handle<WithdrawStakeEvent>(owner),
+                leave_validator_set_events: account::new_event_handle<
+                    LeaveValidatorSetEvent>(owner)
             }
         );
 
         move_to(owner, OwnerCapability { pool_address: owner_address });
     }
 
-    fun initialize_stake_pool_with_empty_config(
-        owner: &signer,
-        operator: address,
-    ) acquires AllowedValidators, OwnerCapability, StakePool {
-        check_stake_permission(owner);
-        initialize_owner(owner);
-        move_to(owner, empty_validator_config());
-
-        let owner_address = signer::address_of(owner);
-        if (owner_address != operator) {
-            set_operator(owner, operator);
-        };
-    }
-
-    fun empty_validator_config(): ValidatorConfig {
-        ValidatorConfig {
-            consensus_pubkey: vector::empty(),
-            network_addresses: vector::empty(),
-            fullnode_addresses: vector::empty(),
-            validator_index: 0
-        }
-    }
-
-    fun register_self_owned_validator(owner_address: address) {
-        if (staking_registry::registry_exists() && !staking_registry::validator_exists(owner_address)) {
-            staking_registry::register_validator_for_owner(
-                owner_address,
-                owner_address,
-                0,
-            );
-        };
-    }
-
     /// Extract and return owner capability from the signing account.
     public fun extract_owner_cap(owner: &signer): OwnerCapability acquires OwnerCapability {
-        check_stake_permission(owner);
         let owner_address = signer::address_of(owner);
         assert_owner_cap_exists(owner_address);
         move_from<OwnerCapability>(owner_address)
@@ -804,7 +1694,6 @@ module topo_framework::stake {
     public fun deposit_owner_cap(
         owner: &signer, owner_cap: OwnerCapability
     ) {
-        check_stake_permission(owner);
         assert!(
             !exists<OwnerCapability>(signer::address_of(owner)),
             error::not_found(EOWNER_CAP_ALREADY_EXISTS)
@@ -821,7 +1710,6 @@ module topo_framework::stake {
     public entry fun set_operator(
         owner: &signer, new_operator: address
     ) acquires OwnerCapability, StakePool {
-        check_stake_permission(owner);
         let owner_address = signer::address_of(owner);
         assert_owner_cap_exists(owner_address);
         let ownership_cap = borrow_global<OwnerCapability>(owner_address);
@@ -841,6 +1729,109 @@ module topo_framework::stake {
         event::emit(SetOperator { pool_address, old_operator, new_operator });
     }
 
+    /// Allows an owner to change the delegated voter of the stake pool.
+    public entry fun set_delegated_voter(
+        owner: &signer, new_voter: address
+    ) acquires OwnerCapability, StakePool {
+        let owner_address = signer::address_of(owner);
+        assert_owner_cap_exists(owner_address);
+        let ownership_cap = borrow_global<OwnerCapability>(owner_address);
+        set_delegated_voter_with_cap(ownership_cap, new_voter);
+    }
+
+    /// Allows an owner to change the delegated voter of the stake pool.
+    public fun set_delegated_voter_with_cap(
+        owner_cap: &OwnerCapability, new_voter: address
+    ) acquires StakePool {
+        let pool_address = owner_cap.pool_address;
+        assert_stake_pool_exists(pool_address);
+        let stake_pool = borrow_global_mut<StakePool>(pool_address);
+        stake_pool.delegated_voter = new_voter;
+    }
+
+    /// Add `amount` of coins from the `account` owning the StakePool.
+    public entry fun add_stake(
+        owner: &signer, amount: u64
+    ) acquires InstalledRewardContext, OwnerCapability, StakePool, ValidatorSet {
+        let owner_address = signer::address_of(owner);
+        assert_owner_cap_exists(owner_address);
+        let ownership_cap = borrow_global<OwnerCapability>(owner_address);
+        add_stake_with_cap(ownership_cap, coin::withdraw<TopoCoin>(owner, amount));
+    }
+
+    /// Add `coins` into `pool_address`. this requires the corresponding `owner_cap` to be passed in.
+    public fun add_stake_with_cap(
+        owner_cap: &OwnerCapability, coins: Coin<TopoCoin>
+    ) acquires InstalledRewardContext, StakePool, ValidatorSet {
+        assert_reconfig_not_in_progress();
+        let pool_address = owner_cap.pool_address;
+        assert_stake_pool_exists(pool_address);
+
+        let amount = coin::value(&coins);
+        if (amount == 0) {
+            coin::destroy_zero(coins);
+            return
+        };
+
+        // Only track and validate voting power increase for active and pending_active validator.
+        // Pending_inactive validator will be removed from the validator set in the next epoch.
+        // Inactive validator's total stake will be tracked when they join the validator set.
+        let validator_set = borrow_global<ValidatorSet>(@topo_framework);
+        // Search directly rather using get_validator_state to save on unnecessary loops.
+        if (find_validator(&validator_set.active_validators, pool_address).is_some()
+            || find_validator(&validator_set.pending_active, pool_address).is_some()) {
+            update_voting_power_increase(amount);
+        };
+
+        // Add to pending_active if it's a current validator because the stake is not counted until the next epoch.
+        // Otherwise, the delegation can be added to active directly as the validator is also activated in the epoch.
+        let stake_pool = borrow_global_mut<StakePool>(pool_address);
+        if (is_current_epoch_validator(pool_address)) {
+            coin::merge<TopoCoin>(&mut stake_pool.pending_active, coins);
+        } else {
+            coin::merge<TopoCoin>(&mut stake_pool.active, coins);
+        };
+
+        let (_, maximum_stake) =
+            staking_config::get_required_stake(&staking_config::get());
+        let voting_power = get_voting_power(stake_pool);
+        assert!(
+            voting_power <= maximum_stake, error::invalid_argument(ESTAKE_EXCEEDS_MAX)
+        );
+
+        event::emit(AddStake { pool_address, amount_added: amount });
+    }
+
+    /// Move `amount` of coins from pending_inactive to active.
+    public entry fun reactivate_stake(owner: &signer, amount: u64) acquires OwnerCapability, StakePool {
+        assert_reconfig_not_in_progress();
+        let owner_address = signer::address_of(owner);
+        assert_owner_cap_exists(owner_address);
+        let ownership_cap = borrow_global<OwnerCapability>(owner_address);
+        reactivate_stake_with_cap(ownership_cap, amount);
+    }
+
+    public fun reactivate_stake_with_cap(
+        owner_cap: &OwnerCapability, amount: u64
+    ) acquires StakePool {
+        assert_reconfig_not_in_progress();
+        let pool_address = owner_cap.pool_address;
+        assert_stake_pool_exists(pool_address);
+
+        // Cap the amount to reactivate by the amount in pending_inactive.
+        let stake_pool = borrow_global_mut<StakePool>(pool_address);
+        let total_pending_inactive = coin::value(&stake_pool.pending_inactive);
+        amount = min(amount, total_pending_inactive);
+
+        // Since this does not count as a voting power change (pending inactive still counts as voting power in the
+        // current epoch), stake can be immediately moved from pending inactive to active.
+        // We also don't need to check voting power increase as there's none.
+        let reactivated_coins = coin::extract(&mut stake_pool.pending_inactive, amount);
+        coin::merge(&mut stake_pool.active, reactivated_coins);
+
+        event::emit(ReactivateStake { pool_address, amount });
+    }
+
     /// Rotate the consensus key of the validator, it'll take effect in next epoch.
     public entry fun rotate_consensus_key(
         operator: &signer,
@@ -848,7 +1839,6 @@ module topo_framework::stake {
         new_consensus_pubkey: vector<u8>,
         proof_of_possession: vector<u8>
     ) acquires StakePool, ValidatorConfig {
-        check_stake_permission(operator);
         assert_reconfig_not_in_progress();
         assert_stake_pool_exists(pool_address);
 
@@ -876,11 +1866,7 @@ module topo_framework::stake {
         validator_info.consensus_pubkey = new_consensus_pubkey;
 
         event::emit(
-            RotateConsensusKey {
-                pool_address,
-                old_consensus_pubkey,
-                new_consensus_pubkey
-            }
+            RotateConsensusKey { pool_address, old_consensus_pubkey, new_consensus_pubkey }
         );
     }
 
@@ -891,7 +1877,6 @@ module topo_framework::stake {
         new_network_addresses: vector<u8>,
         new_fullnode_addresses: vector<u8>
     ) acquires StakePool, ValidatorConfig {
-        check_stake_permission(operator);
         assert_reconfig_not_in_progress();
         assert_stake_pool_exists(pool_address);
         let stake_pool = borrow_global_mut<StakePool>(pool_address);
@@ -922,15 +1907,15 @@ module topo_framework::stake {
 
     /// Similar to increase_lockup_with_cap but will use ownership capability from the signing account.
     public entry fun increase_lockup(owner: &signer) acquires OwnerCapability, StakePool {
-        check_stake_permission(owner);
         let owner_address = signer::address_of(owner);
         assert_owner_cap_exists(owner_address);
         let ownership_cap = borrow_global<OwnerCapability>(owner_address);
         increase_lockup_with_cap(ownership_cap);
     }
 
-    /// Extend the lockup horizon used by governance and validator lifecycle checks.
+    /// 用所有权能力延长锁仓；在此检查冻结状态，使质押、委托和归属合约的调用也受约束。
     public fun increase_lockup_with_cap(owner_cap: &OwnerCapability) acquires StakePool {
+        assert_reconfig_not_in_progress();
         let pool_address = owner_cap.pool_address;
         assert_stake_pool_exists(pool_address);
         let config = staking_config::get();
@@ -947,19 +1932,14 @@ module topo_framework::stake {
         stake_pool.locked_until_secs = new_locked_until_secs;
 
         event::emit(
-            IncreaseLockup {
-                pool_address,
-                old_locked_until_secs,
-                new_locked_until_secs
-            }
+            IncreaseLockup { pool_address, old_locked_until_secs, new_locked_until_secs }
         );
     }
 
     /// This can only called by the operator of the validator/staking pool.
     public entry fun join_validator_set(
         operator: &signer, pool_address: address
-    ) acquires StakePool, ValidatorConfig, ValidatorSet {
-        check_stake_permission(operator);
+    ) acquires InstalledRewardContext, StakePool, ValidatorConfig, ValidatorSet {
         assert!(
             staking_config::get_allow_validator_set_change(&staking_config::get()),
             error::invalid_argument(ENO_POST_GENESIS_VALIDATOR_SET_CHANGE_ALLOWED)
@@ -974,21 +1954,9 @@ module topo_framework::stake {
     /// epoch starts (eligibility will be rechecked).
     ///
     /// This internal version can only be called by the Genesis module during Genesis.
-    ///
-    /// Joining checks (in order):
-    /// 1. No reconfiguration in progress
-    /// 2. Operator signature matches pool's operator_address
-    /// 3. Validator is currently INACTIVE (not already pending or active)
-    /// 4. Validator's own joining power > 0 (owner must have deposited and delegated)
-    /// 5. Total pool power >= minimum_stake and <= maximum_stake
-    /// 6. Per-epoch voting power increase limit not exceeded
-    /// 7. Consensus pubkey is non-empty
-    /// 8. Validator set size <= MAX_VALIDATOR_SET_SIZE (65536)
-    ///
-    /// On success: validator is added to pending_active and staking_registry status is set to PENDING_ACTIVE.
     public(friend) fun join_validator_set_internal(
         operator: &signer, pool_address: address
-    ) acquires StakePool, ValidatorConfig, ValidatorSet {
+    ) acquires InstalledRewardContext, StakePool, ValidatorConfig, ValidatorSet {
         assert_reconfig_not_in_progress();
         assert_stake_pool_exists(pool_address);
         let stake_pool = borrow_global_mut<StakePool>(pool_address);
@@ -1003,9 +1971,19 @@ module topo_framework::stake {
 
         let config = staking_config::get();
         let (minimum_stake, maximum_stake) = staking_config::get_required_stake(&config);
-        let self_power = staking_registry::get_validator_joining_power(pool_address);
-        assert!(self_power > 0, error::invalid_argument(ESTAKE_TOO_LOW));
-        let voting_power = staking_registry::get_validator_total_power(pool_address);
+        // Settle any pending_inactive whose lockup has already expired so it is not counted
+        // as voting power. An inactive validator's pending_inactive is never processed by
+        // update_stake_pool, so we must do it here before evaluating the minimum stake.
+        // Only settle when locked_until_secs > 0 (i.e., a lockup was ever explicitly set);
+        // a value of 0 means the pool was just created and the lockup has not been initialised yet.
+        if (stake_pool.locked_until_secs > 0
+            && timestamp::now_seconds() >= stake_pool.locked_until_secs) {
+            coin::merge(
+                &mut stake_pool.inactive,
+                coin::extract_all(&mut stake_pool.pending_inactive)
+            );
+        };
+        let voting_power = get_voting_power(stake_pool);
         assert!(voting_power >= minimum_stake, error::invalid_argument(ESTAKE_TOO_LOW));
         assert!(voting_power <= maximum_stake, error::invalid_argument(ESTAKE_TOO_HIGH));
 
@@ -1021,83 +1999,124 @@ module topo_framework::stake {
 
         // Validate the current validator set size has not exceeded the limit.
         let validator_set = borrow_global_mut<ValidatorSet>(@topo_framework);
-        validator_set.pending_active.push_back(
-            generate_validator_info(pool_address, *validator_config)
-        );
+        let validator_info = generate_validator_info(pool_address, stake_pool, *validator_config);
+        // PoC 待加入者没有当前 Epoch 的投票权；其权重和增长预算由下一份计划决定。
+        if (is_poc_enabled()) { validator_info.voting_power = 0 };
+        validator_set.pending_active.push_back(validator_info);
         let validator_set_size =
             validator_set.active_validators.length()
                 + validator_set.pending_active.length();
         assert!(
-            validator_set_size <= MAX_VALIDATOR_SET_SIZE,
+            validator_set_size <= MAX_VALIDATOR_SET_SIZE
+                && (!is_poc_prepared() || validator_set_size <= poc_accounting::validator_limit()),
             error::invalid_argument(EVALIDATOR_SET_TOO_LARGE)
         );
-        staking_registry::set_validator_pending_active(pool_address);
 
         event::emit(JoinValidatorSet { pool_address });
     }
 
-    /// Request to have `pool_address` leave the validator set. The validator is only actually removed from the set when
-    /// the next epoch starts.
-    /// The last validator in the set cannot leave. This is an edge case that should never happen as long as the network
-    /// is still operational.
-    ///
-    /// Can only be called by the operator of the validator/staking pool.
-    public entry fun leave_validator_set(
-        operator: &signer, pool_address: address
-    ) acquires StakePool, ValidatorSet {
-        check_stake_permission(operator);
+    /// Similar to unlock_with_cap but will use ownership capability from the signing account.
+    public entry fun unlock(owner: &signer, amount: u64) acquires OwnerCapability, StakePool {
         assert_reconfig_not_in_progress();
-        let config = staking_config::get();
-        assert!(
-            staking_config::get_allow_validator_set_change(&config),
-            error::invalid_argument(ENO_POST_GENESIS_VALIDATOR_SET_CHANGE_ALLOWED)
-        );
+        let owner_address = signer::address_of(owner);
+        assert_owner_cap_exists(owner_address);
+        let ownership_cap = borrow_global<OwnerCapability>(owner_address);
+        unlock_with_cap(amount, ownership_cap);
+    }
 
+    /// Unlock `amount` from the active stake. Only possible if the lockup has expired.
+    public fun unlock_with_cap(amount: u64, owner_cap: &OwnerCapability) acquires StakePool {
+        assert_reconfig_not_in_progress();
+        // Short-circuit if amount to unlock is 0 so we don't emit events.
+        if (amount == 0) { return };
+
+        // Unlocked coins are moved to pending_inactive. When the current lockup cycle expires, they will be moved into
+        // inactive in the earliest possible epoch transition.
+        let pool_address = owner_cap.pool_address;
         assert_stake_pool_exists(pool_address);
         let stake_pool = borrow_global_mut<StakePool>(pool_address);
-        // Account has to be the operator.
-        assert!(
-            signer::address_of(operator) == stake_pool.operator_address,
-            error::unauthenticated(ENOT_OPERATOR)
-        );
+        // Cap amount to unlock by maximum active stake.
+        let amount = min(amount, coin::value(&stake_pool.active));
+        let unlocked_stake = coin::extract(&mut stake_pool.active, amount);
+        coin::merge<TopoCoin>(&mut stake_pool.pending_inactive, unlocked_stake);
 
-        let validator_set = borrow_global_mut<ValidatorSet>(@topo_framework);
-        // If the validator is still pending_active, directly kick the validator out.
-        let maybe_pending_active_index =
-            find_validator(&validator_set.pending_active, pool_address);
-        if (maybe_pending_active_index.is_some()) {
-            validator_set.pending_active.swap_remove(maybe_pending_active_index.extract());
+        event::emit(UnlockStake { pool_address, amount_unlocked: amount });
+    }
 
-            // Decrease the voting power increase as the pending validator's voting power was added when they requested
-            // to join. Now that they changed their mind, their voting power should not affect the joining limit of this
-            // epoch.
-            let validator_stake =
-                staking_registry::get_validator_total_power(pool_address) as u128;
-            // total_joining_power should be larger than validator_stake but just in case there has been a small
-            // rounding error somewhere that can lead to an underflow, we still want to allow this transaction to
-            // succeed.
-            if (validator_set.total_joining_power > validator_stake) {
-                validator_set.total_joining_power -= validator_stake;
-            } else {
-                validator_set.total_joining_power = 0;
-            };
-            staking_registry::set_validator_inactive(pool_address);
-        } else {
-            // Validate that the validator is already part of the validator set.
-            let maybe_active_index =
-                find_validator(&validator_set.active_validators, pool_address);
-            assert!(maybe_active_index.is_some(), error::invalid_state(ENOT_VALIDATOR));
-            let validator_info =
-                validator_set.active_validators.swap_remove(maybe_active_index.extract());
-            assert!(
-                validator_set.active_validators.length() > 0,
-                error::invalid_state(ELAST_VALIDATOR)
-            );
-            validator_set.pending_inactive.push_back(validator_info);
-            staking_registry::set_validator_pending_inactive(pool_address);
+    /// Withdraw from `account`'s inactive stake.
+    public entry fun withdraw(
+        owner: &signer, withdraw_amount: u64
+    ) acquires OwnerCapability, StakePool, ValidatorSet {
+        let owner_address = signer::address_of(owner);
+        assert_owner_cap_exists(owner_address);
+        let ownership_cap = borrow_global<OwnerCapability>(owner_address);
+        let coins = withdraw_with_cap(ownership_cap, withdraw_amount);
+        coin::deposit<TopoCoin>(owner_address, coins);
+    }
 
-            event::emit(LeaveValidatorSet { pool_address });
+    /// Withdraw from `pool_address`'s inactive stake with the corresponding `owner_cap`.
+    public fun withdraw_with_cap(
+        owner_cap: &OwnerCapability, withdraw_amount: u64
+    ): Coin<TopoCoin> acquires StakePool, ValidatorSet {
+        assert_reconfig_not_in_progress();
+        let pool_address = owner_cap.pool_address;
+        assert_stake_pool_exists(pool_address);
+        let stake_pool = borrow_global_mut<StakePool>(pool_address);
+        // There's an edge case where a validator unlocks their stake and leaves the validator set before
+        // the stake is fully unlocked (the current lockup cycle has not expired yet).
+        // This can leave their stake stuck in pending_inactive even after the current lockup cycle expires.
+        if (get_validator_state(pool_address) == VALIDATOR_STATUS_INACTIVE
+            && timestamp::now_seconds() >= stake_pool.locked_until_secs) {
+            let pending_inactive_stake =
+                coin::extract_all(&mut stake_pool.pending_inactive);
+            coin::merge(&mut stake_pool.inactive, pending_inactive_stake);
         };
+
+        // Cap withdraw amount by total inactive coins.
+        withdraw_amount = min(withdraw_amount, coin::value(&stake_pool.inactive));
+        if (withdraw_amount == 0) return coin::zero<TopoCoin>();
+
+        event::emit(WithdrawStake { pool_address, amount_withdrawn: withdraw_amount });
+
+        coin::extract(&mut stake_pool.inactive, withdraw_amount)
+    }
+
+    /// 运营者申请下一 Epoch 退出，当前 Epoch 仍可投票并获得奖励。
+    /// PoC 先校验退出后的完整目标；原生模式继续禁止最后一名在任者退出。
+    public entry fun leave_validator_set(operator: &signer, pool_address: address) acquires InstalledRewardContext, StakePool, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        assert_reconfig_not_in_progress();
+        assert!(staking_config::get_allow_validator_set_change(&staking_config::get()),
+            error::invalid_argument(ENO_POST_GENESIS_VALIDATOR_SET_CHANGE_ALLOWED));
+        assert!(get_operator(pool_address) == signer::address_of(operator), error::unauthenticated(ENOT_OPERATOR));
+        let set = borrow_global<ValidatorSet>(@topo_framework);
+        let pending = find_validator(&set.pending_active, pool_address);
+        if (pending.is_some()) {
+            // 允许在目标不合格时取消待加入申请，通过减少候选者缓解增长预算不足。
+            let native_stake = if (is_poc_enabled()) { 0 } else { get_voting_power(borrow_global<StakePool>(pool_address)) };
+            let set = borrow_global_mut<ValidatorSet>(@topo_framework);
+            set.pending_active.swap_remove(pending.extract());
+            // 原生取消申请仍保留舍入容差；PoC 的 native_stake 为零，不扣减代币增长额度。
+            if (set.total_joining_power > (native_stake as u128)) { set.total_joining_power -= (native_stake as u128) }
+            else { set.total_joining_power = 0 };
+            return
+        };
+        let index = find_validator(&set.active_validators, pool_address);
+        assert!(index.is_some(), error::invalid_state(ENOT_VALIDATOR));
+        if (is_poc_enabled()) {
+            let epoch = poc_accounting::current_epoch();
+            let target = (epoch as u256) + 1;
+            assert!(target <= (MAX_U64 as u256), error::invalid_state(EINVALID_POC_TARGET));
+            // 使用换届构建器校验替补、人数和权重总和，通过后才记录自主退出并调整队列。
+            let preview = preview_transition(target as u64, timestamp::now_seconds(), option::some(pool_address));
+            assert!(preview.reason == 0, error::invalid_state(EINVALID_POC_TARGET));
+            borrow_global_mut<VoluntaryLeaves>(@topo_framework).requests.add(pool_address, epoch);
+        } else {
+            assert!(set.active_validators.length() > 1, error::invalid_state(ELAST_VALIDATOR));
+        };
+        let set = borrow_global_mut<ValidatorSet>(@topo_framework);
+        let validator = set.active_validators.swap_remove(index.extract());
+        set.pending_inactive.push_back(validator);
+        event::emit(LeaveValidatorSet { pool_address });
     }
 
     /// Returns true if the current validator can still vote in the current epoch.
@@ -1110,13 +2129,12 @@ module topo_framework::stake {
             || validator_state == VALIDATOR_STATUS_PENDING_INACTIVE
     }
 
-    /// Update the validator performance (proposal statistics). This is only called by block::prologue().
-    /// This function cannot abort.
+    /// 区块入口按旧索引累计提案表现，忽略越界索引。
+    /// 计数器达到 u64 上限后再次更新，会以 ECOUNTER_OVERFLOW 回滚整笔事务。
     public(friend) fun update_performance_statistics(
         proposer_index: Option<u64>, failed_proposer_indices: vector<u64>
     ) acquires ValidatorPerformance {
-        // Validator set cannot change until the end of the epoch, so the validator index in arguments should
-        // match with those of the validators in ValidatorPerformance resource.
+        // 新 Epoch 安装前，待退出成员仍按原索引累计表现。
         let validator_perf = borrow_global_mut<ValidatorPerformance>(@topo_framework);
         let validator_len = validator_perf.validators.length();
 
@@ -1124,16 +2142,13 @@ module topo_framework::stake {
             update ghost_valid_perf = validator_perf;
             update ghost_proposer_idx = proposer_index;
         };
-        // proposer_index is an option because it can be missing (for NilBlocks)
+        // NilBlock 可能没有提案者，因此 proposer_index 使用 Option。
         if (proposer_index.is_some()) {
             let cur_proposer_index = proposer_index.extract();
-            // Here, and in all other vector::borrow, skip any validator indices that are out of bounds,
-            // this ensures that this function doesn't abort if there are out of bounds errors.
+            // 跳过越界索引；有效索引仍须检查计数器递增是否超出 u64 范围。
             if (cur_proposer_index < validator_len) {
                 let validator = validator_perf.validators.borrow_mut(cur_proposer_index);
-                spec {
-                    assume validator.successful_proposals + 1 <= MAX_U64;
-                };
+                assert!(validator.successful_proposals < (MAX_U64 as u64), error::out_of_range(ECOUNTER_OVERFLOW));
                 validator.successful_proposals += 1;
             };
         };
@@ -1142,162 +2157,61 @@ module topo_framework::stake {
         let f_len = failed_proposer_indices.length();
         while ({
             spec {
+                invariant f <= f_len;
                 invariant len(validator_perf.validators) == validator_len;
-                invariant (
-                    ghost_proposer_idx.is_some()
-                        && ghost_proposer_idx.borrow() < validator_len
-                ) ==>
-                    (
-                        validator_perf.validators[ghost_proposer_idx.borrow()].successful_proposals ==
-                        ghost_valid_perf.validators[ghost_proposer_idx.borrow()].successful_proposals
-                        + 1
-                    );
+                invariant forall i in 0..validator_len:
+                    validator_perf.validators[i].failed_proposals == ghost_valid_perf.validators[i].failed_proposals
+                        + spec_failure_count(failed_proposer_indices, i, f);
+                invariant forall i in 0..validator_len:
+                    validator_perf.validators[i].successful_proposals == ghost_valid_perf.validators[i].successful_proposals
+                        + if (option::is_some(ghost_proposer_idx) && option::borrow(ghost_proposer_idx) == i) { 1 } else { 0 };
             };
             f < f_len
         }) {
             let validator_index = failed_proposer_indices[f];
             if (validator_index < validator_len) {
-                let validator = validator_perf.validators.borrow_mut(validator_index);
                 spec {
-                    assume validator.failed_proposals + 1 <= MAX_U64;
+                    assert spec_failure_count(failed_proposer_indices, validator_index, f + 1)
+                        == spec_failure_count(failed_proposer_indices, validator_index, f) + 1;
                 };
+                let validator = validator_perf.validators.borrow_mut(validator_index);
+                assert!(validator.failed_proposals < (MAX_U64 as u64), error::out_of_range(ECOUNTER_OVERFLOW));
                 validator.failed_proposals += 1;
             };
             f += 1;
         };
     }
 
-    /// Triggered during a reconfiguration. This function shouldn't abort.
+    /// PoC 准备前在此安装原生 Epoch；准备后统一通过计划提交。
     ///
-    /// Full epoch transition sequence:
-    ///
-    /// Phase 1 — Reward & fee distribution (active + pending_inactive validators):
-    ///   For each validator:
-    ///   a. update_stake_pool: merge pending_active coins into active; unlock pending_inactive if lockup expired
-    ///   b. collect_transaction_fee_for_validator: drain the fee aggregator for this validator index
-    ///   c. staking_registry::distribute_transaction_fees: split fees among delegators by power share
-    ///   d. staking_registry::distribute_epoch_rewards: mint and distribute staking rewards
-    ///
-    /// Phase 2 — POC power period advancement:
-    ///   poc_power_store::commit_next_period_if_boundary: if this epoch crosses a period boundary,
-    ///   advance current_period so staged power versions become effective.
-    ///
-    /// Phase 3 — Force-undelegate below-threshold users:
-    ///   For every pool (active, pending_inactive, pending_active):
-    ///   staking_registry::force_undelegate_below_threshold: eject delegators whose effective power
-    ///   has dropped below the maintain threshold (due to POC power decay or deposit withdrawal).
-    ///
-    /// Phase 4 — Validator set state transitions:
-    ///   - pending_active validators → ACTIVE in staking_registry
-    ///   - pending_inactive validators → INACTIVE in staking_registry
-    ///   - Merge pending_active into active_validators; clear pending_inactive
-    ///
-    /// Phase 5 — Recompute active set for next epoch:
-    ///   For each candidate in active_validators:
-    ///   - Recompute voting_power from staking_registry (reflects rewards just distributed)
-    ///   - Keep if voting_power >= minimum_stake; otherwise drop (set INACTIVE)
-    ///
-    /// Phase 6 — Emergency liveness fallback:
-    ///   If the resulting active set is empty (no validator meets minimum_stake),
-    ///   retain a positive-voting-power active set to keep the chain alive.
-    ///   Emit ValidatorSetLivenessFallback event to signal the critical condition.
-    ///
-    /// Phase 7 — Housekeeping:
-    ///   - Reset total_joining_power to 0
-    ///   - Update total_staked_power in staking_registry
-    ///   - Reassign validator indices; reset performance counters
-    ///   - Renew lockups for validators remaining in the active set
-    ///   - Rebuild PendingTransactionFee aggregator map for the new active set
-    ///   - Optionally update rewards rate (periodical_reward_rate_decrease feature)
-    public(friend) fun on_new_epoch() acquires PendingTransactionFee, StakePool, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+    /// 先向在任和待退出成员分发费用并结算奖励，再处理待加入本金和到期退出本金。
+    /// 新委员会接纳合格待加入者、移除待退出者，并按原生本金更新投票权重。
+    public(friend) fun on_new_epoch() acquires PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        assert!(!is_poc_prepared(), error::invalid_state(EPLAN_MISMATCH));
         let validator_set = borrow_global_mut<ValidatorSet>(@topo_framework);
         let config = staking_config::get();
         let validator_perf = borrow_global_mut<ValidatorPerformance>(@topo_framework);
 
-        let (rewards_rate, rewards_rate_denominator) =
-            staking_config::get_reward_rate(&config);
+        // 在任和待退出成员都按原表现索引结算当前 Epoch 的奖励。
+        settle_native_voters(validator_perf, &validator_set.active_validators, &config);
+        settle_native_voters(validator_perf, &validator_set.pending_inactive, &config);
 
-        // Process pending stake and distribute transaction fees and rewards for each currently active validator.
-        validator_set.active_validators.for_each_ref(|validator| {
-            let validator: &ValidatorInfo = validator;
-            update_stake_pool(validator_perf, validator.addr, &config);
-            let validator_config = borrow_global<ValidatorConfig>(validator.addr);
-            let current_perf =
-                validator_perf.validators.borrow(validator_config.validator_index);
-            let num_successful_proposals = current_perf.successful_proposals;
-            let num_total_proposals =
-                current_perf.successful_proposals + current_perf.failed_proposals;
-            let fee_amount =
-                collect_transaction_fee_for_validator(validator_config.validator_index);
-            if (std::features::is_distribute_transaction_fee_enabled() && fee_amount > 0) {
-                staking_registry::distribute_transaction_fees(
-                    validator.addr,
-                    fee_amount,
-                );
-                event::emit(DistributeTransactionFee { pool_address: validator.addr, fee_amount });
-            };
-            staking_registry::distribute_epoch_rewards(
-                validator.addr,
-                num_successful_proposals,
-                num_total_proposals,
-                rewards_rate,
-                rewards_rate_denominator,
-            );
-        });
-
-        // Process pending stake and distribute transaction fees and rewards for each currently pending_inactive validator
-        // (requested to leave but not removed yet).
-        validator_set.pending_inactive.for_each_ref(|validator| {
-            let validator: &ValidatorInfo = validator;
-            update_stake_pool(validator_perf, validator.addr, &config);
-            let validator_config = borrow_global<ValidatorConfig>(validator.addr);
-            let current_perf =
-                validator_perf.validators.borrow(validator_config.validator_index);
-            let num_successful_proposals = current_perf.successful_proposals;
-            let num_total_proposals =
-                current_perf.successful_proposals + current_perf.failed_proposals;
-            let fee_amount =
-                collect_transaction_fee_for_validator(validator_config.validator_index);
-            if (std::features::is_distribute_transaction_fee_enabled() && fee_amount > 0) {
-                staking_registry::distribute_transaction_fees(
-                    validator.addr,
-                    fee_amount,
-                );
-                event::emit(DistributeTransactionFee { pool_address: validator.addr, fee_amount });
-            };
-            staking_registry::distribute_epoch_rewards(
-                validator.addr,
-                num_successful_proposals,
-                num_total_proposals,
-                rewards_rate,
-                rewards_rate_denominator,
-            );
-        });
-
-        poc_power_store::commit_next_period_if_boundary();
-        validator_set.active_validators.for_each_ref(|validator| {
-            let validator: &ValidatorInfo = validator;
-            staking_registry::force_undelegate_below_threshold(validator.addr);
-        });
-        validator_set.pending_inactive.for_each_ref(|validator| {
-            let validator: &ValidatorInfo = validator;
-            staking_registry::force_undelegate_below_threshold(validator.addr);
-        });
+        // Settle expired pending_inactive for pending_active validators before activating them.
+        // update_stake_pool is not called for pending_active validators, so without this step
+        // their expired pending_inactive would be incorrectly counted as voting power, causing
+        // a mismatch with the DKG validator set (which excludes expired pending_inactive) and
+        // an out-of-bounds panic in the epoch manager.
         validator_set.pending_active.for_each_ref(|validator| {
             let validator: &ValidatorInfo = validator;
-            staking_registry::force_undelegate_below_threshold(validator.addr);
+            let stake_pool = borrow_global_mut<StakePool>(validator.addr);
+            if (stake_pool.locked_until_secs > 0
+                && get_reconfig_start_time_secs() >= stake_pool.locked_until_secs) {
+                coin::merge(
+                    &mut stake_pool.inactive,
+                    coin::extract_all(&mut stake_pool.pending_inactive)
+                );
+            };
         });
-
-        validator_set.pending_active.for_each_ref(|validator| {
-            let validator: &ValidatorInfo = validator;
-            staking_registry::set_validator_active(validator.addr);
-        });
-        validator_set.pending_inactive.for_each_ref(|validator| {
-            let validator: &ValidatorInfo = validator;
-            staking_registry::set_validator_inactive(validator.addr);
-        });
-
-        let previous_active_count = validator_set.active_validators.length();
 
         // Activate currently pending_active validators.
         append(&mut validator_set.active_validators, &mut validator_set.pending_active);
@@ -1305,151 +2219,32 @@ module topo_framework::stake {
         // Officially deactivate all pending_inactive validators. They will now no longer receive rewards.
         validator_set.pending_inactive = vector::empty();
 
-        // Update active validator set so that network address/public key change takes effect.
-        // Moreover, recalculate the total voting power, and deactivate the validator whose
-        // voting power is less than the minimum required stake.
-        let next_epoch_validators = vector::empty();
-        let (minimum_stake, maximum_stake) = staking_config::get_required_stake(&config);
-        let voting_power_increase_limit =
-            staking_config::get_voting_power_increase_limit(&config);
-        let max_voting_power_increase =
-            calculate_max_voting_power_increase(
-                validator_set.total_voting_power,
-                voting_power_increase_limit,
-            );
-        let used_voting_power_increase = 0u128;
-        let vlen = validator_set.active_validators.length();
-        let total_voting_power = 0;
-        let dropped_validators = vector[];
-        let i = 0;
-        while ({
-            spec {
-                invariant spec_validators_are_initialized(next_epoch_validators);
-                invariant i <= vlen;
-            };
-            i < vlen
-        }) {
-            let old_validator_info = validator_set.active_validators.borrow_mut(i);
-            let pool_address = old_validator_info.addr;
-            let validator_config = borrow_global<ValidatorConfig>(pool_address);
-            let raw_validator_info =
-                generate_validator_info(pool_address, *validator_config);
-            let baseline_voting_power =
-                if (i < previous_active_count) {
-                    old_validator_info.voting_power
-                } else {
-                    0
-                };
-            let new_validator_info =
-                cap_validator_info_voting_power_for_epoch(
-                    raw_validator_info,
-                    maximum_stake,
-                    baseline_voting_power,
-                    max_voting_power_increase,
-                    used_voting_power_increase,
-                );
-
-            // A validator needs at least the min stake required to join the validator set.
-            if (new_validator_info.voting_power >= minimum_stake) {
-                used_voting_power_increase += voting_power_increase(
-                    baseline_voting_power,
-                    new_validator_info.voting_power,
-                );
-                spec {
-                    assume total_voting_power + new_validator_info.voting_power
-                        <= MAX_U128;
-                };
-                total_voting_power +=(new_validator_info.voting_power as u128);
-                next_epoch_validators.push_back(new_validator_info);
-            } else {
-                dropped_validators.push_back(pool_address);
-            };
-            i += 1;
-        };
-
-        // In the extreme case where the next epoch validator election produces an empty set
-        // (i.e. no staker satisfies the minimum stake or participation requirements), retain a
-        // last-known positive-voting-power active set instead of publishing an empty or zero-power
-        // validator set. A ValidatorSetLivenessFallback event signals this critical governance and
-        // economic security failure.
-        if (!next_epoch_validators.is_empty()) {
-            dropped_validators.for_each_ref(|addr| {
-                staking_registry::set_validator_inactive(*addr);
-            });
-            validator_set.active_validators = next_epoch_validators;
-            validator_set.total_voting_power = total_voting_power;
-        } else {
-            let refreshed_validators = vector::empty();
-            let emergency_total_voting_power = 0u128;
-            let fallback_vlen = validator_set.active_validators.length();
-            let fallback_i = 0;
-            while (fallback_i < fallback_vlen) {
-                let old_validator_info =
-                    validator_set.active_validators.borrow(fallback_i);
-                let pool_address = old_validator_info.addr;
-                let validator_config = &ValidatorConfig[pool_address];
-                let raw_validator_info =
-                    generate_validator_info(pool_address, *validator_config);
-                let baseline_voting_power =
-                    if (fallback_i < previous_active_count) {
-                        old_validator_info.voting_power
-                    } else {
-                        0
-                    };
-                let new_validator_info =
-                    cap_validator_info_voting_power_for_epoch(
-                        raw_validator_info,
-                        maximum_stake,
-                        baseline_voting_power,
-                        max_voting_power_increase,
-                        used_voting_power_increase,
-                    );
-                if (new_validator_info.voting_power > 0) {
-                    used_voting_power_increase += voting_power_increase(
-                        baseline_voting_power,
-                        new_validator_info.voting_power,
-                    );
-                    refreshed_validators.push_back(new_validator_info);
-                    emergency_total_voting_power += (new_validator_info.voting_power as u128);
-                };
-                fallback_i += 1;
-            };
-            if (emergency_total_voting_power > 0) {
-                sync_registry_statuses_to_active_set(
-                    &validator_set.active_validators,
-                    &refreshed_validators,
-                );
-                validator_set.active_validators = refreshed_validators;
-                validator_set.total_voting_power = emergency_total_voting_power;
-            } else {
-                let (snapshot_validators, snapshot_total_voting_power) =
-                    previous_positive_active_validator_snapshot(
-                        &validator_set.active_validators,
-                        previous_active_count,
-                    );
-                sync_registry_statuses_to_active_set(
-                    &validator_set.active_validators,
-                    &snapshot_validators,
-                );
-                validator_set.active_validators = snapshot_validators;
-                validator_set.total_voting_power = snapshot_total_voting_power;
-            };
-            event::emit(
-                ValidatorSetLivenessFallback {
+        // Determine the next-epoch active set: either consume the cached value
+        // produced when reconfig started (async/DKG path), or compute it now from
+        // live state (sync/governance path). The two paths are mutually exclusive,
+        // so we avoid the O(n) per-validator recomputation when the cache exists.
+        let liveness_fallback_event = if (exists<PrecomputedValidatorSet>(@topo_framework)) {
+            let PrecomputedValidatorSet { validator_set: precomputed, is_liveness_fallback } =
+                move_from<PrecomputedValidatorSet>(@topo_framework);
+            *validator_set = precomputed;
+            if (is_liveness_fallback) {
+                let (minimum_stake, _) = staking_config::get_required_stake(&config);
+                option::some(ValidatorSetLivenessFallback {
                     minimum_stake,
                     emergency_validator_count: validator_set.active_validators.length(),
-                    total_emergency_voting_power: validator_set.total_voting_power
-                }
-            );
+                    total_emergency_voting_power: validator_set.total_voting_power,
+                })
+            } else {
+                option::none()
+            }
+        } else {
+            refresh_validator_set_in_place(validator_set, &config)
         };
         validator_set.total_joining_power = 0;
-        let total_staked_power =
-            if (validator_set.total_voting_power > MAX_U64) {
-                MAX_U64 as u64
-            } else {
-                validator_set.total_voting_power as u64
-            };
-        staking_registry::set_total_staked_power(total_staked_power);
+
+        if (liveness_fallback_event.is_some()) {
+            event::emit(liveness_fallback_event.extract());
+        };
 
         // Update validator indices, reset performance scores, and renew lockups.
         validator_perf.validators = vector::empty();
@@ -1459,11 +2254,16 @@ module topo_framework::stake {
         let validator_index = 0;
         while ({
             spec {
-                invariant spec_validators_are_initialized(validator_set.active_validators);
                 invariant len(validator_set.pending_active) == 0;
                 invariant len(validator_set.pending_inactive) == 0;
                 invariant 0 <= validator_index && validator_index <= vlen;
                 invariant vlen == len(validator_set.active_validators);
+                invariant old(exists<PrecomputedValidatorSet>(@topo_framework)) ==>
+                    validator_set.active_validators
+                        == old(global<PrecomputedValidatorSet>(@topo_framework)).validator_set.active_validators;
+                invariant forall i in 0..validator_index:
+                    exists<StakePool>(validator_set.active_validators[i].addr)
+                        && exists<ValidatorConfig>(validator_set.active_validators[i].addr);
                 invariant forall i in 0..validator_index:
                     global<ValidatorConfig>(validator_set.active_validators[i].addr).validator_index
                         < validator_index;
@@ -1527,83 +2327,186 @@ module topo_framework::stake {
         };
     }
 
+    /// Compute the next-epoch active validator set in place from live `StakePool`/`ValidatorConfig` state.
+    /// Used by `on_new_epoch` only on the sync (non-DKG) path; the async/DKG path consumes a
+    /// pre-computed `PrecomputedValidatorSet` instead.
+    /// Returns `Some(ValidatorSetLivenessFallback)` when the freshly-computed set was empty and we
+    /// fell back to retaining the previous active set.
+    fun refresh_validator_set_in_place(
+        validator_set: &mut ValidatorSet,
+        config: &staking_config::StakingConfig,
+    ): Option<ValidatorSetLivenessFallback> acquires StakePool, ValidatorConfig {
+        // Update active validator set so that network address/public key change takes effect.
+        // Moreover, recalculate the total voting power, and deactivate the validator whose
+        // voting power is less than the minimum required stake.
+        let next_epoch_validators = vector::empty();
+        let (minimum_stake, _) = staking_config::get_required_stake(config);
+        let vlen = validator_set.active_validators.length();
+        let total_voting_power = 0;
+        let i = 0;
+        while ({
+            spec {
+                invariant spec_validators_are_initialized(next_epoch_validators);
+                invariant i <= vlen;
+            };
+            i < vlen
+        }) {
+            let old_validator_info = validator_set.active_validators.borrow_mut(i);
+            let pool_address = old_validator_info.addr;
+            let validator_config = borrow_global<ValidatorConfig>(pool_address);
+            let stake_pool = borrow_global<StakePool>(pool_address);
+            let new_validator_info =
+                generate_validator_info(pool_address, stake_pool, *validator_config);
+
+            // A validator needs at least the min stake required to join the validator set.
+            if (new_validator_info.voting_power >= minimum_stake) {
+                spec {
+                    assume total_voting_power + new_validator_info.voting_power
+                        <= MAX_U128;
+                };
+                total_voting_power +=(new_validator_info.voting_power as u128);
+                next_epoch_validators.push_back(new_validator_info);
+            };
+            i += 1;
+        };
+
+        // In the extreme case where the next epoch validator election produces an empty set (i.e., no staker satisfies the minimum stake or participation requirements), the system enters an emergency liveness preservation mode.
+        // Instead of transitioning to an empty validator set—which would render the network inoperable—the protocol retains the previous active validator set and recomputes the total voting power from it.
+        // A ValidatorSetLivenessFallback event is emitted to signal this critical governance and economic security failure.
+        if (!next_epoch_validators.is_empty()) {
+            validator_set.active_validators = next_epoch_validators;
+            validator_set.total_voting_power = total_voting_power;
+            option::none()
+        } else {
+            // We derive the next validator set from the previous epoch's active and pending-active stakers.
+            // If the resulting set is empty, it indicates that no staker is willing or qualified to participate
+            // in consensus anymore. In this case, the chain is considered effectively dead, and we must retain
+            // the previous active validator set as a last-resort liveness fallback.
+            // Recompute each validator's info from current stake (after update_stake_pool) so that
+            // voting_power and total_voting_power reflect rewards, fees, and merged stake—not stale values.
+            let refreshed_validators = vector::empty();
+            let emergency_total_voting_power = 0u128;
+            let fallback_vlen = validator_set.active_validators.length();
+            let fallback_i = 0;
+            while ({
+                spec {
+                    invariant fallback_i <= fallback_vlen;
+                    invariant spec_validators_are_initialized(refreshed_validators);
+                };
+                fallback_i < fallback_vlen
+            }) {
+                let old_validator_info =
+                    validator_set.active_validators.borrow(fallback_i);
+                let pool_address = old_validator_info.addr;
+                let validator_config = &ValidatorConfig[pool_address];
+                let stake_pool = &StakePool[pool_address];
+                let new_validator_info =
+                    generate_validator_info(pool_address, stake_pool, *validator_config);
+                refreshed_validators.push_back(new_validator_info);
+                emergency_total_voting_power +=(new_validator_info.voting_power as u128);
+                fallback_i += 1;
+            };
+            validator_set.active_validators = refreshed_validators;
+            validator_set.total_voting_power = emergency_total_voting_power;
+            option::some(ValidatorSetLivenessFallback {
+                minimum_stake,
+                emergency_validator_count: validator_set.active_validators.length(),
+                total_emergency_voting_power: validator_set.total_voting_power
+            })
+        }
+    }
+
     /// Return the `ValidatorConsensusInfo` of each current validator, sorted by current validator index.
     public fun cur_validator_consensus_infos(): vector<ValidatorConsensusInfo> acquires ValidatorSet {
         let validator_set = borrow_global<ValidatorSet>(@topo_framework);
         validator_consensus_infos_from_validator_set(validator_set)
     }
 
-    public fun get_current_epoch_governance_voting_power(): u64 acquires ValidatorSet {
-        if (!exists<ValidatorSet>(@topo_framework)) {
-            return 0
+    /// Compute simulated next-epoch voting power and ValidatorInfo for a candidate (no stake updates).
+    /// If include_rewards, use validator_perf to add rewards for current validators; pending_active use false.
+    fun compute_simulated_validator_info(
+        candidate: &ValidatorInfo,
+        validator_perf: &ValidatorPerformance,
+        rewards_rate: u64,
+        rewards_rate_denominator: u64,
+        validator_index: u64,
+        include_rewards: bool,
+        cutoff_secs: u64
+    ): (u64, ValidatorInfo) acquires StakePool, ValidatorConfig {
+        let stake_pool = borrow_global<StakePool>(candidate.addr);
+        let cur_active = coin::value(&stake_pool.active);
+        let cur_pending_active = coin::value(&stake_pool.pending_active);
+        let cur_pending_inactive = coin::value(&stake_pool.pending_inactive);
+        let lockup_expired = cutoff_secs >= stake_pool.locked_until_secs;
+        let retained_pending_inactive = if (lockup_expired) { 0 } else { cur_pending_inactive };
+        let (active_reward, pending_inactive_reward) =
+            if (include_rewards && (cur_active > 0 || retained_pending_inactive > 0)) {
+                spec {
+                    assert candidate.config.validator_index
+                        < len(validator_perf.validators);
+                };
+                let cur_perf =
+                    validator_perf.validators.borrow(candidate.config.validator_index);
+                // 两个计数器各自保留完整 u64 范围，相加前先转为 u256。
+                let total_proposals = (cur_perf.successful_proposals as u256)
+                    + (cur_perf.failed_proposals as u256);
+                // 原生结算对两部分本金分别取整；已到期部分连同奖励转为 inactive，不进入目标权重。
+                let active_reward = reward_amount_wide(
+                    cur_active,
+                    cur_perf.successful_proposals,
+                    total_proposals,
+                    rewards_rate,
+                    rewards_rate_denominator
+                );
+                let pending_inactive_reward = reward_amount_wide(
+                    retained_pending_inactive,
+                    cur_perf.successful_proposals,
+                    total_proposals,
+                    rewards_rate,
+                    rewards_rate_denominator
+                );
+                (active_reward, pending_inactive_reward)
+            } else { (0, 0) };
+        spec {
+            assume cur_active + retained_pending_inactive + cur_pending_active
+                + active_reward + pending_inactive_reward <= MAX_U64;
         };
-
-        let cur_validator_set = borrow_global<ValidatorSet>(@topo_framework);
-        let (_, maximum_stake) = staking_config::get_required_stake(&staking_config::get());
-        let total_power = 0u128;
-        cur_validator_set.active_validators.for_each_ref(|validator| {
-            let validator: &ValidatorInfo = validator;
-            total_power += (
-                min_u64(staking_registry::get_validator_total_power(validator.addr), maximum_stake)
-                    as u128
-            );
-        });
-        cur_validator_set.pending_inactive.for_each_ref(|validator| {
-            let validator: &ValidatorInfo = validator;
-            total_power += (
-                min_u64(staking_registry::get_validator_total_power(validator.addr), maximum_stake)
-                    as u128
-            );
-        });
-        if (total_power > MAX_U64) {
-            MAX_U64 as u64
-        } else {
-            total_power as u64
-        }
+        let new_voting_power =
+            cur_active + retained_pending_inactive + cur_pending_active
+                + active_reward + pending_inactive_reward;
+        let config = *borrow_global<ValidatorConfig>(candidate.addr);
+        config.validator_index = validator_index;
+        (
+            new_voting_power,
+            ValidatorInfo { addr: candidate.addr, voting_power: new_voting_power, config }
+        )
     }
 
-    public fun next_validator_consensus_infos(): vector<ValidatorConsensusInfo> acquires PendingTransactionFee, TransactionFeeConfig, ValidatorSet, ValidatorPerformance, ValidatorConfig {
-        let simulated_validator_set = simulate_next_epoch_validator_set();
-        validator_consensus_infos_from_validator_set(&simulated_validator_set)
+    /// Deprecated. Use next_validator_consensus_infos_v2() instead.
+    public fun next_validator_consensus_infos(): vector<ValidatorConsensusInfo>  {
+        abort(error::unavailable(EDEPRECATED))
     }
 
-    fun simulate_next_epoch_validator_set(): ValidatorSet acquires PendingTransactionFee, TransactionFeeConfig, ValidatorSet, ValidatorPerformance, ValidatorConfig {
+    /// 换届启动时读取目标：PoC 准备前按原生规则预计算，准备后只返回已校验的缓存。
+    public(friend) fun next_validator_consensus_infos_v2(): ValidatorSet acquires EpochPlan, InstalledRewardContext, PrecomputedValidatorSet, StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        if (is_poc_prepared()) { return cached_validator_set() };
+        if (exists<PrecomputedValidatorSet>(@topo_framework)) {
+            return borrow_global<PrecomputedValidatorSet>(@topo_framework).validator_set
+        };
+        let (n, d) = staking_config::get_reward_rate(&staking_config::get());
+        let (validator_set, is_liveness_fallback) = compute_native_next_validator_set(n, d, get_reconfig_start_time_secs());
+        move_to(&create_signer::create_signer(@topo_framework),
+            PrecomputedValidatorSet { validator_set, is_liveness_fallback });
+        validator_set
+    }
+
+    /// 按传入的旧 Epoch 奖励率和截止时间只读计算原生目标，保留原生空集合回退规则。
+    fun compute_native_next_validator_set(rewards_rate: u64, rewards_rate_denominator: u64,
+        cutoff_secs: u64): (ValidatorSet, bool) acquires StakePool, ValidatorConfig, ValidatorPerformance, ValidatorSet {
         let cur_validator_set = borrow_global<ValidatorSet>(@topo_framework);
-        let config = staking_config::get();
+        let staking_config = staking_config::get();
         let validator_perf = borrow_global<ValidatorPerformance>(@topo_framework);
-        let simulated_deposit_deltas = simple_map::create<address, u64>();
-        let (minimum_stake, maximum_stake) = staking_config::get_required_stake(&config);
-        let voting_power_increase_limit =
-            staking_config::get_voting_power_increase_limit(&config);
-        let max_voting_power_increase =
-            calculate_max_voting_power_increase(
-                cur_validator_set.total_voting_power,
-                voting_power_increase_limit,
-            );
-        let used_voting_power_increase = 0u128;
-        let (rewards_rate, rewards_rate_denominator) =
-            staking_config::get_reward_rate(&config);
-
-        cur_validator_set.active_validators.for_each_ref(|validator| {
-            let validator: &ValidatorInfo = validator;
-            simulate_epoch_accruals_for_validator(
-                validator.addr,
-                validator_perf,
-                rewards_rate,
-                rewards_rate_denominator,
-                &mut simulated_deposit_deltas,
-            );
-        });
-        cur_validator_set.pending_inactive.for_each_ref(|validator| {
-            let validator: &ValidatorInfo = validator;
-            simulate_epoch_accruals_for_validator(
-                validator.addr,
-                validator_perf,
-                rewards_rate,
-                rewards_rate_denominator,
-                &mut simulated_deposit_deltas,
-            );
-        });
+        let (minimum_stake, _) = staking_config::get_required_stake(&staking_config);
 
         let new_active_validators = vector[];
         let num_new_actives = 0;
@@ -1637,26 +2540,17 @@ module topo_framework::stake {
                         num_candidates - 1 - candidate_idx
                     )
                 };
-            let baseline_voting_power =
-                if (candidate_in_current) {
-                    candidate.voting_power
-                } else {
-                    0
-                };
-            let (new_voting_power, new_validator_info) = compute_simulated_validator_info(
-                candidate,
-                num_new_actives,
-                &simulated_deposit_deltas,
-                maximum_stake,
-                baseline_voting_power,
-                max_voting_power_increase,
-                used_voting_power_increase,
-            );
-            if (new_voting_power >= minimum_stake) {
-                used_voting_power_increase += voting_power_increase(
-                    baseline_voting_power,
-                    new_voting_power,
+            let (new_voting_power, new_validator_info) =
+                compute_simulated_validator_info(
+                    candidate,
+                    validator_perf,
+                    rewards_rate,
+                    rewards_rate_denominator,
+                    num_new_actives,
+                    candidate_in_current,
+                    cutoff_secs
                 );
+            if (new_voting_power >= minimum_stake) {
                 spec {
                     assume new_total_power + new_voting_power <= MAX_U128;
                 };
@@ -1669,10 +2563,21 @@ module topo_framework::stake {
 
         // Mirror on_new_epoch's empty-validator-set fallback: active then pending_active.
         // append() uses pop_back so pending_active ends up in reverse order; match that here.
+        let is_liveness_fallback = false;
         if (new_active_validators.is_empty()
             && (num_cur_actives > 0 || num_cur_pending_actives > 0)) {
             let num_fallback = num_cur_actives + num_cur_pending_actives;
-            for (fallback_idx in 0..num_fallback) {
+            let fallback_idx = 0;
+            while ({
+                spec {
+                    invariant fallback_idx <= num_fallback;
+                    invariant len(new_active_validators) == fallback_idx;
+                    invariant spec_validators_are_initialized(new_active_validators);
+                    invariant forall i in 0..len(new_active_validators):
+                        new_active_validators[i].config.validator_index == i;
+                };
+                fallback_idx < num_fallback
+            }) {
                 let in_active = fallback_idx < num_cur_actives;
                 let candidate =
                     if (in_active) {
@@ -1682,32 +2587,20 @@ module topo_framework::stake {
                             num_fallback - 1 - fallback_idx
                         )
                     };
-                let (new_voting_power, new_validator_info) = compute_simulated_validator_info(
-                    candidate,
-                    new_active_validators.length(),
-                    &simulated_deposit_deltas,
-                    maximum_stake,
-                    if (in_active) { candidate.voting_power } else { 0 },
-                    max_voting_power_increase,
-                    used_voting_power_increase,
-                );
-                used_voting_power_increase += voting_power_increase(
-                    if (in_active) { candidate.voting_power } else { 0 },
-                    new_voting_power,
-                );
-                if (new_voting_power > 0) {
-                    new_active_validators.push_back(new_validator_info);
-                    new_total_power += (new_voting_power as u128);
-                };
-            };
-            if (new_total_power == 0) {
-                let (snapshot_validators, snapshot_total_voting_power) =
-                    previous_positive_active_validator_snapshot(
-                        &cur_validator_set.active_validators,
-                        num_cur_actives,
+                let (new_voting_power, new_validator_info) =
+                    compute_simulated_validator_info(
+                        candidate,
+                        validator_perf,
+                        rewards_rate,
+                        rewards_rate_denominator,
+                        new_active_validators.length(),
+                        in_active,
+                        cutoff_secs
                     );
-                new_active_validators = snapshot_validators;
-                new_total_power = snapshot_total_voting_power;
+                new_active_validators.push_back(new_validator_info);
+                new_total_power +=(new_voting_power as u128);
+                is_liveness_fallback = true;
+                fallback_idx += 1;
             };
         };
 
@@ -1720,288 +2613,16 @@ module topo_framework::stake {
             total_joining_power: 0
         };
 
-        new_validator_set
+        (new_validator_set, is_liveness_fallback)
     }
 
-    fun compute_simulated_validator_info(
-        candidate: &ValidatorInfo,
-        validator_index: u64,
-        simulated_deposit_deltas: &SimpleMap<address, u64>,
-        maximum_stake: u64,
-        baseline_voting_power: u64,
-        max_voting_power_increase: u128,
-        used_voting_power_increase: u128,
-    ): (u64, ValidatorInfo) acquires ValidatorConfig {
-        let raw_voting_power = get_validator_total_power_with_extra_deposit_for_next_epoch(
-            candidate.addr,
-            simulated_deposit_deltas,
-        );
-        let new_voting_power = cap_voting_power_for_epoch(
-            raw_voting_power,
-            maximum_stake,
-            baseline_voting_power,
-            max_voting_power_increase,
-            used_voting_power_increase,
-        );
-        let config = *borrow_global<ValidatorConfig>(candidate.addr);
-        config.validator_index = validator_index;
-        (
-            new_voting_power,
-            ValidatorInfo { addr: candidate.addr, voting_power: new_voting_power, config }
-        )
-    }
-
-    fun previous_positive_active_validator_snapshot(
-        candidates: &vector<ValidatorInfo>,
-        previous_active_count: u64,
-    ): (vector<ValidatorInfo>, u128) acquires ValidatorConfig {
-        let snapshot_validators = vector[];
-        let snapshot_total_voting_power = 0u128;
-        let len = candidates.length();
-        let i = 0;
-        while ({
-            spec {
-                invariant i <= len;
-                invariant spec_validators_are_initialized(snapshot_validators);
-            };
-            i < len
-        }) {
-            if (i < previous_active_count) {
-                let candidate = candidates.borrow(i);
-                if (candidate.voting_power > 0) {
-                    let config = *borrow_global<ValidatorConfig>(candidate.addr);
-                    config.validator_index = snapshot_validators.length();
-                    snapshot_validators.push_back(ValidatorInfo {
-                        addr: candidate.addr,
-                        voting_power: candidate.voting_power,
-                        config,
-                    });
-                    snapshot_total_voting_power += (candidate.voting_power as u128);
-                };
-            };
-            i += 1;
-        };
-        (snapshot_validators, snapshot_total_voting_power)
-    }
-
-    fun sync_registry_statuses_to_active_set(
-        candidates: &vector<ValidatorInfo>,
-        active_set: &vector<ValidatorInfo>,
-    ) {
-        let len = candidates.length();
-        let i = 0;
-        while (i < len) {
-            let candidate = candidates.borrow(i);
-            if (find_validator(active_set, candidate.addr).is_some()) {
-                staking_registry::set_validator_active(candidate.addr);
-            } else {
-                staking_registry::set_validator_inactive(candidate.addr);
-            };
-            i += 1;
-        }
-    }
-
-    fun simulate_epoch_accruals_for_validator(
-        validator_address: address,
-        validator_perf: &ValidatorPerformance,
-        rewards_rate: u64,
-        rewards_rate_denominator: u64,
-        simulated_deposit_deltas: &mut SimpleMap<address, u64>,
-    ) acquires PendingTransactionFee, TransactionFeeConfig, ValidatorConfig {
-        let validator_config = borrow_global<ValidatorConfig>(validator_address);
-        let current_perf =
-            validator_perf.validators.borrow(validator_config.validator_index);
-        let num_successful_proposals = current_perf.successful_proposals;
-        let num_total_proposals =
-            current_perf.successful_proposals + current_perf.failed_proposals;
-        let fee_amount =
-            get_pending_transaction_fee_for_validator(validator_config.validator_index);
-        if (fee_amount > 0) {
-            simulate_fee_distribution_for_validator(
-                validator_address,
-                fee_amount,
-                simulated_deposit_deltas,
-            );
-        };
-        simulate_reward_distribution_for_validator(
-            validator_address,
-            num_successful_proposals,
-            num_total_proposals,
-            rewards_rate,
-            rewards_rate_denominator,
-            simulated_deposit_deltas,
-        );
-    }
-
-    fun simulate_reward_distribution_for_validator(
-        validator_address: address,
-        num_successful_proposals: u64,
-        num_total_proposals: u64,
-        rewards_rate: u64,
-        rewards_rate_denominator: u64,
-        simulated_deposit_deltas: &mut SimpleMap<address, u64>,
-    ) {
-        let current_pool_power = staking_registry::get_validator_total_power(validator_address);
-        if (current_pool_power == 0) {
-            return
-        };
-
-        let (_, maximum_stake) = staking_config::get_required_stake(&staking_config::get());
-        let epoch_reward = calculate_rewards_amount(
-            min_u64(current_pool_power, maximum_stake),
-            num_successful_proposals,
-            num_total_proposals,
-            rewards_rate,
-            rewards_rate_denominator,
-        );
-        if (epoch_reward == 0) {
-            return
-        };
-        simulate_registry_distribution_for_validator(
-            validator_address,
-            epoch_reward,
-            false,
-            simulated_deposit_deltas,
-        );
-    }
-
-    fun simulate_fee_distribution_for_validator(
-        validator_address: address,
-        fee_amount_octa: u64,
-        simulated_deposit_deltas: &mut SimpleMap<address, u64>,
-    ) {
-        if (fee_amount_octa == 0) {
-            return
-        };
-        simulate_registry_distribution_for_validator(
-            validator_address,
-            fee_amount_octa,
-            false,
-            simulated_deposit_deltas,
-        );
-    }
-
-    fun simulate_registry_distribution_for_validator(
-        validator_address: address,
-        total_amount_octa: u64,
-        use_next_epoch_power: bool,
-        simulated_deposit_deltas: &mut SimpleMap<address, u64>,
-    ) {
-        if (total_amount_octa == 0) {
-            return
-        };
-
-        let owner_address = staking_registry::get_validator_owner(validator_address);
-        let commission_bps = staking_registry::get_validator_commission_bps(validator_address);
-        let (member_addresses, member_effective_powers, pool_power) =
-            if (use_next_epoch_power) {
-                staking_registry::get_validator_member_powers_for_next_epoch(
-                    validator_address,
-                    simulated_deposit_deltas,
-                )
-            } else {
-                staking_registry::get_validator_member_powers_with_current_power(
-                    validator_address,
-                    simulated_deposit_deltas,
-                )
-            };
-        if (pool_power == 0) {
-            return
-        };
-
-        let commission = (((total_amount_octa as u128) * (commission_bps as u128)) / 10000) as u64;
-        let distributable = total_amount_octa - commission;
-        let distributed = 0u64;
-        let len = member_addresses.length();
-        let i = 0;
-        while (i < len) {
-            let member = *member_addresses.borrow(i);
-            let member_power = *member_effective_powers.borrow(i);
-            if (member_power > 0) {
-                let reward =
-                    (((distributable as u128) * (member_power as u128)) / (pool_power as u128))
-                        as u64;
-                if (reward > 0) {
-                    add_simulated_deposit_delta(simulated_deposit_deltas, member, reward);
-                };
-                distributed += reward;
-            };
-            i += 1;
-        };
-
-        let owner_reward = commission + (distributable - distributed);
-        if (owner_reward > 0) {
-            add_simulated_deposit_delta(simulated_deposit_deltas, owner_address, owner_reward);
-        };
-    }
-
-    fun get_validator_total_power_with_extra_deposit_for_next_epoch(
-        validator_address: address,
-        simulated_deposit_deltas: &SimpleMap<address, u64>,
-    ): u64 {
-        let (_, _, total_power) = staking_registry::get_validator_member_powers_for_next_epoch(
-            validator_address,
-            simulated_deposit_deltas,
-        );
-        total_power
-    }
-
-    fun add_simulated_deposit_delta(
-        simulated_deposit_deltas: &mut SimpleMap<address, u64>,
-        user: address,
-        amount: u64,
-    ) {
-        if (amount == 0) {
-            return
-        };
-
-        if (simulated_deposit_deltas.contains_key(&user)) {
-            let current = simulated_deposit_deltas.borrow_mut(&user);
-            *current = *current + amount;
-        } else {
-            simulated_deposit_deltas.add(user, amount);
-        };
-    }
-
-    fun get_pending_transaction_fee_for_validator(
-        validator_index: u64
-    ): u64 acquires PendingTransactionFee, TransactionFeeConfig {
-        if (!exists<PendingTransactionFee>(@topo_framework)) {
-            return 0
-        };
-
-        let fee_limit =
-            if (exists<TransactionFeeConfig>(@topo_framework)) {
-                let TransactionFeeConfig::V0 { max_fee_octa_allowed_per_epoch_per_pool } =
-                    borrow_global<TransactionFeeConfig>(@topo_framework);
-                *max_fee_octa_allowed_per_epoch_per_pool
-            } else {
-                MAX_U64 as u64
-            };
-        let pending_fee_by_validator =
-            &borrow_global<PendingTransactionFee>(@topo_framework).pending_fee_by_validator;
-        if (!pending_fee_by_validator.contains(&validator_index)) {
-            return 0
-        };
-
-        let fee_octa = pending_fee_by_validator.borrow(&validator_index).read();
-        if (fee_octa > fee_limit) {
-            fee_limit
-        } else {
-            fee_octa
-        }
-    }
-
-    fun validator_consensus_infos_from_validator_set(
+    friend fun validator_consensus_infos_from_validator_set(
         validator_set: &ValidatorSet
     ): vector<ValidatorConsensusInfo> {
         let validator_consensus_infos = vector[];
 
         let num_active = validator_set.active_validators.length();
         let num_pending_inactive = validator_set.pending_inactive.length();
-        spec {
-            assume num_active + num_pending_inactive <= MAX_U64;
-        };
         let total = num_active + num_pending_inactive;
 
         // Pre-fill the return value with dummy values.
@@ -2032,47 +2653,43 @@ module topo_framework::stake {
             );
         };
 
-        validator_set.active_validators.for_each_ref(
-            |obj| {
-                let vi: &ValidatorInfo = obj;
-                spec {
-                    assume len(validator_consensus_infos)
-                        == len(validator_set.active_validators)
-                            + len(validator_set.pending_inactive);
-                    assert vi.config.validator_index < len(validator_consensus_infos);
-                };
-                let vci = validator_consensus_infos.borrow_mut(vi.config.validator_index);
-                *vci = validator_consensus_info::new(
-                    vi.addr, vi.config.consensus_pubkey, vi.voting_power
-                );
-                spec {
-                    assert len(validator_consensus_infos)
-                        == len(validator_set.active_validators)
-                            + len(validator_set.pending_inactive);
-                };
-            }
-        );
+        idx = 0;
+        while ({
+            spec {
+                invariant idx <= len(validator_set.active_validators);
+                invariant len(validator_consensus_infos) == total;
+                invariant spec_target_indices(validator_set) ==>
+                    (forall i in 0..idx:
+                        spec_consensus_info_matches(
+                            validator_consensus_infos[i], validator_set.active_validators[i]));
+            };
+            idx < num_active
+        }) {
+            let vi = &validator_set.active_validators[idx];
+            validator_consensus_infos[vi.config.validator_index] = validator_consensus_info::new(
+                vi.addr, vi.config.consensus_pubkey, vi.voting_power
+            );
+            idx += 1;
+        };
 
-        validator_set.pending_inactive.for_each_ref(
-            |obj| {
-                let vi: &ValidatorInfo = obj;
-                spec {
-                    assume len(validator_consensus_infos)
-                        == len(validator_set.active_validators)
-                            + len(validator_set.pending_inactive);
-                    assert vi.config.validator_index < len(validator_consensus_infos);
-                };
-                let vci = validator_consensus_infos.borrow_mut(vi.config.validator_index);
-                *vci = validator_consensus_info::new(
-                    vi.addr, vi.config.consensus_pubkey, vi.voting_power
-                );
-                spec {
-                    assert len(validator_consensus_infos)
-                        == len(validator_set.active_validators)
-                            + len(validator_set.pending_inactive);
-                };
-            }
-        );
+        idx = 0;
+        while ({
+            spec {
+                invariant idx <= len(validator_set.pending_inactive);
+                invariant len(validator_consensus_infos) == total;
+                invariant spec_target_indices(validator_set) ==>
+                    (forall i in 0..len(validator_set.active_validators):
+                        spec_consensus_info_matches(
+                            validator_consensus_infos[i], validator_set.active_validators[i]));
+            };
+            idx < num_pending_inactive
+        }) {
+            let vi = &validator_set.pending_inactive[idx];
+            validator_consensus_infos[vi.config.validator_index] = validator_consensus_info::new(
+                vi.addr, vi.config.consensus_pubkey, vi.voting_power
+            );
+            idx += 1;
+        };
 
         validator_consensus_infos
     }
@@ -2084,25 +2701,103 @@ module topo_framework::stake {
         })
     }
 
-    /// Advance the coin buckets in a StakePool at epoch boundary.
+    /// 按原队列顺序结算原生投票池，调用期间不重建索引或变更委员会。
+    fun settle_native_voters(performance: &ValidatorPerformance, validators: &vector<ValidatorInfo>, config: &StakingConfig)
+    acquires PendingTransactionFee, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig {
+        let i = 0;
+        while ({
+            spec {
+                invariant i <= len(validators);
+                invariant exists<coin::CoinInfo<TopoCoin>>(@topo_framework);
+            };
+            i < validators.length()
+        }) {
+            update_stake_pool(performance, validators[i].addr, config);
+            i += 1;
+        }
+    }
+
+    /// PoC 准备前，按原生规则结算 Epoch 奖励、分发费用并处理本金。
     ///
-    /// This function handles the coin-level state transitions within the StakePool struct.
-    /// Note: actual economic rewards are handled by staking_registry, not here.
-    ///
-    /// Transitions:
-    /// - pending_active → active (always, at every epoch boundary)
-    /// - pending_inactive → inactive (only if locked_until_secs <= reconfig_start_time)
-    ///   If the lockup has not yet expired, pending_inactive coins remain locked for another epoch.
-    ///
-    /// This function should not abort; it is called inside on_new_epoch which must complete.
+    /// 对 active 和 pending_inactive 分别分发费用、计算奖励，再处理待加入和到期退出本金。
     fun update_stake_pool(
         validator_perf: &ValidatorPerformance,
         pool_address: address,
         staking_config: &StakingConfig
-    ) acquires StakePool {
-        let _unused_validator_perf = validator_perf;
-        let _unused_staking_config = staking_config;
+    ) acquires PendingTransactionFee, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig {
         let stake_pool = borrow_global_mut<StakePool>(pool_address);
+        let validator_config = borrow_global<ValidatorConfig>(pool_address);
+        let validator_index = validator_config.validator_index;
+        let cur_validator_perf = validator_perf.validators.borrow(validator_index);
+        let num_successful_proposals = cur_validator_perf.successful_proposals;
+
+        let fee_pending_inactive = 0;
+        let fee_active = 0;
+        let fee_limit = transaction_fee_limit();
+
+        if (exists<PendingTransactionFee>(@topo_framework)) {
+            let pending_fee_by_validator =
+                &mut borrow_global_mut<PendingTransactionFee>(@topo_framework).pending_fee_by_validator;
+            if (pending_fee_by_validator.contains(&validator_index)) {
+                let fee_octa = pending_fee_by_validator.remove(&validator_index).read();
+                if (fee_octa > fee_limit) {
+                    fee_octa = fee_limit;
+                };
+                let stake_active = (coin::value(&stake_pool.active) as u128);
+                let stake_pending_inactive =
+                    (coin::value(&stake_pool.pending_inactive) as u128);
+                fee_pending_inactive =
+                    (
+                        ((fee_octa as u128) * stake_pending_inactive
+                            / (stake_active + stake_pending_inactive)) as u64
+                    );
+                fee_active = fee_octa - fee_pending_inactive;
+            }
+        };
+
+        let num_total_proposals = (cur_validator_perf.successful_proposals as u256)
+            + (cur_validator_perf.failed_proposals as u256);
+        let (rewards_rate, rewards_rate_denominator) =
+            staking_config::get_reward_rate(staking_config);
+        let rewards_active =
+            distribute_rewards(
+                &mut stake_pool.active,
+                num_successful_proposals,
+                num_total_proposals,
+                rewards_rate,
+                rewards_rate_denominator
+            );
+        let rewards_pending_inactive =
+            distribute_rewards(
+                &mut stake_pool.pending_inactive,
+                num_successful_proposals,
+                num_total_proposals,
+                rewards_rate,
+                rewards_rate_denominator
+            );
+        spec {
+            assume rewards_active + rewards_pending_inactive <= MAX_U64;
+        };
+
+        if (std::features::is_distribute_transaction_fee_enabled()) {
+            let mint_cap =
+                &borrow_global<TopoCoinCapabilities>(@topo_framework).mint_cap;
+            if (fee_active > 0) {
+                coin::merge(&mut stake_pool.active, coin::mint(fee_active, mint_cap));
+            };
+            if (fee_pending_inactive > 0) {
+                coin::merge(
+                    &mut stake_pool.pending_inactive,
+                    coin::mint(fee_pending_inactive, mint_cap)
+                );
+            };
+            let fee_amount = fee_active + fee_pending_inactive;
+            if (fee_amount > 0) {
+                event::emit(DistributeTransactionFee { pool_address, fee_amount });
+            };
+        };
+
+        let rewards_amount = rewards_active + rewards_pending_inactive;
         // Pending active stake can now be active.
         coin::merge(
             &mut stake_pool.active, coin::extract_all(&mut stake_pool.pending_active)
@@ -2116,80 +2811,45 @@ module topo_framework::stake {
                 coin::extract_all(&mut stake_pool.pending_inactive)
             );
         };
-    }
 
-    fun collect_transaction_fee_for_validator(
-        validator_index: u64
-    ): u64 acquires PendingTransactionFee, TransactionFeeConfig {
-        if (!exists<PendingTransactionFee>(@topo_framework)) {
-            return 0
-        };
-
-        let fee_limit =
-            if (exists<TransactionFeeConfig>(@topo_framework)) {
-                let TransactionFeeConfig::V0 { max_fee_octa_allowed_per_epoch_per_pool } =
-                    borrow_global<TransactionFeeConfig>(@topo_framework);
-                *max_fee_octa_allowed_per_epoch_per_pool
-            } else {
-                MAX_U64 as u64
-            };
-        let pending_fee_by_validator =
-            &mut borrow_global_mut<PendingTransactionFee>(@topo_framework).pending_fee_by_validator;
-        if (!pending_fee_by_validator.contains(&validator_index)) {
-            return 0
-        };
-
-        let fee_octa = pending_fee_by_validator.remove(&validator_index).read();
-        if (fee_octa > fee_limit) {
-            fee_limit
-        } else {
-            fee_octa
-        }
+        event::emit(DistributeRewards { pool_address, rewards_amount });
     }
 
     /// Assuming we are in a middle of a reconfiguration (no matter it is immediate or async), get its start time.
     fun get_reconfig_start_time_secs(): u64 {
-        if (reconfiguration_state::is_initialized()) {
+        if (reconfiguration_state::is_in_progress()) {
             reconfiguration_state::start_time_secs()
         } else {
             timestamp::now_seconds()
         }
     }
 
-    /// Calculate the rewards amount for a stake pool based on performance and rate.
-    ///
-    /// Formula: reward = stake_amount * rewards_rate * num_successful_proposals
-    ///                   / (rewards_rate_denominator * num_total_proposals)
-    ///
-    /// The performance multiplier (num_successful / num_total) penalizes validators that
-    /// miss proposals. A validator that proposes 90% of its assigned slots earns 90% of
-    /// the maximum reward for its stake weight.
-    ///
-    /// All arithmetic uses u128 to avoid overflow before the final division.
-    fun calculate_rewards_amount(
-        stake_amount: u64,
+    /// Mint rewards corresponding to current epoch's `stake` and `num_successful_votes`.
+    fun distribute_rewards(
+        stake: &mut Coin<TopoCoin>,
         num_successful_proposals: u64,
-        num_total_proposals: u64,
+        num_total_proposals: u256,
         rewards_rate: u64,
         rewards_rate_denominator: u64
-    ): u64 {
-        spec {
-            // The following condition must hold because
-            // (1) num_successful_proposals <= num_total_proposals, and
-            // (2) `num_total_proposals` cannot be larger than 86400, the maximum number of proposals
-            //     in a day (1 proposal per second), and `num_total_proposals` is reset to 0 every epoch.
-            assume num_successful_proposals * MAX_REWARDS_RATE <= MAX_U64;
+    ): u64 acquires TopoCoinCapabilities {
+        let stake_amount = coin::value(stake);
+        let rewards_amount =
+            if (stake_amount > 0) {
+                reward_amount_wide(
+                    stake_amount,
+                    num_successful_proposals,
+                    num_total_proposals,
+                    rewards_rate,
+                    rewards_rate_denominator
+                )
+            } else { 0 };
+        if (rewards_amount > 0) {
+            let mint_cap =
+                &borrow_global<TopoCoinCapabilities>(@topo_framework).mint_cap;
+            let rewards = coin::mint(rewards_amount, mint_cap);
+            coin::merge(stake, rewards);
         };
-        // The rewards amount is equal to (stake amount * rewards rate * performance multiplier).
-        // We do multiplication in u128 before division to avoid the overflow and minimize the rounding error.
-        let rewards_numerator =
-            (stake_amount as u128) * (rewards_rate as u128)
-                * (num_successful_proposals as u128);
-        let rewards_denominator =
-            (rewards_rate_denominator as u128) * (num_total_proposals as u128);
-        if (rewards_denominator > 0) {
-            ((rewards_numerator / rewards_denominator) as u64)
-        } else { 0 }
+        rewards_amount
     }
 
     fun append<T>(v1: &mut vector<T>, v2: &mut vector<T>) {
@@ -2203,6 +2863,7 @@ module topo_framework::stake {
         let len = v.length();
         while ({
             spec {
+                invariant i <= len;
                 invariant !(exists j in 0..i: v[j].addr == addr);
             };
             i < len
@@ -2215,115 +2876,30 @@ module topo_framework::stake {
         option::none()
     }
 
-    fun get_validator_addresses(
-        validators: &vector<ValidatorInfo>,
-        offset: u64,
-        limit: u64
-    ): vector<address> {
-        let addresses = vector[];
-        let len = validators.length();
-        let i = offset;
-        let end = range_end(offset, limit, len);
-        while (i < end) {
-            addresses.push_back(validators.borrow(i).addr);
-            i += 1;
-        };
-        addresses
-    }
-
-    fun range_end(offset: u64, limit: u64, len: u64): u64 {
-        if (offset >= len || limit == 0) {
-            return offset
-        };
-        let remaining = len - offset;
-        if (limit >= remaining) {
-            len
-        } else {
-            offset + limit
-        }
-    }
-
     fun generate_validator_info(
-        addr: address, config: ValidatorConfig
+        addr: address, stake_pool: &StakePool, config: ValidatorConfig
     ): ValidatorInfo {
-        let voting_power = staking_registry::get_validator_total_power(addr);
+        let voting_power = get_voting_power(stake_pool);
         ValidatorInfo { addr, voting_power, config }
     }
 
-    fun cap_validator_info_voting_power_for_epoch(
-        info: ValidatorInfo,
-        maximum_stake: u64,
-        baseline_voting_power: u64,
-        max_voting_power_increase: u128,
-        used_voting_power_increase: u128,
-    ): ValidatorInfo {
-        ValidatorInfo {
-            addr: info.addr,
-            voting_power: cap_voting_power_for_epoch(
-                info.voting_power,
-                maximum_stake,
-                baseline_voting_power,
-                max_voting_power_increase,
-                used_voting_power_increase,
-            ),
-            config: info.config,
-        }
-    }
-
-    fun cap_voting_power_for_epoch(
-        raw_voting_power: u64,
-        maximum_stake: u64,
-        baseline_voting_power: u64,
-        max_voting_power_increase: u128,
-        used_voting_power_increase: u128,
-    ): u64 {
-        let capped_by_maximum = min_u64(raw_voting_power, maximum_stake);
-        if (capped_by_maximum <= baseline_voting_power) {
-            return capped_by_maximum
+    /// Returns the sum of all non-inactive stake (active + pending_active + pending_inactive).
+    /// This equals the actual voting power for the next epoch only when called after expired
+    /// pending_inactive has been settled to inactive (e.g. in on_new_epoch or join_validator_set).
+    fun get_voting_power(stake_pool: &StakePool): u64 {
+        let value_pending_active = coin::value(&stake_pool.pending_active);
+        let value_active = coin::value(&stake_pool.active);
+        let value_pending_inactive = coin::value(&stake_pool.pending_inactive);
+        spec {
+            assume value_pending_active + value_active + value_pending_inactive
+                <= MAX_U64;
         };
-
-        let remaining_increase =
-            if (used_voting_power_increase >= max_voting_power_increase) {
-                0
-            } else {
-                max_voting_power_increase - used_voting_power_increase
-            };
-        let allowed_voting_power =
-            (baseline_voting_power as u128) + remaining_increase;
-        if ((capped_by_maximum as u128) > allowed_voting_power) {
-            allowed_voting_power as u64
-        } else {
-            capped_by_maximum
-        }
+        value_pending_active + value_active + value_pending_inactive
     }
 
-    fun calculate_max_voting_power_increase(
-        total_voting_power: u128,
-        voting_power_increase_limit: u64,
-    ): u128 {
-        if (total_voting_power == 0) {
-            MAX_U64
-        } else {
-            (total_voting_power * (voting_power_increase_limit as u128)) / 100
-        }
-    }
-
-    fun voting_power_increase(
-        baseline_voting_power: u64,
-        new_voting_power: u64,
-    ): u128 {
-        if (new_voting_power > baseline_voting_power) {
-            ((new_voting_power - baseline_voting_power) as u128)
-        } else {
-            0
-        }
-    }
-
-    fun min_u64(a: u64, b: u64): u64 {
-        if (a < b) { a } else { b }
-    }
-
-    fun update_voting_power_increase(increase_amount: u64) acquires ValidatorSet {
+    /// 此处按原生代币累计增长额；PoC 算力的增长预算由计划计算，两种单位不能混用。
+    fun update_voting_power_increase(increase_amount: u64) acquires InstalledRewardContext, ValidatorSet {
+        if (is_poc_enabled()) { return };
         let validator_set = borrow_global_mut<ValidatorSet>(@topo_framework);
         let voting_power_increase_limit =
             (
@@ -2359,12 +2935,13 @@ module topo_framework::stake {
     public fun configure_allowed_validators(
         topo_framework: &signer, accounts: vector<address>
     ) acquires AllowedValidators {
-        let aptos_framework_address = signer::address_of(topo_framework);
-        system_addresses::assert_aptos_framework(topo_framework);
-        if (!exists<AllowedValidators>(aptos_framework_address)) {
+        assert_reconfig_not_in_progress();
+        let topo_framework_address = signer::address_of(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
+        if (!exists<AllowedValidators>(topo_framework_address)) {
             move_to(topo_framework, AllowedValidators { accounts });
         } else {
-            let allowed = borrow_global_mut<AllowedValidators>(aptos_framework_address);
+            let allowed = borrow_global_mut<AllowedValidators>(topo_framework_address);
             allowed.accounts = accounts;
         }
     }
@@ -2396,6 +2973,10 @@ module topo_framework::stake {
     use topo_std::bls12381::proof_of_possession_from_bytes;
     use topo_framework::reconfiguration_state;
     use topo_framework::validator_consensus_info;
+    use topo_framework::validator_consensus_info::ValidatorConsensusInfo;
+    #[test_only]
+    use topo_std::fixed_point64;
+
     #[test_only]
     const EPOCH_DURATION: u64 = 60;
 
@@ -2403,7 +2984,7 @@ module topo_framework::stake {
     const LOCKUP_CYCLE_SECONDS: u64 = 3600;
 
     #[test_only]
-    public fun initialize_for_test(topo_framework: &signer) acquires TopoCoinCapabilities {
+    public fun initialize_for_test(topo_framework: &signer) {
         reconfiguration_state::initialize(topo_framework);
         initialize_for_test_custom(
             topo_framework,
@@ -2423,6 +3004,32 @@ module topo_framework::stake {
         );
     }
 
+    #[test_only]
+    public fun join_validator_set_for_test(
+        pk: &bls12381::PublicKey,
+        pop: &bls12381::ProofOfPossession,
+        operator: &signer,
+        pool_address: address,
+        should_end_epoch: bool
+    ) acquires EpochPlan, InstalledRewardContext, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        let pk_bytes = bls12381::public_key_to_bytes(pk);
+        let pop_bytes = bls12381::proof_of_possession_to_bytes(pop);
+        rotate_consensus_key(operator, pool_address, pk_bytes, pop_bytes);
+        join_validator_set(operator, pool_address);
+        if (should_end_epoch) {
+            end_epoch();
+        }
+    }
+
+    #[test_only]
+    public fun fast_forward_to_unlock(
+        pool_address: address
+    ) acquires EpochPlan, InstalledRewardContext, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        let expiration_time = get_lockup_secs(pool_address);
+        timestamp::update_global_time_for_test_secs(expiration_time);
+        end_epoch();
+    }
+
     // Convenient function for setting up all required stake initializations.
     #[test_only]
     public fun initialize_for_test_custom(
@@ -2434,7 +3041,7 @@ module topo_framework::stake {
         rewards_rate_numerator: u64,
         rewards_rate_denominator: u64,
         voting_power_increase_limit: u64
-    ) acquires TopoCoinCapabilities {
+    ) {
         timestamp::set_time_has_started_for_testing(topo_framework);
         reconfiguration_state::initialize(topo_framework);
         if (!exists<ValidatorSet>(@topo_framework)) {
@@ -2457,23 +3064,6 @@ module topo_framework::stake {
             coin::destroy_burn_cap<TopoCoin>(burn_cap);
         };
 
-        if (!staking_registry::registry_exists()) {
-            staking_registry::store_topo_coin_mint_cap(
-                topo_framework,
-                borrow_global<TopoCoinCapabilities>(@topo_framework).mint_cap,
-            );
-            staking_registry::initialize(
-                topo_framework,
-                1000000,
-                1000,
-                recurring_lockup_secs,
-            );
-        };
-
-        if (poc_power_store::get_operator() == @0x0) {
-            poc_power_store::initialize_power_store(topo_framework, @topo_framework);
-        };
-
         // In the test environment, the periodical_reward_rate_decrease feature is initially turned off.
         features::change_feature_flags_for_testing(
             topo_framework,
@@ -2482,31 +3072,36 @@ module topo_framework::stake {
         );
     }
 
+    // This function assumes the stake module already the capability to mint aptos coins.
+    #[test_only]
+    public fun mint_coins(amount: u64): Coin<TopoCoin> acquires TopoCoinCapabilities {
+        let mint_cap = &borrow_global<TopoCoinCapabilities>(@topo_framework).mint_cap;
+        coin::mint(amount, mint_cap)
+    }
+
+    #[test_only]
+    public fun mint(account: &signer, amount: u64) acquires TopoCoinCapabilities {
+        coin::register<TopoCoin>(account);
+        coin::deposit(signer::address_of(account), mint_coins(amount));
+    }
+
     #[test_only]
     public fun mint_and_add_stake(
         account: &signer, amount: u64
-    ) acquires TopoCoinCapabilities {
-        coin::register<TopoCoin>(account);
-        let mint_cap = &borrow_global<TopoCoinCapabilities>(@topo_framework).mint_cap;
-        coin::deposit(signer::address_of(account), coin::mint(amount, mint_cap));
-        staking_registry::deposit(account, amount);
-        let account_address = signer::address_of(account);
-        let (_, delegated_to, _) = staking_registry::get_user_stake_info(account_address);
-        if (delegated_to == @0x0 && staking_registry::validator_exists(account_address)) {
-            staking_registry::delegate(account, account_address);
-        };
+    ) acquires InstalledRewardContext, OwnerCapability, StakePool, TopoCoinCapabilities, ValidatorSet {
+        mint(account, amount);
+        add_stake(account, amount);
     }
 
     #[test_only]
     public fun initialize_test_validator(
-        topo_framework: &signer,
         public_key: &bls12381::PublicKey,
         proof_of_possession: &bls12381::ProofOfPossession,
         validator: &signer,
         amount: u64,
         should_join_validator_set: bool,
         should_end_epoch: bool
-    ) acquires AllowedValidators, TopoCoinCapabilities, PendingTransactionFee, StakePool, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
         let validator_address = signer::address_of(validator);
         account::create_account_for_test(validator_address);
 
@@ -2521,13 +3116,6 @@ module topo_framework::stake {
         );
 
         if (amount > 0) {
-            let genesis_power =
-                staking_registry::calculate_genesis_power_from_stake(amount);
-            poc_power_store::set_genesis_committed_power(
-                topo_framework,
-                validator_address,
-                genesis_power,
-            );
             mint_and_add_stake(validator, amount);
         };
 
@@ -2540,6 +3128,71 @@ module topo_framework::stake {
     }
 
     #[test_only]
+    public fun create_validator_set(
+        topo_framework: &signer,
+        active_validator_addresses: vector<address>,
+        public_keys: vector<bls12381::PublicKey>
+    ) {
+        let active_validators = vector::empty<ValidatorInfo>();
+        let i = 0;
+        while (i < active_validator_addresses.length()) {
+            let validator_address = active_validator_addresses.borrow(i);
+            let pk = public_keys.borrow(i);
+            active_validators.push_back(
+                ValidatorInfo {
+                    addr: *validator_address,
+                    voting_power: 0,
+                    config: ValidatorConfig {
+                        consensus_pubkey: bls12381::public_key_to_bytes(pk),
+                        network_addresses: b"",
+                        fullnode_addresses: b"",
+                        validator_index: 0
+                    }
+                }
+            );
+            i += 1;
+        };
+
+        move_to(
+            topo_framework,
+            ValidatorSet {
+                consensus_scheme: 0,
+                // active validators for the current epoch
+                active_validators,
+                // pending validators to leave in next epoch (still active)
+                pending_inactive: vector::empty<ValidatorInfo>(),
+                // pending validators to join in next epoch
+                pending_active: vector::empty<ValidatorInfo>(),
+                total_voting_power: 0,
+                total_joining_power: 0
+            }
+        );
+    }
+
+    #[test_only]
+    public fun create_stake_pool(
+        account: &signer,
+        active: Coin<TopoCoin>,
+        pending_inactive: Coin<TopoCoin>,
+        locked_until_secs: u64
+    ) acquires AllowedValidators, InstalledRewardContext, OwnerCapability, StakePool, ValidatorSet {
+        let account_address = signer::address_of(account);
+        initialize_stake_owner(account, 0, account_address, account_address);
+        let stake_pool = borrow_global_mut<StakePool>(account_address);
+        coin::merge(&mut stake_pool.active, active);
+        coin::merge(&mut stake_pool.pending_inactive, pending_inactive);
+        stake_pool.locked_until_secs = locked_until_secs;
+    }
+
+    // Allows unit tests to set custom validator performances.
+    #[test_only]
+    public fun update_validator_performances_for_test(
+        proposer_index: Option<u64>, failed_proposer_indices: vector<u64>
+    ) acquires ValidatorPerformance {
+        update_performance_statistics(proposer_index, failed_proposer_indices);
+    }
+
+    #[test_only]
     public fun generate_identity(): (
         bls12381::SecretKey, bls12381::PublicKey, bls12381::ProofOfPossession
     ) {
@@ -2547,6 +3200,652 @@ module topo_framework::stake {
         let pop = bls12381::generate_proof_of_possession(&sk);
         let unvalidated_pk = bls12381::public_key_with_pop_to_normal(&pkpop);
         (sk, unvalidated_pk, pop)
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x10007, location = Self)]
+    public entry fun test_inactive_validator_can_add_stake_if_exceeding_max_allowed(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        initialize_for_test(topo_framework);
+        let (_sk, pk, pop) = generate_identity();
+        initialize_test_validator(&pk, &pop, validator, 100, false, false);
+
+        // Add more stake to exceed max. This should fail.
+        mint_and_add_stake(validator, 9901);
+    }
+
+    #[test(topo_framework = @0x1, validator_1 = @0x123, validator_2 = @0x234)]
+    #[expected_failure(abort_code = 0x10007, location = Self)]
+    public entry fun test_pending_active_validator_cannot_add_stake_if_exceeding_max_allowed(
+        topo_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        initialize_for_test_custom(
+            topo_framework,
+            50,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            10,
+            100000
+        );
+        // Have one validator join the set to ensure the validator set is not empty when main validator joins.
+        let (_sk_1, pk_1, pop_1) = generate_identity();
+        initialize_test_validator(&pk_1, &pop_1, validator_1, 100, true, true);
+
+        // Validator 2 joins validator set but epoch has not ended so validator is in pending_active state.
+        let (_sk_2, pk_2, pop_2) = generate_identity();
+        initialize_test_validator(&pk_2, &pop_2, validator_2, 100, true, false);
+
+        // Add more stake to exceed max. This should fail.
+        mint_and_add_stake(validator_2, 9901);
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x10007, location = Self)]
+    public entry fun test_active_validator_cannot_add_stake_if_exceeding_max_allowed(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        initialize_for_test(topo_framework);
+        // Validator joins validator set and waits for epoch end so it's in the validator set.
+        let (_sk, pk, pop) = generate_identity();
+        initialize_test_validator(&pk, &pop, validator, 100, true, true);
+
+        // Add more stake to exceed max. This should fail.
+        mint_and_add_stake(validator, 9901);
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x10007, location = Self)]
+    public entry fun test_active_validator_with_pending_inactive_stake_cannot_add_stake_if_exceeding_max_allowed(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        initialize_for_test(topo_framework);
+        // Validator joins validator set and waits for epoch end so it's in the validator set.
+        let (_sk, pk, pop) = generate_identity();
+        initialize_test_validator(&pk, &pop, validator, 100, true, true);
+
+        // Request to unlock 50 coins, which go to pending_inactive. Validator has 50 remaining in active.
+        unlock(validator, 50);
+        assert_validator_state(signer::address_of(validator), 50, 0, 0, 50, 0);
+
+        // Add 9901 more. Total stake is 50 (active) + 50 (pending_inactive) + 9901 > 10000 so still exceeding max.
+        mint_and_add_stake(validator, 9901);
+    }
+
+    #[test(topo_framework = @topo_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    #[expected_failure(abort_code = 0x10007, location = Self)]
+    public entry fun test_pending_inactive_cannot_add_stake_if_exceeding_max_allowed(
+        topo_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        initialize_for_test(topo_framework);
+        let (_sk_1, pk_1, pop_1) = generate_identity();
+        let (_sk_2, pk_2, pop_2) = generate_identity();
+        initialize_test_validator(&pk_1, &pop_1, validator_1, 100, true, false);
+        initialize_test_validator(&pk_2, &pop_2, validator_2, 100, true, true);
+
+        // Leave validator set so validator is in pending_inactive state.
+        leave_validator_set(validator_1, signer::address_of(validator_1));
+
+        // Add 9901 more. Total stake is 50 (active) + 50 (pending_inactive) + 9901 > 10000 so still exceeding max.
+        mint_and_add_stake(validator_1, 9901);
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123)]
+    public entry fun test_end_to_end(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        initialize_for_test(topo_framework);
+        let (_sk, pk, pop) = generate_identity();
+        initialize_test_validator(&pk, &pop, validator, 100, true, true);
+
+        // Validator has a lockup now that they've joined the validator set.
+        let validator_address = signer::address_of(validator);
+        assert!(get_remaining_lockup_secs(validator_address) == LOCKUP_CYCLE_SECONDS, 1);
+
+        // Validator adds more stake while already being active.
+        // The added stake should go to pending_active to wait for activation when next epoch starts.
+        mint(validator, 900);
+        add_stake(validator, 100);
+        assert!(coin::balance<TopoCoin>(validator_address) == 800, 2);
+        assert_validator_state(validator_address, 100, 0, 100, 0, 0);
+
+        // Pending_active stake is activated in the new epoch.
+        // Rewards of 1 coin are also distributed for the existing active stake of 100 coins.
+        end_epoch();
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_ACTIVE, 3);
+        assert_validator_state(validator_address, 201, 0, 0, 0, 0);
+
+        // Request unlock of 100 coins. These 100 coins are moved to pending_inactive and will be unlocked when the
+        // current lockup expires.
+        unlock(validator, 100);
+        assert_validator_state(validator_address, 101, 0, 0, 100, 0);
+
+        // Enough time has passed so the current lockup cycle should have ended.
+        // The first epoch after the lockup cycle ended should automatically move unlocked (pending_inactive) stake
+        // to inactive.
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_epoch();
+        // Rewards were also minted to pending_inactive, which got all moved to inactive.
+        assert_validator_state(validator_address, 102, 101, 0, 0, 0);
+        // Lockup is renewed and validator is still active.
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_ACTIVE, 4);
+        assert!(get_remaining_lockup_secs(validator_address) == LOCKUP_CYCLE_SECONDS, 5);
+
+        // Validator withdraws from inactive stake multiple times.
+        withdraw(validator, 50);
+        assert!(coin::balance<TopoCoin>(validator_address) == 850, 6);
+        assert_validator_state(validator_address, 102, 51, 0, 0, 0);
+        withdraw(validator, 51);
+        assert!(coin::balance<TopoCoin>(validator_address) == 901, 7);
+        assert_validator_state(validator_address, 102, 0, 0, 0, 0);
+
+        // Enough time has passed again and the validator's lockup is renewed once more. Validator is still active.
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_epoch();
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_ACTIVE, 8);
+        assert!(get_remaining_lockup_secs(validator_address) == LOCKUP_CYCLE_SECONDS, 9);
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123)]
+    public entry fun test_inactive_validator_with_existing_lockup_join_validator_set(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        initialize_for_test(topo_framework);
+        let (_sk, pk, pop) = generate_identity();
+        initialize_test_validator(&pk, &pop, validator, 100, false, false);
+
+        // Validator sets lockup before even joining the set and lets half of lockup pass by.
+        increase_lockup(validator);
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS / 2);
+        let validator_address = signer::address_of(validator);
+        assert!(
+            get_remaining_lockup_secs(validator_address) == LOCKUP_CYCLE_SECONDS / 2,
+            1
+        );
+
+        // Join the validator set with an existing lockup
+        join_validator_set(validator, validator_address);
+
+        // Validator is added to the set but lockup time shouldn't have changed.
+        end_epoch();
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_ACTIVE, 2);
+        assert!(
+            get_remaining_lockup_secs(validator_address)
+                == LOCKUP_CYCLE_SECONDS / 2 - EPOCH_DURATION,
+            3
+        );
+        assert_validator_state(validator_address, 100, 0, 0, 0, 0);
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x10012, location = Self)]
+    public entry fun test_cannot_reduce_lockup(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        initialize_for_test(topo_framework);
+        let (_sk, pk, pop) = generate_identity();
+        initialize_test_validator(&pk, &pop, validator, 100, false, false);
+
+        // Increase lockup.
+        increase_lockup(validator);
+        // Reduce recurring lockup to 0.
+        staking_config::update_recurring_lockup_duration_secs(topo_framework, 1);
+        // INcrease lockup should now fail because the new lockup < old lockup.
+        increase_lockup(validator);
+    }
+
+    #[test(topo_framework = @topo_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    #[expected_failure(abort_code = 0x1000D, location = Self)]
+    public entry fun test_inactive_validator_cannot_join_if_exceed_increase_limit(
+        topo_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        // Only 50% voting power increase is allowed in each epoch.
+        initialize_for_test_custom(
+            topo_framework,
+            50,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            10,
+            50
+        );
+        let (_sk_1, pk_1, pop_1) = generate_identity();
+        let (_sk_2, pk_2, pop_2) = generate_identity();
+        initialize_test_validator(&pk_1, &pop_1, validator_1, 100, false, false);
+        initialize_test_validator(&pk_2, &pop_2, validator_2, 100, false, false);
+
+        // Validator 1 needs to be in the set so validator 2's added stake counts against the limit.
+        join_validator_set(validator_1, signer::address_of(validator_1));
+        end_epoch();
+
+        // Validator 2 joins the validator set but their stake would lead to exceeding the voting power increase limit.
+        // Therefore, this should fail.
+        join_validator_set(validator_2, signer::address_of(validator_2));
+    }
+
+    #[test(topo_framework = @topo_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    public entry fun test_pending_active_validator_can_add_more_stake(
+        topo_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        initialize_for_test_custom(
+            topo_framework,
+            50,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            10,
+            10000
+        );
+        // Need 1 validator to be in the active validator set so joining limit works.
+        let (_sk_1, pk_1, pop_1) = generate_identity();
+        let (_sk_2, pk_2, pop_2) = generate_identity();
+        initialize_test_validator(&pk_1, &pop_1, validator_1, 100, false, true);
+        initialize_test_validator(&pk_2, &pop_2, validator_2, 100, false, false);
+
+        // Add more stake while still pending_active.
+        let validator_2_address = signer::address_of(validator_2);
+        join_validator_set(validator_2, validator_2_address);
+        assert!(
+            get_validator_state(validator_2_address) == VALIDATOR_STATUS_PENDING_ACTIVE,
+            0
+        );
+        mint_and_add_stake(validator_2, 100);
+        assert_validator_state(validator_2_address, 200, 0, 0, 0, 0);
+    }
+
+    #[test(topo_framework = @topo_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    #[expected_failure(abort_code = 0x1000D, location = Self)]
+    public entry fun test_pending_active_validator_cannot_add_more_stake_than_limit(
+        topo_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        // 100% voting power increase is allowed in each epoch.
+        initialize_for_test_custom(
+            topo_framework,
+            50,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            10,
+            100
+        );
+        // Need 1 validator to be in the active validator set so joining limit works.
+        let (_sk_1, pk_1, pop_1) = generate_identity();
+        initialize_test_validator(&pk_1, &pop_1, validator_1, 100, true, true);
+
+        // Validator 2 joins the validator set but epoch has not ended so they're still pending_active.
+        // Current voting power increase is already 100%. This is not failing yet.
+        let (_sk_2, pk_2, pop_2) = generate_identity();
+        initialize_test_validator(&pk_2, &pop_2, validator_2, 100, true, false);
+
+        // Add more stake, which now exceeds the 100% limit. This should fail.
+        mint_and_add_stake(validator_2, 1);
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123)]
+    public entry fun test_pending_active_validator_leaves_validator_set(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        initialize_for_test(topo_framework);
+        // Validator joins but epoch hasn't ended, so the validator is still pending_active.
+        let (_sk, pk, pop) = generate_identity();
+        initialize_test_validator(&pk, &pop, validator, 100, true, false);
+        let validator_address = signer::address_of(validator);
+        assert!(
+            get_validator_state(validator_address) == VALIDATOR_STATUS_PENDING_ACTIVE,
+            0
+        );
+
+        // Check that voting power increase is tracked.
+        assert!(
+            borrow_global<ValidatorSet>(@topo_framework).total_joining_power == 100, 0
+        );
+
+        // Leave the validator set immediately.
+        leave_validator_set(validator, validator_address);
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_INACTIVE, 1);
+
+        // Check that voting power increase has been decreased when the pending active validator leaves.
+        assert!(
+            borrow_global<ValidatorSet>(@topo_framework).total_joining_power == 0, 1
+        );
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x1000D, location = Self)]
+    public entry fun test_active_validator_cannot_add_more_stake_than_limit_in_multiple_epochs(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        // Only 50% voting power increase is allowed in each epoch.
+        initialize_for_test_custom(
+            topo_framework,
+            50,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            10,
+            50
+        );
+        // Add initial stake and join the validator set.
+        let (_sk, pk, pop) = generate_identity();
+        initialize_test_validator(&pk, &pop, validator, 100, true, true);
+
+        let validator_address = signer::address_of(validator);
+        assert_validator_state(validator_address, 100, 0, 0, 0, 0);
+        end_epoch();
+        assert_validator_state(validator_address, 110, 0, 0, 0, 0);
+        end_epoch();
+        assert_validator_state(validator_address, 121, 0, 0, 0, 0);
+        // Add more than 50% limit. The following line should fail.
+        mint_and_add_stake(validator, 99);
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x1000D, location = Self)]
+    public entry fun test_active_validator_cannot_add_more_stake_than_limit(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        // Only 50% voting power increase is allowed in each epoch.
+        initialize_for_test_custom(
+            topo_framework,
+            50,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            10,
+            50
+        );
+        let (_sk, pk, pop) = generate_identity();
+        initialize_test_validator(&pk, &pop, validator, 100, true, true);
+
+        // Add more than 50% limit. This should fail.
+        mint_and_add_stake(validator, 51);
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123)]
+    public entry fun test_active_validator_unlock_partial_stake(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        // Reward rate = 10%.
+        initialize_for_test_custom(
+            topo_framework,
+            50,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            10,
+            100
+        );
+        let (_sk, pk, pop) = generate_identity();
+        initialize_test_validator(&pk, &pop, validator, 100, true, true);
+
+        // Unlock half of the coins.
+        let validator_address = signer::address_of(validator);
+        assert!(get_remaining_lockup_secs(validator_address) == LOCKUP_CYCLE_SECONDS, 1);
+        unlock(validator, 50);
+        assert_validator_state(validator_address, 50, 0, 0, 50, 0);
+
+        // Enough time has passed so the current lockup cycle should have ended.
+        // 50 coins should have unlocked while the remaining 51 (50 + rewards) should stay locked for another cycle.
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_epoch();
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_ACTIVE, 2);
+        // Validator received rewards in both active and pending inactive.
+        assert_validator_state(validator_address, 55, 55, 0, 0, 0);
+        assert!(get_remaining_lockup_secs(validator_address) == LOCKUP_CYCLE_SECONDS, 3);
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123, validator_2 = @0x234)]
+    public entry fun test_active_validator_can_withdraw_all_stake_and_rewards_at_once(
+        topo_framework: &signer, validator: &signer, validator_2: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        initialize_for_test(topo_framework);
+        let (_sk, pk, pop) = generate_identity();
+        let (_sk_2, pk_2, pop_2) = generate_identity();
+        initialize_test_validator(&pk, &pop, validator, 100, true, false);
+        initialize_test_validator(&pk_2, &pop_2, validator_2, 100, true, true);
+        let validator_address = signer::address_of(validator);
+        assert!(get_remaining_lockup_secs(validator_address) == LOCKUP_CYCLE_SECONDS, 0);
+
+        // One more epoch passes to generate rewards.
+        end_epoch();
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_ACTIVE, 1);
+        assert_validator_state(validator_address, 101, 0, 0, 0, 1);
+
+        // Unlock all coins while still having a lockup.
+        assert!(
+            get_remaining_lockup_secs(validator_address)
+                == LOCKUP_CYCLE_SECONDS - EPOCH_DURATION,
+            2
+        );
+        unlock(validator, 101);
+        assert_validator_state(validator_address, 0, 0, 0, 101, 1);
+
+        // One more epoch passes while the current lockup cycle (3600 secs) has not ended.
+        timestamp::fast_forward_seconds(1000);
+        end_epoch();
+        // Validator should not be removed from the validator set since their 100 coins in pending_inactive state should
+        // still count toward voting power.
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_ACTIVE, 3);
+        assert_validator_state(validator_address, 0, 0, 0, 102, 1);
+
+        // Enough time has passed so the current lockup cycle should have ended. Funds are now fully unlocked.
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_epoch();
+        assert_validator_state(validator_address, 0, 103, 0, 0, 1);
+        // Validator ahs been kicked out of the validator set as their stake is 0 now.
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_INACTIVE, 4);
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123)]
+    public entry fun test_active_validator_unlocking_more_than_available_stake_should_cap(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        initialize_for_test(topo_framework);
+        let (_sk, pk, pop) = generate_identity();
+        initialize_test_validator(&pk, &pop, validator, 100, false, false);
+
+        // Validator unlocks more stake than they have active. This should limit the unlock to 100.
+        unlock(validator, 200);
+        assert_validator_state(signer::address_of(validator), 0, 0, 0, 100, 0);
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123)]
+    public entry fun test_active_validator_withdraw_should_cap_by_inactive_stake(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        initialize_for_test(topo_framework);
+        // Initial balance = 900 (idle) + 100 (staked) = 1000.
+        let (_sk, pk, pop) = generate_identity();
+        initialize_test_validator(&pk, &pop, validator, 100, true, true);
+        mint(validator, 900);
+
+        // Validator unlocks stake.
+        unlock(validator, 100);
+        // Enough time has passed so the stake is fully unlocked.
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_epoch();
+
+        // Validator can only withdraw a max of 100 unlocked coins even if they request to withdraw more than 100.
+        withdraw(validator, 200);
+        let validator_address = signer::address_of(validator);
+        // Receive back all coins with an extra 1 for rewards.
+        assert!(coin::balance<TopoCoin>(validator_address) == 1001, 2);
+        assert_validator_state(validator_address, 0, 0, 0, 0, 0);
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123)]
+    public entry fun test_active_validator_can_reactivate_pending_inactive_stake(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        initialize_for_test(topo_framework);
+        let (_sk, pk, pop) = generate_identity();
+        initialize_test_validator(&pk, &pop, validator, 100, true, true);
+
+        // Validator unlocks stake, which gets moved into pending_inactive.
+        unlock(validator, 50);
+        let validator_address = signer::address_of(validator);
+        assert_validator_state(validator_address, 50, 0, 0, 50, 0);
+
+        // Validator can reactivate pending_inactive stake.
+        reactivate_stake(validator, 50);
+        assert_validator_state(validator_address, 100, 0, 0, 0, 0);
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123)]
+    public entry fun test_active_validator_reactivate_more_than_available_pending_inactive_stake_should_cap(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        initialize_for_test(topo_framework);
+        let (_sk, pk, pop) = generate_identity();
+        initialize_test_validator(&pk, &pop, validator, 100, true, true);
+
+        // Validator tries to reactivate more than available pending_inactive stake, which should limit to 50.
+        unlock(validator, 50);
+        let validator_address = signer::address_of(validator);
+        assert_validator_state(validator_address, 50, 0, 0, 50, 0);
+        reactivate_stake(validator, 51);
+        assert_validator_state(validator_address, 100, 0, 0, 0, 0);
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123, validator_2 = @0x234)]
+    public entry fun test_active_validator_having_insufficient_remaining_stake_after_withdrawal_gets_kicked(
+        topo_framework: &signer, validator: &signer, validator_2: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        initialize_for_test(topo_framework);
+        let (_sk, pk, pop) = generate_identity();
+        let (_sk_2, pk_2, pop_2) = generate_identity();
+        initialize_test_validator(&pk, &pop, validator, 100, true, false);
+        initialize_test_validator(&pk_2, &pop_2, validator_2, 100, true, true);
+
+        // Unlock enough coins that the remaining is not enough to meet the min required.
+        let validator_address = signer::address_of(validator);
+        assert!(get_remaining_lockup_secs(validator_address) == LOCKUP_CYCLE_SECONDS, 1);
+        unlock(validator, 50);
+        assert_validator_state(validator_address, 50, 0, 0, 50, 1);
+
+        // Enough time has passed so the current lockup cycle should have ended.
+        // 50 coins should have unlocked while the remaining 51 (50 + rewards) is not enough so the validator is kicked
+        // from the validator set.
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_ACTIVE, 2);
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_epoch();
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_INACTIVE, 2);
+        assert_validator_state(validator_address, 50, 50, 0, 0, 1);
+        // Lockup is no longer renewed since the validator is no longer a part of the validator set.
+        assert!(get_remaining_lockup_secs(validator_address) == 0, 3);
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123, validator_2 = @0x234)]
+    public entry fun test_active_validator_leaves_staking_but_still_has_a_lockup(
+        topo_framework: &signer, validator: &signer, validator_2: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        initialize_for_test(topo_framework);
+        let (_sk_1, pk_1, pop_1) = generate_identity();
+        let (_sk_2, pk_2, pop_2) = generate_identity();
+        initialize_test_validator(&pk_1, &pop_1, validator, 100, true, false);
+        // We need a second validator here just so the first validator can leave.
+        initialize_test_validator(&pk_2, &pop_2, validator_2, 100, true, true);
+
+        // Leave the validator set while still having a lockup.
+        let validator_address = signer::address_of(validator);
+        assert!(get_remaining_lockup_secs(validator_address) == LOCKUP_CYCLE_SECONDS, 0);
+        leave_validator_set(validator, validator_address);
+        // Validator is in pending_inactive state but is technically still part of the validator set.
+        assert!(
+            get_validator_state(validator_address) == VALIDATOR_STATUS_PENDING_INACTIVE,
+            2
+        );
+        assert_validator_state(validator_address, 100, 0, 0, 0, 1);
+        end_epoch();
+
+        // Epoch has ended so validator is no longer part of the validator set.
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_INACTIVE, 3);
+        // However, their stake, including rewards, should still subject to the existing lockup.
+        assert_validator_state(validator_address, 101, 0, 0, 0, 1);
+        assert!(
+            get_remaining_lockup_secs(validator_address)
+                == LOCKUP_CYCLE_SECONDS - EPOCH_DURATION,
+            4
+        );
+
+        // If they try to unlock, their stake is moved to pending_inactive and would only be withdrawable after the
+        // lockup has expired.
+        unlock(validator, 50);
+        assert_validator_state(validator_address, 51, 0, 0, 50, 1);
+        // A couple of epochs passed but lockup has not expired so the validator's stake remains the same.
+        end_epoch();
+        end_epoch();
+        end_epoch();
+        assert_validator_state(validator_address, 51, 0, 0, 50, 1);
+        // Fast forward enough so the lockup expires. Now the validator can just call withdraw directly to withdraw
+        // pending_inactive stakes.
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        withdraw(validator, 50);
+        assert_validator_state(validator_address, 51, 0, 0, 0, 1);
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123, validator_2 = @0x234)]
+    public entry fun test_active_validator_leaves_staking_and_rejoins_with_expired_lockup_should_be_renewed(
+        topo_framework: &signer, validator: &signer, validator_2: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        initialize_for_test(topo_framework);
+        let (_sk_1, pk_1, pop_1) = generate_identity();
+        let (_sk_2, pk_2, pop_2) = generate_identity();
+        initialize_test_validator(&pk_1, &pop_1, validator, 100, true, false);
+        // We need a second validator here just so the first validator can leave.
+        initialize_test_validator(&pk_2, &pop_2, validator_2, 100, true, true);
+
+        // Leave the validator set while still having a lockup.
+        let validator_address = signer::address_of(validator);
+        assert!(get_remaining_lockup_secs(validator_address) == LOCKUP_CYCLE_SECONDS, 0);
+        leave_validator_set(validator, validator_address);
+        end_epoch();
+
+        // Fast forward enough so the lockup expires.
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        assert!(get_remaining_lockup_secs(validator_address) == 0, 1);
+
+        // Validator rejoins the validator set. Once the current epoch ends, their lockup should be automatically
+        // renewed.
+        join_validator_set(validator, validator_address);
+        end_epoch();
+        assert!(get_validator_state(validator_address) == VALIDATOR_STATUS_ACTIVE, 2);
+        assert!(get_remaining_lockup_secs(validator_address) == LOCKUP_CYCLE_SECONDS, 2);
+    }
+
+    #[test(topo_framework = @topo_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    public entry fun test_pending_inactive_validator_does_not_count_in_increase_limit(
+        topo_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        // Only 50% voting power increase is allowed in each epoch.
+        initialize_for_test_custom(
+            topo_framework,
+            50,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            10,
+            50
+        );
+        let (_sk_1, pk_1, pop_1) = generate_identity();
+        let (_sk_2, pk_2, pop_2) = generate_identity();
+        initialize_test_validator(&pk_1, &pop_1, validator_1, 100, true, false);
+        // We need a second validator here just so the first validator can leave.
+        initialize_test_validator(&pk_2, &pop_2, validator_2, 100, true, true);
+
+        // Validator 1 leaves the validator set. Epoch has not ended so they're still pending_inactive.
+        leave_validator_set(validator_1, signer::address_of(validator_1));
+        // Validator 1 adds more stake. This should not succeed as it should not count as a voting power increase.
+        mint_and_add_stake(validator_1, 51);
     }
 
     #[
@@ -2562,7 +3861,7 @@ module topo_framework::stake {
         validator_1: &signer,
         validator_2: &signer,
         validator_3: &signer
-    ) acquires AllowedValidators, TopoCoinCapabilities, PendingTransactionFee, StakePool, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
         let validator_1_address = signer::address_of(validator_1);
         let validator_2_address = signer::address_of(validator_2);
         let validator_3_address = signer::address_of(validator_3);
@@ -2581,9 +3880,9 @@ module topo_framework::stake {
         let pk_1_bytes = bls12381::public_key_to_bytes(&pk_1);
         let (_sk_2, pk_2, pop_2) = generate_identity();
         let (_sk_3, pk_3, pop_3) = generate_identity();
-        initialize_test_validator(topo_framework, &pk_1, &pop_1, validator_1, 100, false, false);
-        initialize_test_validator(topo_framework, &pk_2, &pop_2, validator_2, 100, false, false);
-        initialize_test_validator(topo_framework, &pk_3, &pop_3, validator_3, 100, false, false);
+        initialize_test_validator(&pk_1, &pop_1, validator_1, 100, false, false);
+        initialize_test_validator(&pk_2, &pop_2, validator_2, 100, false, false);
+        initialize_test_validator(&pk_3, &pop_3, validator_3, 100, false, false);
 
         // Validator 1 and 2 join the validator set.
         join_validator_set(validator_2, validator_2_address);
@@ -2593,6 +3892,8 @@ module topo_framework::stake {
         assert!(get_validator_state(validator_2_address) == VALIDATOR_STATUS_ACTIVE, 1);
 
         // Validator indices is the reverse order of the joining order.
+        assert_validator_state(validator_1_address, 100, 0, 0, 0, 0);
+        assert_validator_state(validator_2_address, 100, 0, 0, 0, 1);
         let validator_set = borrow_global<ValidatorSet>(@topo_framework);
         let validator_config_1 = validator_set.active_validators.borrow(0);
         assert!(validator_config_1.addr == validator_1_address, 2);
@@ -2643,19 +3944,249 @@ module topo_framework::stake {
         // Changes applied after new epoch
         end_epoch();
         assert!(get_validator_state(validator_1_address) == VALIDATOR_STATUS_ACTIVE, 8);
-        assert!(get_validator_index(validator_1_address) == 0, 11);
+        assert_validator_state(validator_1_address, 101, 0, 0, 0, 0);
         assert!(get_validator_state(validator_2_address) == VALIDATOR_STATUS_INACTIVE, 9);
         // The validator index of validator 2 stays the same but this doesn't matter as the next time they rejoin the
         // validator set, their index will get set correctly.
-        assert!(get_validator_index(validator_2_address) == 1, 12);
+        assert_validator_state(validator_2_address, 101, 0, 0, 0, 1);
         assert!(get_validator_state(validator_3_address) == VALIDATOR_STATUS_ACTIVE, 10);
-        assert!(get_validator_index(validator_3_address) == 1, 13);
+        assert_validator_state(validator_3_address, 100, 0, 0, 0, 1);
         assert!(
             borrow_global<ValidatorSet>(@topo_framework).active_validators.borrow(0).config
             .consensus_pubkey == pk_1b_bytes,
             0
         );
 
+        // Validators without enough stake will be removed.
+        unlock(validator_1, 50);
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_epoch();
+        assert!(
+            get_validator_state(validator_1_address) == VALIDATOR_STATUS_INACTIVE, 11
+        );
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123)]
+    public entry fun test_delegated_staking_with_owner_cap(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        initialize_for_test_custom(
+            topo_framework,
+            100,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            100,
+            100
+        );
+        let (_sk, pk, pop) = generate_identity();
+        initialize_test_validator(&pk, &pop, validator, 0, false, false);
+        let owner_cap = extract_owner_cap(validator);
+
+        // Add stake when the validator is not yet activated.
+        add_stake_with_cap(&owner_cap, mint_coins(100));
+        let pool_address = signer::address_of(validator);
+        assert_validator_state(pool_address, 100, 0, 0, 0, 0);
+
+        // Join the validator set with enough stake.
+        join_validator_set(validator, pool_address);
+        end_epoch();
+        assert!(get_validator_state(pool_address) == VALIDATOR_STATUS_ACTIVE, 0);
+
+        // Unlock the entire stake.
+        unlock_with_cap(100, &owner_cap);
+        assert_validator_state(pool_address, 0, 0, 0, 100, 0);
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_epoch();
+
+        // Withdraw stake + rewards.
+        assert_validator_state(pool_address, 0, 101, 0, 0, 0);
+        let coins = withdraw_with_cap(&owner_cap, 101);
+        assert!(coin::value(&coins) == 101, 1);
+        assert_validator_state(pool_address, 0, 0, 0, 0, 0);
+
+        // Operator can separately rotate consensus key.
+        let (_sk_new, pk_new, pop_new) = generate_identity();
+        let pk_new_bytes = bls12381::public_key_to_bytes(&pk_new);
+        let pop_new_bytes = bls12381::proof_of_possession_to_bytes(&pop_new);
+        rotate_consensus_key(
+            validator,
+            pool_address,
+            pk_new_bytes,
+            pop_new_bytes
+        );
+        let validator_config = borrow_global<ValidatorConfig>(pool_address);
+        assert!(validator_config.consensus_pubkey == pk_new_bytes, 2);
+
+        // Operator can update network and fullnode addresses.
+        update_network_and_fullnode_addresses(validator, pool_address, b"1", b"2");
+        let validator_config = borrow_global<ValidatorConfig>(pool_address);
+        assert!(validator_config.network_addresses == b"1", 3);
+        assert!(validator_config.fullnode_addresses == b"2", 4);
+
+        // Cleanups.
+        coin::register<TopoCoin>(validator);
+        coin::deposit(pool_address, coins);
+        deposit_owner_cap(validator, owner_cap);
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x1000A, location = Self)]
+    public entry fun test_validator_cannot_join_post_genesis(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        initialize_for_test_custom(
+            topo_framework,
+            100,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            false,
+            1,
+            100,
+            100
+        );
+
+        // Joining the validator set should fail as post genesis validator set change is not allowed.
+        let (_sk, pk, pop) = generate_identity();
+        initialize_test_validator(&pk, &pop, validator, 100, true, true);
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x1000E, location = Self)]
+    public entry fun test_invalid_pool_address(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        initialize_for_test(topo_framework);
+        let (_sk, pk, pop) = generate_identity();
+        initialize_test_validator(&pk, &pop, validator, 100, true, true);
+        join_validator_set(validator, @0x234);
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x1000A, location = Self)]
+    public entry fun test_validator_cannot_leave_post_genesis(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        initialize_for_test_custom(
+            topo_framework,
+            100,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            false,
+            1,
+            100,
+            100
+        );
+        let (_sk, pk, pop) = generate_identity();
+        initialize_test_validator(&pk, &pop, validator, 100, false, false);
+
+        // Bypass the check to join. This is the same function called during Genesis.
+        let validator_address = signer::address_of(validator);
+        join_validator_set_internal(validator, validator_address);
+        end_epoch();
+
+        // Leaving the validator set should fail as post genesis validator set change is not allowed.
+        leave_validator_set(validator, validator_address);
+    }
+
+    #[
+        test(
+            topo_framework = @topo_framework,
+            validator_1 = @topo_framework,
+            validator_2 = @0x2,
+            validator_3 = @0x3,
+            validator_4 = @0x4,
+            validator_5 = @0x5
+        )
+    ]
+    fun test_validator_consensus_infos_from_validator_set(
+        topo_framework: &signer,
+        validator_1: &signer,
+        validator_2: &signer,
+        validator_3: &signer,
+        validator_4: &signer,
+        validator_5: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        let v1_addr = signer::address_of(validator_1);
+        let v2_addr = signer::address_of(validator_2);
+        let v3_addr = signer::address_of(validator_3);
+        let v4_addr = signer::address_of(validator_4);
+        let v5_addr = signer::address_of(validator_5);
+
+        initialize_for_test(topo_framework);
+
+        let (_sk_1, pk_1, pop_1) = generate_identity();
+        let (_sk_2, pk_2, pop_2) = generate_identity();
+        let (_sk_3, pk_3, pop_3) = generate_identity();
+        let (_sk_4, pk_4, pop_4) = generate_identity();
+        let (_sk_5, pk_5, pop_5) = generate_identity();
+        let pk_1_bytes = bls12381::public_key_to_bytes(&pk_1);
+        let pk_3_bytes = bls12381::public_key_to_bytes(&pk_3);
+        let pk_5_bytes = bls12381::public_key_to_bytes(&pk_5);
+
+        initialize_test_validator(&pk_1, &pop_1, validator_1, 101, false, false);
+        initialize_test_validator(&pk_2, &pop_2, validator_2, 102, false, false);
+        initialize_test_validator(&pk_3, &pop_3, validator_3, 103, false, false);
+        initialize_test_validator(&pk_4, &pop_4, validator_4, 104, false, false);
+        initialize_test_validator(&pk_5, &pop_5, validator_5, 105, false, false);
+
+        join_validator_set(validator_3, v3_addr);
+        join_validator_set(validator_1, v1_addr);
+        join_validator_set(validator_5, v5_addr);
+        end_epoch();
+        let vci_vec_0 =
+            validator_consensus_infos_from_validator_set(
+                borrow_global<ValidatorSet>(@topo_framework)
+            );
+        let vci_addrs =
+            vci_vec_0.map_ref(|obj| {
+                let vci: &ValidatorConsensusInfo = obj;
+                validator_consensus_info::get_addr(vci)
+            });
+        let vci_pks =
+            vci_vec_0.map_ref(|obj| {
+                let vci: &ValidatorConsensusInfo = obj;
+                validator_consensus_info::get_pk_bytes(vci)
+            });
+        let vci_voting_powers =
+            vci_vec_0.map_ref(|obj| {
+                let vci: &ValidatorConsensusInfo = obj;
+                validator_consensus_info::get_voting_power(vci)
+            });
+        assert!(
+            vector[@0x5, @topo_framework, @0x3] == vci_addrs,
+            1
+        );
+        assert!(
+            vector[pk_5_bytes, pk_1_bytes, pk_3_bytes] == vci_pks,
+            2
+        );
+        assert!(vector[105, 101, 103] == vci_voting_powers, 3);
+        leave_validator_set(validator_3, v3_addr);
+        let vci_vec_1 =
+            validator_consensus_infos_from_validator_set(
+                borrow_global<ValidatorSet>(@topo_framework)
+            );
+        assert!(vci_vec_0 == vci_vec_1, 11);
+        join_validator_set(validator_2, v2_addr);
+        let vci_vec_2 =
+            validator_consensus_infos_from_validator_set(
+                borrow_global<ValidatorSet>(@topo_framework)
+            );
+        assert!(vci_vec_0 == vci_vec_2, 12);
+        leave_validator_set(validator_1, v1_addr);
+        let vci_vec_3 =
+            validator_consensus_infos_from_validator_set(
+                borrow_global<ValidatorSet>(@topo_framework)
+            );
+        assert!(vci_vec_0 == vci_vec_3, 13);
+        join_validator_set(validator_4, v4_addr);
+        let vci_vec_4 =
+            validator_consensus_infos_from_validator_set(
+                borrow_global<ValidatorSet>(@topo_framework)
+            );
+        assert!(vci_vec_0 == vci_vec_4, 14);
     }
 
     #[
@@ -2675,7 +4206,7 @@ module topo_framework::stake {
         validator_3: &signer,
         validator_4: &signer,
         validator_5: &signer
-    ) acquires AllowedValidators, TopoCoinCapabilities, PendingTransactionFee, StakePool, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
         let v1_addr = signer::address_of(validator_1);
         let v2_addr = signer::address_of(validator_2);
         let v3_addr = signer::address_of(validator_3);
@@ -2683,8 +4214,6 @@ module topo_framework::stake {
         let v5_addr = signer::address_of(validator_5);
 
         initialize_for_test(topo_framework);
-        // This test focuses on validator index churn, not power decay across periods.
-        poc_power_store::set_retention_bps_per_period(topo_framework, 10000);
 
         let (_sk_1, pk_1, pop_1) = generate_identity();
         let (_sk_2, pk_2, pop_2) = generate_identity();
@@ -2692,11 +4221,11 @@ module topo_framework::stake {
         let (_sk_4, pk_4, pop_4) = generate_identity();
         let (_sk_5, pk_5, pop_5) = generate_identity();
 
-        initialize_test_validator(topo_framework, &pk_1, &pop_1, validator_1, 100, false, false);
-        initialize_test_validator(topo_framework, &pk_2, &pop_2, validator_2, 100, false, false);
-        initialize_test_validator(topo_framework, &pk_3, &pop_3, validator_3, 100, false, false);
-        initialize_test_validator(topo_framework, &pk_4, &pop_4, validator_4, 100, false, false);
-        initialize_test_validator(topo_framework, &pk_5, &pop_5, validator_5, 100, false, false);
+        initialize_test_validator(&pk_1, &pop_1, validator_1, 100, false, false);
+        initialize_test_validator(&pk_2, &pop_2, validator_2, 100, false, false);
+        initialize_test_validator(&pk_3, &pop_3, validator_3, 100, false, false);
+        initialize_test_validator(&pk_4, &pop_4, validator_4, 100, false, false);
+        initialize_test_validator(&pk_5, &pop_5, validator_5, 100, false, false);
 
         join_validator_set(validator_3, v3_addr);
         end_epoch();
@@ -2735,6 +4264,300 @@ module topo_framework::stake {
         assert!(get_validator_index(v2_addr) == 2, 17);
     }
 
+    #[test(topo_framework = @topo_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    public entry fun test_validator_rewards_are_performance_based(
+        topo_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        initialize_for_test(topo_framework);
+
+        let validator_1_address = signer::address_of(validator_1);
+        let validator_2_address = signer::address_of(validator_2);
+
+        // Both validators join the set.
+        let (_sk_1, pk_1, pop_1) = generate_identity();
+        let (_sk_2, pk_2, pop_2) = generate_identity();
+        initialize_test_validator(&pk_1, &pop_1, validator_1, 100, true, false);
+        initialize_test_validator(&pk_2, &pop_2, validator_2, 100, true, true);
+
+        // Validator 2 failed proposal.
+        let failed_proposer_indices = vector::empty<u64>();
+        let validator_1_index =
+            borrow_global<ValidatorConfig>(validator_1_address).validator_index;
+        let validator_2_index =
+            borrow_global<ValidatorConfig>(validator_2_address).validator_index;
+        failed_proposer_indices.push_back(validator_2_index);
+        let proposer_indices = option::some(validator_1_index);
+        update_performance_statistics(proposer_indices, failed_proposer_indices);
+        end_epoch();
+
+        // Validator 2 received no rewards. Validator 1 didn't fail proposals, so it still receives rewards.
+        assert_validator_state(validator_1_address, 101, 0, 0, 0, 1);
+        assert_validator_state(validator_2_address, 100, 0, 0, 0, 0);
+
+        // Validator 2 decides to leave. Both validators failed proposals.
+        unlock(validator_2, 100);
+        leave_validator_set(validator_2, validator_2_address);
+        let failed_proposer_indices = vector::empty<u64>();
+        let validator_1_index =
+            borrow_global<ValidatorConfig>(validator_1_address).validator_index;
+        let validator_2_index =
+            borrow_global<ValidatorConfig>(validator_2_address).validator_index;
+        failed_proposer_indices.push_back(validator_1_index);
+        failed_proposer_indices.push_back(validator_2_index);
+        update_performance_statistics(option::none(), failed_proposer_indices);
+        // Fast forward so validator 2's stake is fully unlocked.
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_epoch();
+
+        // Validator 1 and 2 received no additional rewards due to failed proposals
+        assert_validator_state(validator_1_address, 101, 0, 0, 0, 0);
+        assert_validator_state(validator_2_address, 0, 100, 0, 0, 0);
+    }
+
+    #[test(topo_framework = @topo_framework, validator_1 = @0x123, validator_2 = @0x234)]
+    public entry fun test_validator_rewards_rate_decrease_over_time(
+        topo_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        initialize_for_test(topo_framework);
+
+        let genesis_time_in_secs = timestamp::now_seconds();
+
+        let validator_1_address = signer::address_of(validator_1);
+        let validator_2_address = signer::address_of(validator_2);
+
+        // Both validators join the set.
+        let (_sk_1, pk_1, pop_1) = generate_identity();
+        let (_sk_2, pk_2, pop_2) = generate_identity();
+        initialize_test_validator(&pk_1, &pop_1, validator_1, 1000, true, false);
+        initialize_test_validator(&pk_2, &pop_2, validator_2, 10000, true, true);
+
+        // One epoch passed. Validator 1 and validator 2 should receive rewards at rewards rate = 1% every epoch.
+        end_epoch();
+        assert_validator_state(validator_1_address, 1010, 0, 0, 0, 1);
+        assert_validator_state(validator_2_address, 10100, 0, 0, 0, 0);
+
+        // Enable rewards rate decrease. Initially rewards rate is still 1% every epoch. Rewards rate halves every year.
+        let one_year_in_secs: u64 = 31536000;
+        staking_config::initialize_rewards(
+            topo_framework,
+            fixed_point64::create_from_rational(1, 100),
+            fixed_point64::create_from_rational(3, 1000),
+            one_year_in_secs,
+            genesis_time_in_secs,
+            fixed_point64::create_from_rational(50, 100)
+        );
+        features::change_feature_flags_for_testing(
+            topo_framework,
+            vector[features::get_periodical_reward_rate_decrease_feature()],
+            vector[]
+        );
+
+        // For some reason, this epoch is very long. It has been 1 year since genesis when the epoch ends.
+        timestamp::fast_forward_seconds(one_year_in_secs - EPOCH_DURATION * 3);
+        end_epoch();
+        // Validator 1 and validator 2 should still receive rewards at rewards rate = 1% every epoch. Rewards rate has halved after this epoch.
+        assert_validator_state(validator_1_address, 1020, 0, 0, 0, 1);
+        assert_validator_state(validator_2_address, 10200, 0, 0, 0, 0);
+
+        // For some reason, this epoch is also very long. One year passed.
+        timestamp::fast_forward_seconds(one_year_in_secs - EPOCH_DURATION);
+        end_epoch();
+        // Validator 1 and validator 2 should still receive rewards at rewards rate = 0.5% every epoch. Rewards rate has halved after this epoch.
+        assert_validator_state(validator_1_address, 1025, 0, 0, 0, 1);
+        assert_validator_state(validator_2_address, 10250, 0, 0, 0, 0);
+
+        end_epoch();
+        // Rewards rate has halved but cannot become lower than min_rewards_rate.
+        // Validator 1 and validator 2 should receive rewards at rewards rate = 0.3% every epoch.
+        assert_validator_state(validator_1_address, 1028, 0, 0, 0, 1);
+        assert_validator_state(validator_2_address, 10280, 0, 0, 0, 0);
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123)]
+    public entry fun test_update_performance_statistics_should_not_fail_due_to_out_of_bounds(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        initialize_for_test(topo_framework);
+
+        let validator_address = signer::address_of(validator);
+        let (_sk, pk, pop) = generate_identity();
+        initialize_test_validator(&pk, &pop, validator, 100, true, true);
+
+        let valid_validator_index =
+            borrow_global<ValidatorConfig>(validator_address).validator_index;
+        let out_of_bounds_index = valid_validator_index + 100;
+
+        // Invalid validator index in the failed proposers vector should not lead to abort.
+        let failed_proposer_indices = vector::empty<u64>();
+        failed_proposer_indices.push_back(valid_validator_index);
+        failed_proposer_indices.push_back(out_of_bounds_index);
+        update_performance_statistics(option::none(), failed_proposer_indices);
+        end_epoch();
+
+        // Validator received no rewards due to failing to propose.
+        assert_validator_state(validator_address, 100, 0, 0, 0, 0);
+
+        // Invalid validator index in the proposer should not lead to abort.
+        let proposer_index_optional = option::some(out_of_bounds_index);
+        update_performance_statistics(proposer_index_optional, vector::empty<u64>());
+        end_epoch();
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x1000B, location = Self)]
+    public entry fun test_invalid_config(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, InstalledRewardContext, OwnerCapability, StakePool, TopoCoinCapabilities, ValidatorConfig, ValidatorSet {
+        initialize_for_test_custom(
+            topo_framework,
+            50,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            100,
+            100
+        );
+
+        // Call initialize_stake_owner, which only initializes the stake pool but not validator config.
+        let validator_address = signer::address_of(validator);
+        account::create_account_for_test(validator_address);
+        initialize_stake_owner(
+            validator,
+            0,
+            validator_address,
+            validator_address
+        );
+        mint_and_add_stake(validator, 100);
+
+        // Join the validator set with enough stake. This should fail because the validator didn't initialize validator
+        // config.
+        join_validator_set(validator, validator_address);
+    }
+
+    #[test(topo_framework = @topo_framework, validator = @0x123)]
+    public entry fun test_valid_config(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, InstalledRewardContext, OwnerCapability, StakePool, TopoCoinCapabilities, ValidatorConfig, ValidatorSet {
+        initialize_for_test_custom(
+            topo_framework,
+            50,
+            10000,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            1,
+            100,
+            100
+        );
+
+        // Call initialize_stake_owner, which only initializes the stake pool but not validator config.
+        let validator_address = signer::address_of(validator);
+        account::create_account_for_test(validator_address);
+        initialize_stake_owner(
+            validator,
+            0,
+            validator_address,
+            validator_address
+        );
+        mint_and_add_stake(validator, 100);
+
+        // Initialize validator config.
+        let validator_address = signer::address_of(validator);
+        let (_sk_new, pk_new, pop_new) = generate_identity();
+        let pk_new_bytes = bls12381::public_key_to_bytes(&pk_new);
+        let pop_new_bytes = bls12381::proof_of_possession_to_bytes(&pop_new);
+        rotate_consensus_key(
+            validator,
+            validator_address,
+            pk_new_bytes,
+            pop_new_bytes
+        );
+
+        // Join the validator set with enough stake. This now wouldn't fail since the validator config already exists.
+        join_validator_set(validator, validator_address);
+    }
+
+    #[test]
+    public entry fun test_rewards_calculation() {
+        let stake_amount = 2000;
+        let num_successful_proposals = 199;
+        let num_total_proposals = 200;
+        let rewards_rate = 700;
+        let rewards_rate_denominator = 777;
+        let rewards_amount =
+            reward_amount_wide(
+                stake_amount,
+                num_successful_proposals,
+                num_total_proposals as u256,
+                rewards_rate,
+                rewards_rate_denominator
+            );
+        // Consider `amount_imprecise` and `amount_precise` defined as follows:
+        // amount_imprecise = (stake_amount * rewards_rate / rewards_rate_denominator) * num_successful_proposals / num_total_proposals
+        // amount_precise = stake_amount * rewards_rate * num_successful_proposals / (rewards_rate_denominator * num_total_proposals)
+        // Although they are equivalent in the real arithmetic, they are not in the integer arithmetic due to a rounding error.
+        // With the test parameters above, `amount_imprecise` is equal to 1791 because of an unbounded rounding error
+        // while `amount_precise` is equal to 1792. The reward must use the single final division.
+        assert!(rewards_amount == 1792, 0);
+
+        let stake_amount = 100000000000000000;
+        let num_successful_proposals = 9999;
+        let num_total_proposals = 10000;
+        let rewards_rate = 3141592;
+        let rewards_rate_denominator = 10000000;
+        // This should not abort due to an arithmetic overflow.
+        let rewards_amount =
+            reward_amount_wide(
+                stake_amount,
+                num_successful_proposals,
+                num_total_proposals as u256,
+                rewards_rate,
+                rewards_rate_denominator
+            );
+        assert!(rewards_amount == 31412778408000000, 0);
+    }
+
+    #[test_only]
+    public fun set_validator_perf_at_least_one_block() acquires ValidatorPerformance {
+        let validator_perf = borrow_global_mut<ValidatorPerformance>(@topo_framework);
+        validator_perf.validators.for_each_mut(|validator| {
+            let validator: &mut IndividualValidatorPerformance = validator;
+            if (validator.successful_proposals + validator.failed_proposals < 1) {
+                validator.successful_proposals = 1;
+            };
+        });
+    }
+
+    #[test(topo_framework = @0x1, validator_1 = @0x123, validator_2 = @0x234)]
+    public entry fun test_removing_validator_from_active_set(
+        topo_framework: &signer, validator_1: &signer, validator_2: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        initialize_for_test(topo_framework);
+        let (_sk_1, pk_1, pop_1) = generate_identity();
+        let (_sk_2, pk_2, pop_2) = generate_identity();
+        initialize_test_validator(&pk_1, &pop_1, validator_1, 100, true, false);
+        initialize_test_validator(&pk_2, &pop_2, validator_2, 100, true, true);
+        assert!(
+            borrow_global<ValidatorSet>(@topo_framework).active_validators.length()
+                == 2,
+            0
+        );
+
+        // Remove validator 1 from the active validator set. Only validator 2 remains.
+        let validator_to_remove = signer::address_of(validator_1);
+        remove_validators(topo_framework, &vector[validator_to_remove]);
+        assert!(
+            borrow_global<ValidatorSet>(@topo_framework).active_validators.length()
+                == 1,
+            0
+        );
+        assert!(
+            get_validator_state(validator_to_remove)
+                == VALIDATOR_STATUS_PENDING_INACTIVE,
+            1
+        );
+    }
+
     #[test(
         vm = @0x0, topo_framework = @0x1, validator_0 = @0x123, validator_1 = @0x234
     )]
@@ -2743,7 +4566,7 @@ module topo_framework::stake {
         topo_framework: &signer,
         validator_0: &signer,
         validator_1: &signer
-    ) acquires AllowedValidators, TopoCoinCapabilities, PendingTransactionFee, StakePool, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
         initialize_for_test(topo_framework);
         initialize_pending_transaction_fee(topo_framework);
         features::change_feature_flags_for_testing(
@@ -2755,8 +4578,8 @@ module topo_framework::stake {
         let address_1 = signer::address_of(validator_1);
         let (_sk_0, pk_0, pop_0) = generate_identity();
         let (_sk_1, pk_1, pop_1) = generate_identity();
-        initialize_test_validator(topo_framework, &pk_0, &pop_0, validator_0, 100, true, false);
-        initialize_test_validator(topo_framework, &pk_1, &pop_1, validator_1, 100, true, true);
+        initialize_test_validator(&pk_0, &pop_0, validator_0, 100, true, false);
+        initialize_test_validator(&pk_1, &pop_1, validator_1, 100, true, true);
         assert!(
             borrow_global<ValidatorSet>(@topo_framework).active_validators.length()
                 == 2,
@@ -2842,105 +4665,243 @@ module topo_framework::stake {
         );
     }
 
-    #[test_only]
-    public fun end_epoch() acquires PendingTransactionFee, StakePool, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
-        // Set the number of blocks to 1, to give out rewards to non-failing validators.
-        let validator_perf = borrow_global_mut<ValidatorPerformance>(@topo_framework);
-        validator_perf.validators.for_each_mut(|validator| {
-            let validator: &mut IndividualValidatorPerformance = validator;
-            if (validator.successful_proposals + validator.failed_proposals < 1) {
-                validator.successful_proposals = 1;
+    #[test(
+        vm = @0x0, topo_framework = @0x1, validator_0 = @0x123, validator_1 = @0x234
+    )]
+    #[expected_failure(abort_code = 0x10002, location = 0x1::big_ordered_map)]
+    public entry fun test_transaction_fee_non_validator(
+        vm: &signer,
+        topo_framework: &signer,
+        validator_0: &signer,
+        validator_1: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        initialize_for_test(topo_framework);
+        initialize_pending_transaction_fee(topo_framework);
+        features::change_feature_flags_for_testing(
+            topo_framework,
+            vector[features::get_distribute_transaction_fee_feature()],
+            vector[]
+        );
+        let (_sk_0, pk_0, pop_0) = generate_identity();
+        let (_sk_1, pk_1, pop_1) = generate_identity();
+        initialize_test_validator(&pk_0, &pop_0, validator_0, 100, true, false);
+        initialize_test_validator(&pk_1, &pop_1, validator_1, 100, true, true);
+        assert!(
+            borrow_global<ValidatorSet>(@topo_framework).active_validators.length()
+                == 2,
+            0
+        );
+
+        let validator_to_remove = signer::address_of(validator_0);
+        remove_validators(topo_framework, &vector[validator_to_remove]);
+        assert!(
+            borrow_global<ValidatorSet>(@topo_framework).active_validators.length()
+                == 1,
+            0
+        );
+
+        // validator 0 is pending inactive, validator 1 is active.
+
+        end_epoch();
+        assert!(
+            event::emitted_events<DistributeTransactionFee>().length() == 0,
+            0
+        );
+
+        // Validator index is out of bound, abort.
+        record_fee(vm, vector[1], vector[1]);
+    }
+
+    #[test(
+        vm = @0x0, topo_framework = @0x1, validator_0 = @0x123, validator_1 = @0x234
+    )]
+    public entry fun test_transaction_fee_limit(
+        vm: &signer,
+        topo_framework: &signer,
+        validator_0: &signer,
+        validator_1: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        initialize_for_test(topo_framework);
+        initialize_pending_transaction_fee(topo_framework);
+        features::change_feature_flags_for_testing(
+            topo_framework,
+            vector[features::get_distribute_transaction_fee_feature()],
+            vector[]
+        );
+        let address_0 = signer::address_of(validator_0);
+        let address_1 = signer::address_of(validator_1);
+        let (_sk_0, pk_0, pop_0) = generate_identity();
+        let (_sk_1, pk_1, pop_1) = generate_identity();
+        initialize_test_validator(&pk_0, &pop_0, validator_0, 100, true, false);
+        initialize_test_validator(&pk_1, &pop_1, validator_1, 100, true, true);
+        assert!(
+            borrow_global<ValidatorSet>(@topo_framework).active_validators.length()
+                == 2,
+            0
+        );
+
+        record_fee(vm, vector[], vector[]);
+        record_fee(
+            vm,
+            vector[get_validator_index(address_0)],
+            vector[1]
+        );
+        record_fee(
+            vm,
+            vector[get_validator_index(address_1)],
+            vector[2]
+        );
+        record_fee(
+            vm,
+            vector[get_validator_index(address_0), get_validator_index(address_1)],
+            vector[10, 220]
+        );
+
+        {
+            let fee_table =
+                &borrow_global<PendingTransactionFee>(@topo_framework).pending_fee_by_validator;
+            assert!(
+                fee_table.borrow(&get_validator_index(address_0)).read() == 11,
+                0
+            );
+            assert!(
+                fee_table.borrow(&get_validator_index(address_1)).read() == 222,
+                0
+            );
+            let config = TransactionFeeConfig::V0 {
+                max_fee_octa_allowed_per_epoch_per_pool: 20
             };
-        });
+            set_transaction_fee_config(topo_framework, config);
+            end_epoch();
+
+            assert!(
+                event::was_event_emitted(
+                    &DistributeTransactionFee { pool_address: address_0, fee_amount: 11 }
+                ),
+                0
+            );
+            assert!(
+                event::was_event_emitted(
+                    &DistributeTransactionFee { pool_address: address_1, fee_amount: 20 }
+                ),
+                0
+            );
+        };
+
+        // Make sure we can set the config multiple times.
+        let config =
+            TransactionFeeConfig::V0 { max_fee_octa_allowed_per_epoch_per_pool: 200 };
+        set_transaction_fee_config(topo_framework, config);
+    }
+
+    #[test_only]
+    public fun end_epoch() acquires EpochPlan, InstalledRewardContext, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        // Set the number of blocks to 1, to give out rewards to non-failing validators.
+        set_validator_perf_at_least_one_block();
         timestamp::fast_forward_seconds(EPOCH_DURATION);
         reconfiguration_state::on_reconfig_start();
-        let actual =
-            next_validator_consensus_infos().map(|i| validator_consensus_info::get_addr(&i));
+        let actual = validator_consensus_infos_from_validator_set(&next_validator_consensus_infos_v2());
         on_new_epoch();
-        let expected =
-            cur_validator_consensus_infos().map(|i| validator_consensus_info::get_addr(&i));
+        let expected = cur_validator_consensus_infos();
         assert!(expected == actual, 999);
         reconfiguration_state::on_reconfig_finish();
     }
 
     #[test_only]
-    /// Override the current epoch proposal counters for a validator.
-    ///
-    /// External test modules cannot mutate `ValidatorPerformance` directly because that
-    /// resource is internal to the staking pipeline. This helper keeps tests on the real
-    /// reward path while allowing them to deterministically configure the proposal inputs
-    /// consumed by `next_validator_consensus_infos()` and `on_new_epoch()`.
-    public fun set_validator_performance_for_test(
-        validator_index: u64,
-        successful_proposals: u64,
-        failed_proposals: u64,
-    ) acquires ValidatorPerformance {
-        let validator_perf = borrow_global_mut<ValidatorPerformance>(@topo_framework);
-        let perf = validator_perf.validators.borrow_mut(validator_index);
-        perf.successful_proposals = successful_proposals;
-        perf.failed_proposals = failed_proposals;
-    }
-
-    #[test_only]
-    /// Thin test-only wrapper around the production fee recording path.
-    ///
-    /// The real `record_fee` entry point is restricted to the VM via a friend-only call,
-    /// which is correct for production but inaccessible from external Move test modules.
-    /// This helper preserves the exact production logic and only opens a test harness hook.
-    public fun record_fee_for_test(
-        vm: &signer,
-        fee_distribution_validator_indices: vector<u64>,
-        fee_amounts_octa: vector<u64>,
-    ) acquires PendingTransactionFee {
-        record_fee(vm, fee_distribution_validator_indices, fee_amounts_octa);
-    }
-
-    #[test_only]
-    /// Test-only probe for the emergency validator-set fallback event.
-    ///
-    /// External Move test modules cannot name `stake::ValidatorSetLivenessFallback`
-    /// directly because the event type is private to this module. This helper lets
-    /// e2e tests verify the production event without widening production visibility.
-    public fun was_validator_set_liveness_fallback_emitted(
-        minimum_stake: u64,
-        emergency_validator_count: u64,
-        total_emergency_voting_power: u128,
-    ): bool {
-        event::was_event_emitted(
-            &ValidatorSetLivenessFallback {
-                minimum_stake,
-                emergency_validator_count,
-                total_emergency_voting_power,
-            }
-        )
-    }
-
-    #[test_only]
-    /// Test-only probe for the transaction-fee distribution event.
-    ///
-    /// This mirrors the exact event emitted inside `on_new_epoch`, allowing external
-    /// Move tests to validate the Rust-visible fee path without exposing the event type.
-    public fun was_transaction_fee_distributed(
+    public fun assert_stake_pool(
         pool_address: address,
-        fee_amount: u64,
-    ): bool {
-        event::was_event_emitted(
-            &DistributeTransactionFee {
-                pool_address,
-                fee_amount,
-            }
-        )
+        active_stake: u64,
+        inactive_stake: u64,
+        pending_active_stake: u64,
+        pending_inactive_stake: u64
+    ) acquires StakePool {
+        let stake_pool = borrow_global<StakePool>(pool_address);
+        let actual_active_stake = coin::value(&stake_pool.active);
+        assert!(actual_active_stake == active_stake, actual_active_stake);
+        let actual_inactive_stake = coin::value(&stake_pool.inactive);
+        assert!(actual_inactive_stake == inactive_stake, actual_inactive_stake);
+        let actual_pending_active_stake = coin::value(&stake_pool.pending_active);
+        assert!(
+            actual_pending_active_stake == pending_active_stake,
+            actual_pending_active_stake
+        );
+        let actual_pending_inactive_stake = coin::value(&stake_pool.pending_inactive);
+        assert!(
+            actual_pending_inactive_stake == pending_inactive_stake,
+            actual_pending_inactive_stake
+        );
+    }
+
+    #[test_only]
+    public fun assert_validator_state(
+        pool_address: address,
+        active_stake: u64,
+        inactive_stake: u64,
+        pending_active_stake: u64,
+        pending_inactive_stake: u64,
+        validator_index: u64
+    ) acquires StakePool, ValidatorConfig {
+        assert_stake_pool(
+            pool_address,
+            active_stake,
+            inactive_stake,
+            pending_active_stake,
+            pending_inactive_stake
+        );
+        let validator_config = borrow_global<ValidatorConfig>(pool_address);
+        assert!(
+            validator_config.validator_index == validator_index,
+            validator_config.validator_index
+        );
+    }
+
+    #[test(topo_framework = @0x1, validator = @0x123)]
+    public entry fun test_allowed_validators(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, InstalledRewardContext, OwnerCapability, StakePool, ValidatorSet {
+        let addr = signer::address_of(validator);
+        let (burn, mint) = topo_coin::initialize_for_test(topo_framework);
+        configure_allowed_validators(topo_framework, vector[addr]);
+
+        account::create_account_for_test(addr);
+        coin::register<TopoCoin>(validator);
+        initialize_stake_owner(validator, 0, addr, addr);
+        coin::destroy_burn_cap(burn);
+        coin::destroy_mint_cap(mint);
+    }
+
+    #[test(topo_framework = @0x1, validator = @0x123)]
+    #[expected_failure(abort_code = 0x60011, location = Self)]
+    public entry fun test_not_allowed_validators(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, InstalledRewardContext, OwnerCapability, StakePool, ValidatorSet {
+        configure_allowed_validators(topo_framework, vector[]);
+        let (burn, mint) = topo_coin::initialize_for_test(topo_framework);
+
+        let addr = signer::address_of(validator);
+        account::create_account_for_test(addr);
+        coin::register<TopoCoin>(validator);
+        initialize_stake_owner(validator, 0, addr, addr);
+        coin::destroy_burn_cap(burn);
+        coin::destroy_mint_cap(mint);
+    }
+
+    #[test_only]
+    public fun with_rewards(amount: u64): u64 {
+        let (numerator, denominator) =
+            staking_config::get_reward_rate(&staking_config::get());
+        amount + amount * numerator / denominator
     }
 
     #[test(topo_framework = @topo_framework, validator = @0x123)]
     public entry fun test_validator_set_liveness_fallback(
         topo_framework: &signer, validator: &signer
-    ) acquires ValidatorSet, AllowedValidators, TopoCoinCapabilities, PendingTransactionFee, StakePool, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance {
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
         // Initialize with a minimum stake requirement (100)
         initialize_for_test(topo_framework);
         let (_sk, pk, pop) = generate_identity();
 
-        initialize_test_validator(topo_framework, &pk, &pop, validator, 100, true, true);
+        initialize_test_validator(&pk, &pop, validator, 100, true, true);
         staking_config::update_required_stake(topo_framework, 1000, 10000);
         end_epoch();
 
@@ -2960,150 +4921,982 @@ module topo_framework::stake {
     }
 
     #[test(topo_framework = @topo_framework, validator = @0x123)]
-    public entry fun test_next_validator_consensus_infos_includes_epoch_rewards(
-        topo_framework: &signer,
-        validator: &signer,
-    ) acquires ValidatorSet, AllowedValidators, TopoCoinCapabilities, PendingTransactionFee, StakePool, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance {
-        initialize_for_test_custom(
-            topo_framework,
-            100,
-            10000,
-            LOCKUP_CYCLE_SECONDS,
-            true,
-            0,
-            100,
-            1000000,
-        );
-        poc_power_store::set_retention_bps_per_period(topo_framework, 10000);
-
-        let validator_address = signer::address_of(validator);
+    public entry fun test_reconfig_start_fills_precomputed_cache(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        initialize_for_test(topo_framework);
         let (_sk, pk, pop) = generate_identity();
-        initialize_test_validator(topo_framework, &pk, &pop, validator, 100, true, false);
-        // Keep the committed power above the current deposit cover so the next-epoch
-        // simulation must include rewards to raise voting power from 100 to 120.
-        poc_power_store::set_genesis_committed_power(
-            topo_framework,
-            validator_address,
-            120,
-        );
-        end_epoch();
-        staking_config::update_rewards_rate(topo_framework, 25, 100);
-        {
-            let validator_perf = borrow_global_mut<ValidatorPerformance>(@topo_framework);
-            let perf = validator_perf.validators.borrow_mut(0);
-            perf.successful_proposals = 1;
-            perf.failed_proposals = 0;
-        };
+        initialize_test_validator(&pk, &pop, validator, 100, true, true);
 
-        staking_config::update_required_stake(topo_framework, 110, 10000);
-
-        let next_infos = next_validator_consensus_infos();
-        assert!(next_infos.length() == 1, 0);
-        let next_info = next_infos.borrow(0);
-        assert!(validator_consensus_info::get_addr(next_info) == validator_address, 1);
-        assert!(validator_consensus_info::get_voting_power(next_info) == 120, 2);
-
-        end_epoch();
-
-        let cur_infos = cur_validator_consensus_infos();
-        assert!(cur_infos.length() == 1, 3);
-        let cur_info = cur_infos.borrow(0);
-        assert!(validator_consensus_info::get_addr(cur_info) == validator_address, 4);
-        assert!(validator_consensus_info::get_voting_power(cur_info) == 120, 5);
+        // Simulates what try_start / try_start_with_chunky_dkg does.
+        reconfiguration_state::on_reconfig_start();
+        let _ = next_validator_consensus_infos_v2();
+        assert!(exists<PrecomputedValidatorSet>(@topo_framework), 0);
     }
 
-    #[test(
-        topo_framework = @topo_framework,
-        validator = @0x123,
-        delegator = @0x456
-    )]
-    #[expected_failure(abort_code = 0x1000f, location = topo_framework::staking_registry)]
-    public entry fun test_delegate_rejects_below_min_active_power(
-        topo_framework: &signer,
-        validator: &signer,
-        delegator: &signer,
-    ) acquires AllowedValidators, TopoCoinCapabilities, PendingTransactionFee, StakePool, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+    #[test(topo_framework = @topo_framework, validator = @0x123)]
+    public entry fun test_precomputed_cache_cleared_after_epoch(
+        topo_framework: &signer, validator: &signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
         initialize_for_test(topo_framework);
-
-        let validator_address = signer::address_of(validator);
-        let delegator_address = signer::address_of(delegator);
-        let (_validator_sk, validator_pk, validator_pop) = generate_identity();
-        initialize_test_validator(
-            topo_framework,
-            &validator_pk,
-            &validator_pop,
-            validator,
-            100,
-            false,
-            false,
-        );
-
-        staking_registry::set_active_power_thresholds(topo_framework, 100, 8000);
-        account::create_account_for_test(delegator_address);
-        poc_power_store::set_genesis_committed_power(
-            topo_framework,
-            delegator_address,
-            99,
-        );
-        mint_and_add_stake(delegator, 99);
-
-        staking_registry::delegate(delegator, validator_address);
-    }
-
-    #[test(
-        topo_framework = @topo_framework,
-        validator = @0x123,
-        delegator = @0x456
-    )]
-    public entry fun test_force_undelegate_below_maintain_threshold(
-        topo_framework: &signer,
-        validator: &signer,
-        delegator: &signer,
-    ) acquires AllowedValidators, TopoCoinCapabilities, PendingTransactionFee, StakePool, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
-        initialize_for_test(topo_framework);
-
-        let validator_address = signer::address_of(validator);
-        let delegator_address = signer::address_of(delegator);
-        let (_validator_sk, validator_pk, validator_pop) = generate_identity();
-        initialize_test_validator(
-            topo_framework,
-            &validator_pk,
-            &validator_pop,
-            validator,
-            100,
-            true,
-            false,
-        );
-
-        account::create_account_for_test(delegator_address);
-        poc_power_store::set_genesis_committed_power(
-            topo_framework,
-            delegator_address,
-            100,
-        );
-        mint_and_add_stake(delegator, 100);
-        staking_registry::delegate(delegator, validator_address);
-        staking_registry::set_active_power_thresholds(topo_framework, 100, 8000);
-
-        let target_period = poc_power_store::get_current_period() + 1;
-        poc_power_store::stage_batch_update(
-            topo_framework,
-            target_period,
-            vector[delegator_address],
-            vector[79u64],
-        );
+        let (_sk, pk, pop) = generate_identity();
+        initialize_test_validator(&pk, &pop, validator, 100, true, true);
 
         end_epoch();
-        let (_, delegated_to_before, _) = staking_registry::get_user_stake_info(delegator_address);
-        assert!(delegated_to_before == validator_address, 0);
 
-        while (poc_power_store::get_current_period() < target_period) {
-            end_epoch();
+        // Cache must be cleared so the next epoch starts fresh.
+        assert!(!exists<PrecomputedValidatorSet>(@topo_framework), 0);
+    }
+    #[test_only]
+    public fun poc_setup(framework: &signer, user: &signer, addresses: vector<address>, activation: u64) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        poc_setup_mode(framework, user, addresses, activation, true);
+    }
+
+    #[test_only]
+    public fun poc_setup_controlled(framework: &signer, user: &signer, addresses: vector<address>, activation: u64) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        poc_setup_mode(framework, user, addresses, activation, false);
+    }
+
+    #[test_only]
+    fun poc_setup_mode(framework: &signer, user: &signer, addresses: vector<address>, activation: u64, dynamic: bool) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        initialize_for_test_custom(framework, 100, 10000, 3600, dynamic, 1, 100, 25);
+        initialize_pending_transaction_fee(framework);
+        set_transaction_fee_limit_per_epoch_per_pool(framework, 50);
+        addresses.for_each_ref(|address| {
+            let validator = create_signer::create_signer(*address);
+            let (_sk, pk, pop) = generate_identity();
+            initialize_test_validator(&pk, &pop, &validator, 100, false, false);
+            join_validator_set_internal(&validator, *address);
+        });
+        end_epoch();
+        staking_config::initialize_rewards(framework, fixed_point64::create_from_rational(1, 100),
+            fixed_point64::create_from_rational(0, 1), 86400, timestamp::now_seconds(),
+            fixed_point64::create_from_rational(0, 1));
+        poc_accounting::prepare(framework, 1, activation,
+            poc_accounting::new_power_params(100000000, 10, 1000, 4),
+            poc_accounting::new_deployment_limits(5, 5, 5, 8, 50),
+            25, dynamic);
+        prepare_poc_context(framework, 1);
+        poc_power_store::initialize_for_test(framework, 1, 10000, 60, @topo_framework);
+        addresses.for_each_ref(|pool| poc_accounting::enable_pool(framework, *pool));
+        poc_accounting::replace_allocation(user, addresses, vector[2500, 2500, 2500, 2500],
+            40u128 << 16, 40u128 << 16, 62);
+    }
+
+    #[test_only]
+    public fun poc_begin_for_test() acquires EpochPlan, InstalledRewardContext, StakePool, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        let epoch = poc_accounting::current_epoch() + 1;
+        assert!(try_cache_epoch_plan(epoch, timestamp::now_seconds()) == 0, 100);
+        reconfiguration_state::on_reconfig_start();
+        validate_epoch_plan(epoch);
+    }
+
+    #[test_only]
+    public fun poc_commit(framework: &signer) acquires EpochPlan, InstalledRewardContext, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        assert!(try_cache_epoch_plan(poc_accounting::current_epoch() + 1, timestamp::now_seconds()) == 0, 100);
+        reconfiguration_state::on_reconfig_start();
+        settle_closing_epoch();
+        apply_cached_features(framework);
+        install_epoch_plan(poc_accounting::current_epoch() + 1);
+        finish_epoch_plan();
+        reconfiguration_state::on_reconfig_finish();
+    }
+
+    #[test_only]
+    public fun record_fee_for_test(vm: &signer, validator_index: u64, fee_octa: u64) acquires PendingTransactionFee {
+        record_fee(vm, vector[validator_index], vector[fee_octa]);
+    }
+
+    #[test_only]
+    /// 每池保证金为 1000 Octa、算力为 1024 power，最终权重上限为 1000 power；最优表现下每期通胀为 10 Octa。
+    fun poc_setup_reward_split(framework: &signer, user: &signer, native_reward_bps: u64) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        let pool_addresses = vector[@0x11, @0x22, @0x33, @0x44];
+        poc_setup(framework, user, pool_addresses, 2);
+        // 通胀用例明确关闭分费；费用用例在安装目标 Epoch 前单独开启。
+        features::change_feature_flags_for_testing(framework, vector[], vector[features::get_distribute_transaction_fee_feature()]);
+        let mint_cap = &borrow_global<TopoCoinCapabilities>(@topo_framework).mint_cap;
+        pool_addresses.for_each_ref(|pool_address| {
+            coin::merge(&mut borrow_global_mut<StakePool>(*pool_address).active, coin::mint(900, mint_cap));
+        });
+        poc_accounting::replace_allocation(user, pool_addresses, vector[2500, 2500, 2500, 2500],
+            4096u128 << 16, 4096u128 << 16, 62);
+        schedule_reward_split(framework, native_reward_bps, 2);
+    }
+
+    #[test_only]
+    fun stake_balances_match(pool_address: address, expected_balances_octa: vector<u64>): bool acquires StakePool {
+        let (active_stake_octa, inactive_stake_octa, pending_active_stake_octa, pending_inactive_stake_octa) = get_stake(pool_address);
+        vector[active_stake_octa, inactive_stake_octa, pending_active_stake_octa, pending_inactive_stake_octa] == expected_balances_octa
+    }
+
+    #[test(framework = @0x1, user = @0x777, vm = @vm_reserved)]
+    fun poc_large_fee_limit_does_not_reserve_actual_balance(framework: signer, user: signer, vm: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        poc_setup_reward_split(&framework, &user, 10000);
+        poc_accounting::update_deployment_limits(&framework,
+            poc_accounting::new_deployment_limits(5, 5, 5, 8, MAX_U64 as u64), 25, true);
+        validate_poc_deployment_limits();
+        set_transaction_fee_limit_per_epoch_per_pool(&framework, MAX_U64 as u64);
+        features::change_feature_flags_for_testing(&framework,
+            vector[features::get_distribute_transaction_fee_feature()], vector[]);
+
+        // 实际保证金仅 1000 Octa；巨大费用政策上限不能阻止首次安装。
+        assert!(preview_epoch_transition(2, timestamp::now_seconds()).reason == 0, 1);
+        poc_commit(&framework);
+        assert!(stake_balances_match(@0x44, vector[1000, 0, 0, 0]), 2);
+        // 委托入池费仍使用保守估算；10 Octa 通胀加 MAX_U64 费用限额须封顶而非溢出。
+        assert!(get_native_reward_upper_bound(@0x44) == (MAX_U64 as u64), 3);
+
+        let mint_cap = &borrow_global<TopoCoinCapabilities>(@topo_framework).mint_cap;
+        coin::deposit(@0x44, coin::mint(7, mint_cap));
+        let owner = create_signer::create_signer(@0x44);
+        add_stake(&owner, 7);
+        assert!(stake_balances_match(@0x44, vector[1000, 0, 7, 0]), 4);
+        let index = get_validator_index(@0x44);
+        update_performance_statistics(option::some(index), vector[]);
+        record_fee(&vm, vector[index], vector[9]);
+        assert!(get_pending_transaction_fee()[index] == 9, 5);
+        assert!(preview_epoch_transition(3, timestamp::now_seconds()).reason == 0, 6);
+        poc_commit(&framework);
+
+        // 只分发真实的 10 Octa 通胀和 9 Octa 费用，再合并追加的 7 Octa 本金。
+        assert!(stake_balances_match(@0x44, vector[1026, 0, 0, 0]), 7);
+        let (_, _, _, vault, _) = poc_accounting::get_pool(@0x44);
+        assert!(vault == 0 && event::was_event_emitted(&DistributeRewards {
+            pool_address: @0x44, rewards_amount: 10 })
+            && event::was_event_emitted(&DistributeTransactionFee { pool_address: @0x44, fee_amount: 9 }), 8);
+        assert!(get_pending_transaction_fee() == vector[0, 0, 0, 0]
+            && poc_accounting::current_epoch() == 3 && !exists<EpochPlan>(@topo_framework)
+            && !exists<PrecomputedValidatorSet>(@topo_framework) && !features::is_reconfiguration_frozen(), 9);
+    }
+
+    #[test(framework = @0x1, user = @0x777)]
+    fun poc_rewards_follow_native_rate_configuration(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        initialize_for_test_custom(&framework, 100, 10000, 3600, true, 1, 100, 25);
+        initialize_pending_transaction_fee(&framework);
+        set_transaction_fee_limit_per_epoch_per_pool(&framework, 50);
+        let pool_addresses = vector[@0x11, @0x22, @0x33, @0x44];
+        pool_addresses.for_each_ref(|pool_address| {
+            let validator = create_signer::create_signer(*pool_address);
+            let (_sk, pk, pop) = generate_identity();
+            initialize_test_validator(&pk, &pop, &validator, 1000, false, false);
+            join_validator_set_internal(&validator, *pool_address);
+        });
+        end_epoch();
+        staking_config::initialize_rewards(&framework, fixed_point64::create_from_rational(1, 100),
+            fixed_point64::create_from_rational(0, 1), 86400, timestamp::now_seconds(),
+            fixed_point64::create_from_rational(0, 1));
+        poc_accounting::prepare(&framework, 1, 2,
+            poc_accounting::new_power_params(100000000, 10, 1000, 4),
+            poc_accounting::new_deployment_limits(5, 5, 5, 8, 50), 25, true);
+        prepare_poc_context(&framework, 1);
+        poc_power_store::initialize_for_test(&framework, 1, 10000, 60, @topo_framework);
+        pool_addresses.for_each_ref(|pool_address| poc_accounting::enable_pool(&framework, *pool_address));
+        poc_accounting::replace_allocation(&user, pool_addresses, vector[2500, 2500, 2500, 2500],
+            4096u128 << 16, 4096u128 << 16, 62);
+        schedule_reward_split(&framework, 3000, 2);
+        // PoC 准备后仍可通过原生治理设置高于原 1% 部署上限的奖励率。
+        staking_config::update_rewards_rate(&framework, 1, 2);
+        staking_config::update_rewards_config(&framework, fixed_point64::create_from_rational(1, 4),
+            fixed_point64::create_from_rational(0, 1), 86400, fixed_point64::create_from_rational(0, 1));
+        assert!(preview_epoch_transition(2, timestamp::now_seconds()).reason == 0, 1);
+        poc_commit(&framework);
+        assert!(get_installed_native_reward_bps() == 3000 && get_native_reward_upper_bound(@0x44) == 165, 2);
+        let (poc, rate, denominator) = get_installed_reward_rate();
+        assert!(poc && rate == 1 && denominator == 2, 3);
+        // 切换奖励率来源只影响新安装的 Epoch，待结束期继续按 50% 结算。
+        features::change_feature_flags_for_next_epoch(&framework,
+            vector[features::get_periodical_reward_rate_decrease_feature()], vector[]);
+        update_performance_statistics(option::some(get_validator_index(@0x44)), vector[]);
+        poc_commit(&framework);
+        let (_, _, _, vault_balance_octa, _) = poc_accounting::get_pool(@0x44);
+        assert!(stake_balances_match(@0x44, vector[1150, 0, 0, 0]) && vault_balance_octa == 350, 4);
+        let (poc, rate, denominator) = get_installed_reward_rate();
+        assert!(poc && rate * 4 == denominator, 5);
+        update_performance_statistics(option::some(get_validator_index(@0x44)), vector[]);
+        poc_commit(&framework);
+        let (_, _, _, vault_balance_octa, _) = poc_accounting::get_pool(@0x44);
+        assert!(stake_balances_match(@0x44, vector[1225, 0, 0, 0]) && vault_balance_octa == 525, 6);
+    }
+
+    #[test_only]
+    fun reward_split_configuration_matches(
+        installed_epoch: u64, installed_native_reward_bps: u64, configured_native_reward_bps: u64,
+        pending_native_reward_bps: Option<u64>, pending_activation_epoch: Option<u64>,
+    ): bool {
+        let (actual_installed_epoch, actual_installed_native_reward_bps, actual_configured_native_reward_bps,
+            actual_pending_native_reward_bps, actual_pending_activation_epoch) = get_reward_split_configuration();
+        actual_installed_epoch == installed_epoch && actual_installed_native_reward_bps == installed_native_reward_bps
+            && actual_configured_native_reward_bps == configured_native_reward_bps
+            && actual_pending_native_reward_bps == pending_native_reward_bps
+            && actual_pending_activation_epoch == pending_activation_epoch
+    }
+
+    #[test(framework = @0x1, power_only = @0x777, bond_only = @0x44, vm = @vm_reserved)]
+    fun poc_mixed_rewards_preserve_native_ownership_and_fee_destination(framework: signer, power_only: signer, bond_only: signer, vm: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        poc_setup_reward_split(&framework, &power_only, 3000);
+        features::change_feature_flags_for_testing(&framework, vector[features::get_distribute_transaction_fee_feature()], vector[]);
+        assert!(get_installed_native_reward_bps() == 0, 1);
+        // 只出保证金的 owner 建立零 units 持仓，以生产领取路径证明其不能取得 PoC 金库收益。
+        poc_accounting::replace_allocation(&bond_only, vector[@0x44], vector[10000], 0, 0, 62);
+        coin::register<TopoCoin>(&power_only);
+        poc_commit(&framework);
+        assert!(get_installed_native_reward_bps() == 3000 && get_native_reward_upper_bound(@0x44) == 18, 2);
+        unlock(&bond_only, 400);
+        let mint_cap = &borrow_global<TopoCoinCapabilities>(@topo_framework).mint_cap;
+        coin::deposit(@0x44, coin::mint(100, mint_cap));
+        add_stake(&bond_only, 100);
+        coin::merge(&mut borrow_global_mut<StakePool>(@0x44).inactive, coin::mint(77, mint_cap));
+        let validator_index = get_validator_index(@0x44);
+        update_performance_statistics(option::some(validator_index), vector[]);
+        record_fee(&vm, vector[validator_index], vector[20]);
+        poc_commit(&framework);
+        // 3 Octa 原生奖励按 active 与 pending_inactive 的 600:400 余额比例分为 2 和 1 Octa。
+        // 20 Octa 交易费分为原生 6、PoC 14；原生费用按同一旧本金分为 4 和 2 Octa。
+        // pending_active 的 100 Octa 与 inactive 的 77 Octa 均不参与本次奖励分配。
+        assert!(stake_balances_match(@0x44, vector[706, 77, 0, 403]), 3);
+        let (units, _, reward_base_octa, vault_balance_octa, reward_index) = poc_accounting::get_pool(@0x44);
+        assert!(units == (1024u128 << 16) && reward_base_octa == 1000
+            && vault_balance_octa == 21 && reward_index == 106482650419171269725723069251584, 4);
+        assert!(event::was_event_emitted(&DistributeRewards { pool_address: @0x44, rewards_amount: 3 })
+            && event::was_event_emitted(&DistributeTransactionFee { pool_address: @0x44, fee_amount: 6 }), 5);
+        assert!(event::was_event_emitted(&PoCRewardSplit { pool: @0x44, closing_epoch: 2,
+            native_reward_bps: 3000, total_inflation_octa: 10, active_native_reward_octa: 2,
+            pending_inactive_native_reward_octa: 1, poc_inflation_octa: 7 }), 6);
+        assert!(event::was_event_emitted(&PoCRewardCredited { pool: @0x44, closing_epoch: 2,
+            reward_base_octa: 1000, inflation: 7, fee: 14,
+            delta_index: 106482650419171269725723069251584 }), 7);
+
+        let (_, _, bond_claimable, bond_fractional) = poc_accounting::get_position(@0x44, @0x44);
+        let (_, _, power_claimable, power_fractional) = poc_accounting::get_position(@0x777, @0x44);
+        assert!(bond_claimable == 0 && bond_fractional == 0
+            && power_claimable == 21 && power_fractional == 0, 8);
+        let bond_rewards = poc_accounting::claim_rewards(&bond_only, vector[@0x44]);
+        coin::destroy_zero(bond_rewards);
+        let claimed_rewards = poc_accounting::claim_rewards(&power_only, vector[@0x44]);
+        assert!(coin::value(&claimed_rewards) == 21 && coin::balance<TopoCoin>(@0x777) == 0
+            && coin::balance<TopoCoin>(@0x44) == 0, 9);
+        coin::deposit(@0x777, claimed_rewards);
+        assert!(coin::balance<TopoCoin>(@0x777) == 21 && coin::balance<TopoCoin>(@0x44) == 0, 10);
+        coin::destroy_zero(poc_accounting::claim_rewards(&power_only, vector[@0x44]));
+        coin::destroy_zero(poc_accounting::claim_rewards(&bond_only, vector[@0x44]));
+        let (_, _, _, remaining_vault, _) = poc_accounting::get_pool(@0x44);
+        assert!(remaining_vault == 0, 11);
+    }
+
+    #[test(framework = @0x1, dual_owner = @0x44, vm = @vm_reserved)]
+    fun poc_mixed_rewards_dual_owner_receives_native_and_poc_independently(framework: signer, dual_owner: signer, vm: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        // 同一地址拥有池保证金并提供全部算力；两类收益仍分别进入质押余额和本人钱包。
+        poc_setup_reward_split(&framework, &dual_owner, 3000);
+        features::change_feature_flags_for_testing(&framework, vector[features::get_distribute_transaction_fee_feature()], vector[]);
+        poc_commit(&framework);
+        unlock(&dual_owner, 400);
+        let mint_cap = &borrow_global<TopoCoinCapabilities>(@topo_framework).mint_cap;
+        coin::deposit(@0x44, coin::mint(100, mint_cap));
+        add_stake(&dual_owner, 100);
+        coin::merge(&mut borrow_global_mut<StakePool>(@0x44).inactive, coin::mint(77, mint_cap));
+        let validator_index = get_validator_index(@0x44);
+        update_performance_statistics(option::some(validator_index), vector[]);
+        record_fee(&vm, vector[validator_index], vector[20]);
+        poc_commit(&framework);
+
+        assert!(stake_balances_match(@0x44, vector[706, 77, 0, 403])
+            && coin::balance<TopoCoin>(@0x44) == 0, 1);
+        let (_, _, claimable_octa, fractional_entitlement) = poc_accounting::get_position(@0x44, @0x44);
+        assert!(claimable_octa == 21 && fractional_entitlement == 0, 2);
+        let claimed_rewards = poc_accounting::claim_rewards(&dual_owner, vector[@0x44]);
+        assert!(coin::value(&claimed_rewards) == 21, 3);
+        coin::deposit(@0x44, claimed_rewards);
+        assert!(coin::balance<TopoCoin>(@0x44) == 21
+            && stake_balances_match(@0x44, vector[706, 77, 0, 403]), 4);
+        coin::destroy_zero(poc_accounting::claim_rewards(&dual_owner, vector[@0x44]));
+        let (_, _, _, vault_balance_octa, _) = poc_accounting::get_pool(@0x44);
+        assert!(vault_balance_octa == 0, 5);
+    }
+
+    #[test(framework = @0x1, user = @0x777, vm = @vm_reserved)]
+    fun poc_zero_and_full_native_split_use_old_epoch_snapshot(framework: signer, user: signer, vm: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        poc_setup_reward_split(&framework, &user, 0);
+        features::change_feature_flags_for_testing(&framework, vector[features::get_distribute_transaction_fee_feature()], vector[]);
+        poc_commit(&framework);
+        schedule_reward_split(&framework, 10000, 3);
+        assert!(get_installed_native_reward_bps() == 0 && get_native_reward_upper_bound(@0x44) == 0, 1);
+        update_performance_statistics(option::some(get_validator_index(@0x44)), vector[]);
+        record_fee(&vm, vector[get_validator_index(@0x44)], vector[5]);
+        poc_commit(&framework);
+        assert!(stake_balances_match(@0x44, vector[1000, 0, 0, 0]) && get_installed_native_reward_bps() == 10000, 2);
+        let (_, _, _, vault_balance_octa, _) = poc_accounting::get_pool(@0x44);
+        assert!(vault_balance_octa == 15, 3);
+        let validator_index = get_validator_index(@0x44);
+        update_performance_statistics(option::some(validator_index), vector[]);
+        record_fee(&vm, vector[validator_index], vector[4]);
+        poc_commit(&framework);
+        let (_, _, _, vault_balance_octa, _) = poc_accounting::get_pool(@0x44);
+        assert!(stake_balances_match(@0x44, vector[1014, 0, 0, 0]) && vault_balance_octa == 15, 4);
+    }
+
+    #[test(framework = @0x1, user = @0x777, vm = @vm_reserved)]
+    fun poc_fee_split_rounding_is_independent_of_inflation(framework: signer, user: signer, vm: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        poc_setup_reward_split(&framework, &user, 3500);
+        features::change_feature_flags_for_testing(&framework, vector[features::get_distribute_transaction_fee_feature()], vector[]);
+        poc_commit(&framework);
+        let index = get_validator_index(@0x44);
+        update_performance_statistics(option::some(index), vector[]);
+        record_fee(&vm, vector[index], vector[2]);
+        poc_commit(&framework);
+        // 原生分别得到 floor(10 * 35%) = 3 和 floor(2 * 35%) = 0，不能先合计后取整为 4。
+        assert!(stake_balances_match(@0x44, vector[1003, 0, 0, 0]), 1);
+        let (_, _, _, vault, _) = poc_accounting::get_pool(@0x44);
+        assert!(vault == 9, 2);
+    }
+
+    #[test(framework = @0x1, user = @0x777, vm = @vm_reserved)]
+    fun poc_fee_only_split_caps_before_splitting_and_uses_old_switch(framework: signer, user: signer, vm: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        poc_setup_reward_split(&framework, &user, 3000);
+        staking_config::update_rewards_rate(&framework, 0, 100);
+        features::change_feature_flags_for_testing(&framework, vector[features::get_distribute_transaction_fee_feature()], vector[]);
+        poc_commit(&framework);
+        assert!(get_native_reward_upper_bound(@0x44) == 15, 1);
+        // 不产生通胀，费用先截断到旧期 50 Octa 上限；当前配置修改不改变已安装上下文。
+        set_transaction_fee_limit_per_epoch_per_pool(&framework, 10);
+        features::change_feature_flags_for_testing(&framework, vector[], vector[features::get_distribute_transaction_fee_feature()]);
+        schedule_reward_split(&framework, 10000, 3);
+        assert!(get_native_reward_upper_bound(@0x44) == 15, 2);
+        record_fee(&vm, vector[get_validator_index(@0x44)], vector[18446744073709551615]);
+        poc_commit(&framework);
+        assert!(stake_balances_match(@0x44, vector[1015, 0, 0, 0]), 3);
+        let (_, _, _, vault, _) = poc_accounting::get_pool(@0x44);
+        assert!(vault == 35 && get_native_reward_upper_bound(@0x44) == 0, 4);
+        // 新期关闭费用分发，已记录费用仍清空，但两路都不入账。
+        record_fee(&vm, vector[get_validator_index(@0x44)], vector[10]);
+        poc_commit(&framework);
+        let (_, _, _, vault, _) = poc_accounting::get_pool(@0x44);
+        assert!(vault == 35 && stake_balances_match(@0x44, vector[1015, 0, 0, 0]), 5);
+        assert!(get_pending_transaction_fee() == vector[0, 0, 0, 0], 6);
+    }
+
+    #[test(framework = @0x1, user = @0x777)]
+    fun poc_fee_upper_bound_excludes_nonvoting_pools(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        poc_setup_reward_split(&framework, &user, 3000);
+        features::change_feature_flags_for_testing(&framework, vector[features::get_distribute_transaction_fee_feature()], vector[]);
+        poc_commit(&framework);
+        poc_add_replacement(&framework, @0x55);
+        assert!(get_native_reward_upper_bound(@0x44) == 18, 1);
+        assert!(!is_current_epoch_validator(@0x55) && get_native_reward_upper_bound(@0x55) == 0, 2);
+    }
+
+    #[test(framework = @0x1, user = @0x777)]
+    fun poc_reward_split_pending_replace_cancel_and_future_activation(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        poc_setup_reward_split(&framework, &user, 3000);
+        poc_commit(&framework);
+        schedule_reward_split(&framework, 5000, 4);
+        schedule_reward_split(&framework, 7500, 3);
+        assert!(reward_split_configuration_matches(2, 3000, 3000, option::some(7500), option::some(3)), 1);
+        cancel_pending_reward_split(&framework);
+        assert!(reward_split_configuration_matches(2, 3000, 3000, option::none(), option::none()), 2);
+        schedule_reward_split(&framework, 6000, 4);
+        poc_commit(&framework);
+        assert!(get_installed_native_reward_bps() == 3000, 3);
+        poc_commit(&framework);
+        assert!(reward_split_configuration_matches(4, 6000, 6000, option::none(), option::none()), 4);
+    }
+
+    #[test(framework = @0x1, user = @0x777)]
+    #[expected_failure(abort_code = 0x30003, location = topo_framework::poc_reward_split)]
+    fun poc_reward_split_schedule_frozen_rejected(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        poc_setup_reward_split(&framework, &user, 3000);
+        poc_begin_for_test();
+        schedule_reward_split(&framework, 6000, 2);
+    }
+
+    #[test(framework = @0x1, user = @0x777)]
+    #[expected_failure(abort_code = 0x30003, location = topo_framework::poc_reward_split)]
+    fun poc_reward_split_cancel_frozen_rejected(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        poc_setup_reward_split(&framework, &user, 3000);
+        poc_begin_for_test();
+        cancel_pending_reward_split(&framework);
+    }
+
+    #[test(user = @0x777)]
+    #[expected_failure(abort_code = 0x50003, location = topo_framework::system_addresses)]
+    fun poc_reward_split_schedule_unauthorized_rejected(user: signer) {
+        schedule_reward_split(&user, 3000, 2);
+    }
+
+    #[test(user = @0x777)]
+    #[expected_failure(abort_code = 0x50003, location = topo_framework::system_addresses)]
+    fun poc_reward_split_cancel_unauthorized_rejected(user: signer) {
+        cancel_pending_reward_split(&user);
+    }
+
+    #[test]
+    fun poc_native_reward_split_rounding_and_zero_balances() {
+        let (active_reward_octa, pending_inactive_reward_octa) = split_native_reward_by_stake(3, 600, 400);
+        assert!(active_reward_octa == 2 && pending_inactive_reward_octa == 1, 1);
+        let (active_reward_octa, pending_inactive_reward_octa) = split_native_reward_by_stake(3, 0, 400);
+        assert!(active_reward_octa == 0 && pending_inactive_reward_octa == 3, 2);
+        let (active_reward_octa, pending_inactive_reward_octa) = split_native_reward_by_stake(3, 600, 0);
+        assert!(active_reward_octa == 3 && pending_inactive_reward_octa == 0, 3);
+        let (active_reward_octa, pending_inactive_reward_octa) = split_native_reward_by_stake(0, 0, 0);
+        assert!(active_reward_octa == 0 && pending_inactive_reward_octa == 0, 4);
+        let (active_reward_octa, pending_inactive_reward_octa) = split_native_reward_by_stake(18446744073709551615, 18446744073709551615, 0);
+        assert!(active_reward_octa == 18446744073709551615 && pending_inactive_reward_octa == 0, 5);
+    }
+
+    #[test(framework = @0x1, validator = @0x55)]
+    fun poc_native_preview_pending_member_does_not_read_old_performance(
+        framework: signer, validator: signer
+    ) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        initialize_for_test_custom(&framework, 100, 10000, 3600, true, 1, 100, 25);
+        let (_sk, pk, pop) = generate_identity();
+        initialize_test_validator(&pk, &pop, &validator, 100, true, false);
+        let candidate = *borrow_global<ValidatorSet>(@topo_framework).pending_active.borrow(0);
+        // 待加入成员没有旧期表现：无效索引和空数组也不得被 include_rewards=false 的路径读取。
+        candidate.config.validator_index = MAX_U64 as u64;
+        let performance = ValidatorPerformance { validators: vector[] };
+        let (power, info) = compute_simulated_validator_info(
+            &candidate, &performance, 1, 100, 7, false, timestamp::now_seconds());
+        let ValidatorPerformance { validators: _ } = performance;
+        assert!(power == 100 && info.voting_power == 100 && info.config.validator_index == 7, 1);
+    }
+
+    #[test]
+    fun poc_growth_initialization_and_replacement() {
+        assert!(allocate_growth(&vector[10, 10, 10, 10], &vector[100, 100, 100, 0], 400, 25, true)
+            == vector[10, 10, 10, 10], 1);
+        assert!(allocate_growth(&vector[10, 10, 10, 10], &vector[10, 10, 10, 0], 40, 25, false)
+            == vector[10, 10, 10, 10], 2);
+        assert!(allocate_growth(&vector[10, 10, 10, 10, 10], &vector[10, 10, 10, 0, 0], 40, 25, false)
+            == vector[10, 10, 10, 5, 5], 3);
+    }
+
+    #[test]
+    fun poc_growth_drops_and_flooring() {
+        assert!(allocate_growth(&vector[5, 10, 10], &vector[10, 0, 0], 10, 25, false)
+            == vector[5, 1, 1], 1);
+        assert!(allocate_growth(&vector[5, 5], &vector[10, 10], 20, 25, false) == vector[5, 5], 2);
+        // 预算为 2，三名新候选各分到 0；舍入余量不再分配。
+        assert!(allocate_growth(&vector[10, 10, 10], &vector[0, 0, 0], 10, 25, false) == vector[0, 0, 0], 3);
+    }
+
+    #[test_only]
+    fun assert_poc_target_bounds() {
+        // 每个权重均可由 u64 表示，总和仍可能超界；普通和 Chunky DKG 启动前必须拒绝。
+        let (reason, total) = validate_target_powers(
+            &vector[1u64 << 63, 1u64 << 63], 2, 8
+        );
+        assert!(reason == TARGET_OUT_OF_RANGE && total == 1u256 << 64, 1);
+
+        // 总权重恰好等于 u64 上限仍可进入 DKG，第一项超过总和上限才被拒绝。
+        let (reason, total) = validate_target_powers(
+            &vector[1u64 << 63, (1u64 << 63) - 1], 2, 8
+        );
+        assert!(reason == 0 && total == (MAX_U64 as u256), 2);
+
+        // 生产预览只保留 power >= min_power 的成员，且 min_power 大于零。
+        let (reason, total) = validate_target_powers(&vector[0, 0], 2, 8);
+        assert!(reason == ZERO_TARGET_POWER && total == 0, 3);
+    }
+
+    #[test]
+    fun poc_actual_total_rejects_dkg_overflow() {
+        assert_poc_target_bounds();
+    }
+
+    #[test]
+    fun poc_target_checks_actual_total_independent_of_capacity() {
+        let quarter = (MAX_U64 as u64) / 4;
+        let powers = vector[quarter, quarter, quarter, quarter + 3];
+        // 实际总和恰好为 u64::MAX，人数上限也满足。
+        let (reason, total) = validate_target_powers(&powers, 4, 128);
+        assert!(reason == 0 && total == (MAX_U64 as u256), 1);
+        // 多 1 即拒绝，不能将总和截成 u64::MAX。
+        powers.push_back(1);
+        let (reason, total) = validate_target_powers(&powers, 4, 128);
+        assert!(reason == TARGET_OUT_OF_RANGE && total == (MAX_U64 as u256) + 1, 2);
+        let (reason, _) = validate_target_powers(&vector[], 1, 128);
+        assert!(reason == INSUFFICIENT_VALIDATORS, 3);
+    }
+
+    #[test(framework = @topo_framework)]
+    fun poc_config_accepts_u64_max_power(framework: signer) {
+        initialize_for_test_custom(&framework, 1, 100, 3600, false, 1, 100, 25);
+        let max_power = MAX_U64 as u64;
+        poc_accounting::prepare(
+            &framework, 1, 2,
+            poc_accounting::new_power_params(100000000, 1, max_power, 4),
+            poc_accounting::new_deployment_limits(4, 4, 4, 8, 0),
+            25, false,
+        );
+        let (_, _, _, params, _, _) = poc_accounting::get_config();
+        let (_, _, installed_max_power, _) = poc_accounting::get_power_params_fields(&params);
+        assert!(installed_max_power == max_power, 1);
+        let (reason, total) = validate_target_powers(&vector[max_power, 1], 2, 8);
+        assert!(reason == TARGET_OUT_OF_RANGE && total == 1u256 << 64, 2);
+    }
+
+    #[test]
+    fun poc_target_accepts_concentrated_weights_and_checks_membership() {
+        let (reason, total) = validate_target_powers(&vector[20, 5, 5, 5, 5], 4, 8);
+        assert!(reason == 0 && total == 40, 1);
+        let (reason, total) = validate_target_powers(&vector[10, 10, 5, 5], 4, 8);
+        assert!(reason == 0 && total == 30, 2);
+        let (reason, _) = validate_target_powers(&vector[10, 10, 10], 4, 8);
+        assert!(reason == INSUFFICIENT_VALIDATORS, 3);
+    }
+
+    #[test]
+    fun poc_rewards_long_epoch_and_fractional_rate() {
+        let max = MAX_U64 as u64;
+        assert!(reward_amount_wide(max, max, (max as u256) * 2, 1, 1) == max / 2, 1);
+        assert!(reward_amount_wide(100, 1, 3, 1, 10) == 3, 2);
+        assert!(reward_amount_wide(100, 0, 0, 1, 10) == 0, 3);
+        assert!(reward_amount_wide(max, max, max as u256, max, max) == max, 4);
+    }
+
+    #[test(framework = @0x1, user = @0x777)]
+    fun poc_counter_maximum_and_unrelated_indices(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        poc_setup(&framework, &user, vector[@0x11, @0x22, @0x33, @0x44], 2);
+        let max = MAX_U64 as u64;
+        let performance = &mut borrow_global_mut<ValidatorPerformance>(@topo_framework).validators[0];
+        performance.successful_proposals = max - 1;
+        performance.failed_proposals = max - 1;
+        update_performance_statistics(option::some(0), vector[0]);
+        let (success, failed) = get_current_epoch_proposal_counts(0);
+        assert!(success == max && failed == max, 1);
+        update_performance_statistics(option::some(max), vector[max]);
+        let (success, failed) = get_current_epoch_proposal_counts(0);
+        assert!(success == max && failed == max, 2);
+    }
+
+    #[test(framework = @0x1, user = @0x777)]
+    #[expected_failure(abort_code = 0x20024, location = Self)]
+    fun poc_counter_success_overflow_rejected(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        poc_setup(&framework, &user, vector[@0x11, @0x22, @0x33, @0x44], 2);
+        borrow_global_mut<ValidatorPerformance>(@topo_framework).validators[0].successful_proposals = MAX_U64 as u64;
+        update_performance_statistics(option::some(0), vector[]);
+    }
+
+    #[test(framework = @0x1, user = @0x777)]
+    #[expected_failure(abort_code = 0x20024, location = Self)]
+    fun poc_counter_duplicate_failures_overflow_rejected(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        poc_setup(&framework, &user, vector[@0x11, @0x22, @0x33, @0x44], 2);
+        borrow_global_mut<ValidatorPerformance>(@topo_framework).validators[0].failed_proposals = (MAX_U64 as u64) - 1;
+        update_performance_statistics(option::some(1), vector[0, 0]);
+    }
+
+    #[test(framework = @0x1, user = @0x777)]
+    fun poc_native_transition_then_first_install(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        poc_setup(&framework, &user, vector[@0x11, @0x22, @0x33, @0x44], 3);
+        assert!(reward_split_configuration_matches(1, 0, 5000, option::none(), option::none()), 7);
+        let native_preview = preview_epoch_transition(2, timestamp::now_seconds());
+        assert!(native_preview.reason == 0 && !native_preview.poc_enabled, 1);
+        assert!(native_preview.validator_set.total_voting_power == 400, 2);
+        poc_commit(&framework);
+        assert!(!is_poc_enabled() && poc_accounting::current_epoch() == 2, 3);
+        let first = preview_epoch_transition(3, timestamp::now_seconds());
+        assert!(first.reason == 0 && first.poc_enabled && first.validator_set.total_voting_power == 40, 4);
+        poc_commit(&framework);
+        assert!(is_poc_enabled() && get_installed_reward_context().epoch == 3, 5);
+        assert!(get_installed_native_reward_bps() == 5000, 8);
+        assert!(!features::is_reconfiguration_frozen() && !exists<EpochPlan>(@topo_framework)
+            && !exists<PrecomputedValidatorSet>(@topo_framework), 6);
+    }
+
+    #[test(framework = @0x1, user = @0x777, vm = @vm_reserved)]
+    fun poc_reward_vault_does_not_compound_native_stake(framework: signer, user: signer, vm: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        poc_setup(&framework, &user, vector[@0x11, @0x22, @0x33, @0x44], 2);
+        schedule_reward_split(&framework, 0, 2);
+        features::change_feature_flags_for_testing(&framework, vector[features::get_distribute_transaction_fee_feature()], vector[]);
+        poc_commit(&framework);
+        let (active, inactive, joining, leaving) = get_stake(@0x44);
+        let before = vector[active, inactive, joining, leaving];
+        update_performance_statistics(option::some(0), vector[]);
+        record_fee(&vm, vector[0, 0], vector[49, 18446744073709551615]);
+        assert!(get_pending_transaction_fee()[0] == 50, 1);
+        poc_commit(&framework);
+        let (active, inactive, joining, leaving) = get_stake(@0x44);
+        assert!(vector[active, inactive, joining, leaving] == before, 2);
+        let claimed = poc_accounting::claim_rewards(&user, vector[@0x44]);
+        assert!(coin::value(&claimed) == 50, 3);
+        coin::deposit(@0x44, claimed);
+        let twice = poc_accounting::claim_rewards(&user, vector[@0x44]);
+        coin::destroy_zero(twice);
+    }
+
+    #[test(framework = @0x1, user = @0x777, other = @0x888, vm = @vm_reserved)]
+    fun poc_binding_bond_cap_preserves_user_reward_ratio(framework: signer, user: signer, other: signer, vm: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        poc_setup(&framework, &user, vector[@0x11, @0x22, @0x33, @0x44], 2);
+        // 两个用户分别提供 10、30 算力，池内原生保证金为 100。
+        poc_accounting::replace_allocation(&other, vector[@0x44], vector[10000],
+            30u128 << 16, 30u128 << 16, 62);
+        poc_accounting::schedule_power_params(&framework,
+            poc_accounting::new_power_params(1000000000, 10, 100, 4), 2, 25, true);
+        features::change_feature_flags_for_testing(&framework,
+            vector[features::get_distribute_transaction_fee_feature()], vector[]);
+        let preview = preview_epoch_transition(2, timestamp::now_seconds());
+        assert!(preview.reason == 0, 1);
+        preview.targets.for_each_ref(|target| {
+            if (target.pool == @0x44) {
+                assert!(target.units == (40u128 << 16)
+                    && target.power == 10 && target.reward_base_octa == 100, 2);
+            };
+        });
+        poc_commit(&framework);
+        let (units, _, reward_base_octa, vault, _) = poc_accounting::get_pool(@0x44);
+        assert!(units == (40u128 << 16) && reward_base_octa == 100 && vault == 0
+            && get_current_epoch_voting_power(@0x44) == 10, 3);
+        // 保证金将共识权重限制为 100 / 10 = 10，低于总算力 40 和 max_power 100。
+        // 默认各半：1 通胀全部归 PoC，37 费用分为原生 18、PoC 19；PoC 的 20 按 1:3 分配。
+        let index = get_validator_index(@0x44);
+        update_performance_statistics(option::some(index), vector[]);
+        record_fee(&vm, vector[index], vector[37]);
+        poc_commit(&framework);
+        let (active, _, _, _) = get_stake(@0x44);
+        assert!(active == 118, 4);
+        let first = poc_accounting::claim_rewards(&user, vector[@0x44]);
+        let second = poc_accounting::claim_rewards(&other, vector[@0x44]);
+        assert!(coin::value(&first) == 5 && coin::value(&second) == 15, 5);
+        coin::merge(&mut first, second);
+        coin::deposit(@0x44, first);
+        let (_, _, _, vault, _) = poc_accounting::get_pool(@0x44);
+        assert!(vault == 0, 6);
+    }
+
+    #[test(framework = @0x1, user = @0x777)]
+    fun poc_claim_during_freeze_keeps_target_and_cutoff(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        poc_setup(&framework, &user, vector[@0x11, @0x22, @0x33, @0x44], 2);
+        let owner = create_signer::create_signer(@0x44);
+        unlock(&owner, 100);
+        let cutoff = timestamp::now_seconds();
+        let preview = preview_epoch_transition(2, cutoff);
+        assert!(try_cache_epoch_plan(2, cutoff) == 0, 1);
+        reconfiguration_state::on_reconfig_start();
+        let set = cached_validator_set();
+        let data = borrow_global<EpochPlan>(@topo_framework).data;
+        timestamp::update_global_time_for_test_secs(7200);
+        let claimed = poc_accounting::claim_rewards(&user, vector[@0x44]);
+        coin::destroy_zero(claimed);
+        assert!(cached_validator_set() == set, 2);
+        assert!(preview_epoch_transition(99, 7200) == preview, 3);
+        assert!(try_cache_epoch_plan(2, 7200) == 0 && next_validator_consensus_infos_v2() == set, 5);
+        assert!(borrow_global<EpochPlan>(@topo_framework).data == data
+            && cached_epoch_preview() == preview, 6);
+        settle_closing_epoch();
+        apply_cached_features(&framework);
+        install_epoch_plan(2);
+        assert!(*borrow_global<ValidatorSet>(@topo_framework) == preview.validator_set, 7);
+        finish_epoch_plan();
+        reconfiguration_state::on_reconfig_finish();
+        let (_, inactive, _, pending_inactive) = get_stake(@0x44);
+        assert!(inactive == 0 && pending_inactive == 100, 4);
+    }
+
+    #[test(framework = @0x1, user = @0x777)]
+    fun poc_deferred_keeps_epoch_and_allows_repair(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        poc_setup(&framework, &user, vector[@0x11, @0x22, @0x33, @0x44], 2);
+        poc_accounting::replace_allocation(&user, vector[@0x11], vector[10000], 40u128 << 16, 40u128 << 16, 62);
+        let old = *borrow_global<ValidatorSet>(@topo_framework);
+        assert!(try_cache_epoch_plan(2, timestamp::now_seconds()) == INSUFFICIENT_VALIDATORS, 1);
+        assert!(poc_accounting::current_epoch() == 1 && !reconfiguration_state::is_in_progress()
+            && !features::is_reconfiguration_frozen() && !exists<EpochPlan>(@topo_framework), 2);
+        assert!(*borrow_global<ValidatorSet>(@topo_framework) == old, 3);
+        poc_accounting::replace_allocation(&user, vector[@0x11, @0x22, @0x33, @0x44], vector[2500, 2500, 2500, 2500],
+            40u128 << 16, 40u128 << 16, 62);
+        poc_commit(&framework);
+        assert!(get_installed_reward_context().poc_enabled, 4);
+    }
+
+    #[test(framework = @0x1, user = @0x777)]
+    #[expected_failure(abort_code = 0x30014, location = Self)]
+    fun poc_frozen_capability_lockup_rejected(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        poc_setup(&framework, &user, vector[@0x11, @0x22, @0x33, @0x44], 2);
+        assert!(try_cache_epoch_plan(2, timestamp::now_seconds()) == 0, 1);
+        reconfiguration_state::on_reconfig_start();
+        increase_lockup_with_cap(borrow_global<OwnerCapability>(@0x44));
+    }
+
+    #[test(framework = @0x1, user = @0x777)]
+    #[expected_failure(abort_code = 0x30020, location = Self)]
+    fun poc_second_settlement_rejected(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        poc_setup(&framework, &user, vector[@0x11, @0x22, @0x33, @0x44], 2);
+        assert!(try_cache_epoch_plan(2, timestamp::now_seconds()) == 0, 1);
+        reconfiguration_state::on_reconfig_start();
+        settle_closing_epoch();
+        settle_closing_epoch();
+    }
+    #[test_only]
+    fun poc_add_replacement(framework: &signer, pool: address) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        let owner = create_signer::create_signer(pool);
+        let (_sk, pk, pop) = generate_identity();
+        initialize_test_validator(&pk, &pop, &owner, 100, false, false);
+        poc_accounting::enable_pool(framework, pool);
+        poc_accounting::replace_allocation(&owner, vector[pool], vector[10000], 10u128 << 16, 10u128 << 16, 62);
+        join_validator_set(&owner, pool);
+    }
+
+    #[test(framework = @0x1, user = @0x777)]
+    fun poc_voluntary_cancel_preserves_old_indices(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        poc_setup(&framework, &user, vector[@0x11, @0x22, @0x33, @0x44], 2);
+        poc_commit(&framework);
+        let old_index = get_validator_index(@0x44);
+        poc_add_replacement(&framework, @0x55);
+        assert!(borrow_global<ValidatorSet>(@topo_framework).pending_active[0].voting_power == 0, 1);
+        assert!(borrow_global<ValidatorSet>(@topo_framework).total_joining_power == 0, 2);
+        let operator = create_signer::create_signer(@0x44);
+        let hypothetical = preview_transition(3, timestamp::now_seconds(), option::some(@0x44));
+        leave_validator_set(&operator, @0x44);
+        assert!(preview_transition(3, timestamp::now_seconds(), option::none()).validator_set == hypothetical.validator_set, 8);
+        assert!(get_validator_state(@0x44) == VALIDATOR_STATUS_PENDING_INACTIVE, 3);
+        cancel_leave_validator_set(&operator, @0x44);
+        assert!(get_validator_state(@0x44) == VALIDATOR_STATUS_ACTIVE, 4);
+        assert!(get_validator_index(@0x44) == old_index
+            && get_current_epoch_voting_power(@0x44) == 10
+            && borrow_global<ValidatorSet>(@topo_framework).total_voting_power == 40, 5);
+        // 再次申请同一替换，验证生产构建器仍能生成合格目标。
+        leave_validator_set(&operator, @0x44);
+        poc_commit(&framework);
+        assert!(get_validator_state(@0x44) == VALIDATOR_STATUS_INACTIVE
+            && get_current_epoch_voting_power(@0x55) == 10, 6);
+        let (_, _, old_base, _, _) = poc_accounting::get_pool(@0x44);
+        assert!(old_base == 0, 7);
+    }
+
+    #[test(framework = @0x1, user = @0x777, vm = @vm_reserved)]
+    fun poc_capacity_v8_union15_deferred16_repair(framework: signer, user: signer, vm: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        poc_setup(&framework, &user, vector[@0x11, @0x22, @0x33, @0x44], 2);
+        features::change_feature_flags_for_testing(&framework,
+            vector[features::get_distribute_transaction_fee_feature()], vector[]);
+        poc_commit(&framework);
+        // 每次加入均满足实际增长预算；不同用户各向一个池分配算力。
+        vector[@0x55, @0x66, @0x77, @0x88].for_each_ref(|pool| {
+            poc_add_replacement(&framework, *pool);
+            poc_commit(&framework);
+        });
+        assert!(poc_accounting::validator_limit() == 8
+            && borrow_global<ValidatorSet>(@topo_framework).active_validators.length() == 8
+            && borrow_global<ValidatorSet>(@topo_framework).total_voting_power == 80, 1);
+        let old_index = get_validator_index(@0x11);
+        let exiting = vector[@0x22, @0x33, @0x44, @0x55, @0x66, @0x77, @0x88];
+        remove_validators(&framework, &exiting);
+        vector[@0x99, @0xaa, @0xbb, @0xcc, @0xdd, @0xee, @0xff].for_each_ref(|pool| {
+            poc_add_replacement(&framework, *pool);
+        });
+        let current = *borrow_global<ValidatorSet>(@topo_framework);
+        assert!(current.active_validators.length() == 1 && current.pending_active.length() == 7
+            && current.pending_inactive.length() == 7 && current.total_voting_power == 80, 2);
+        let epoch = poc_accounting::current_epoch();
+        let (period, boundary, index, _) = poc_power_store::get_normalization_clock();
+        let deferred = preview_epoch_transition(epoch + 1, timestamp::now_seconds());
+        assert!(deferred.targets.length() == 15 && deferred.reason == INSUFFICIENT_VALIDATORS
+            && deferred.validator_set.active_validators.length() == 1, 3);
+        // 模拟旧 Epoch 连续出块：继续累计表现和费用，目标与时钟保持不变。
+        for (_i in 0..16) {
+            timestamp::fast_forward_seconds(1);
+            update_performance_statistics(option::some(old_index), vector[]);
+            record_fee(&vm, vector[old_index], vector[1]);
+            assert!(try_cache_epoch_plan(epoch + 1, timestamp::now_seconds()) == INSUFFICIENT_VALIDATORS, 4);
+            assert!(!exists<EpochPlan>(@topo_framework) && !exists<PrecomputedValidatorSet>(@topo_framework)
+                && !features::is_reconfiguration_frozen() && !reconfiguration_state::is_in_progress(), 5);
+            assert!(*borrow_global<ValidatorSet>(@topo_framework) == current
+                && poc_accounting::current_epoch() == epoch, 6);
         };
-        let (_, delegated_to_after, cooldown_until_secs) =
-            staking_registry::get_user_stake_info(delegator_address);
-        assert!(delegated_to_after == @0x0, 1);
-        assert!(cooldown_until_secs > 0, 2);
-        assert!(staking_registry::get_effective_power(delegator_address) == 0, 3);
+        let (success, failed) = get_current_epoch_proposal_counts(old_index);
+        assert!(success == 16 && failed == 0 && get_pending_transaction_fee()[old_index] == 16, 7);
+        let (next_period, next_boundary, next_index, _) = poc_power_store::get_normalization_clock();
+        assert!(period == next_period && boundary == next_boundary && index == next_index, 8);
+        let (_, _, old_base, vault, _) = poc_accounting::get_pool(@0x11);
+        let (units, future_units, _, _, _) = poc_accounting::get_pool(@0x99);
+        assert!(old_base == 10 && vault == 0 && units == 0 && future_units == (10u128 << 16), 9);
+        // 治理修复参数后，八名候选在原有的 20 权重预算内全部合格。
+        let config = staking_config::get();
+        poc_accounting::schedule_power_params(&framework, poc_accounting::new_power_params(100000000, 2, 2, 4),
+            epoch + 1, staking_config::get_voting_power_increase_limit(&config),
+            staking_config::get_allow_validator_set_change(&config));
+        let ready = preview_epoch_transition(epoch + 1, timestamp::now_seconds());
+        assert!(ready.reason == 0 && ready.targets.length() == 15
+            && ready.validator_set.active_validators.length() == 8
+            && ready.validator_set.total_voting_power == 16, 10);
+        let expected_order = vector[@0x11, @0xff, @0xee, @0xdd, @0xcc, @0xbb, @0xaa, @0x99];
+        for (i in 0..8) {
+            let validator = ready.validator_set.active_validators[i];
+            assert!(validator.addr == expected_order[i] && validator.voting_power == 2, 11);
+        };
+        poc_commit(&framework);
+        assert!(*borrow_global<ValidatorSet>(@topo_framework) == ready.validator_set
+            && poc_accounting::current_epoch() == epoch + 1, 12);
+        exiting.for_each_ref(|pool| {
+            let (_, _, base, _, _) = poc_accounting::get_pool(*pool);
+            assert!(base == 0 && get_validator_state(*pool) == VALIDATOR_STATUS_INACTIVE, 13);
+        });
+        let (_, _, base, vault, _) = poc_accounting::get_pool(@0x11);
+        assert!(base == 2 && vault == 8, 14);
+        assert!(stake_balances_match(@0x11, vector[108, 0, 0, 0]), 16);
+        let (units, _, base, vault, _) = poc_accounting::get_pool(@0x99);
+        assert!(units == (10u128 << 16) && base == 2 && vault == 0, 15);
+    }
+
+    #[test(framework = @0x1, user = @0x777)]
+    #[expected_failure(abort_code = 0x30023, location = Self)]
+    fun poc_governance_revokes_voluntary_cancel(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        poc_setup(&framework, &user, vector[@0x11, @0x22, @0x33, @0x44], 2);
+        poc_commit(&framework);
+        poc_add_replacement(&framework, @0x55);
+        let operator = create_signer::create_signer(@0x44);
+        leave_validator_set(&operator, @0x44);
+        remove_validators(&framework, &vector[@0x44]);
+        cancel_leave_validator_set(&operator, @0x44);
+    }
+
+    #[test(framework = @0x1, user = @0x777)]
+    #[expected_failure(abort_code = 0x30022, location = Self)]
+    fun poc_competing_replacements_reject_unsafe_leave(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        poc_setup(&framework, &user, vector[@0x11, @0x22, @0x33, @0x44], 2);
+        poc_commit(&framework);
+        poc_add_replacement(&framework, @0x55);
+        poc_add_replacement(&framework, @0x66);
+        let operator = create_signer::create_signer(@0x44);
+        leave_validator_set(&operator, @0x44);
+    }
+
+    #[test(framework = @0x1, user = @0x777)]
+    fun poc_context_rate_changes_only_after_install(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        poc_setup(&framework, &user, vector[@0x11, @0x22, @0x33, @0x44], 3);
+        let (_, rate, den) = get_installed_reward_rate();
+        assert!(rate == 1 && den == 100, 1);
+        // 治理参数已修改，当前原生 Epoch 仍按已安装的奖励配置结算。
+        staking_config::update_rewards_rate(&framework, 1, 200);
+        let (_, rate, den) = get_installed_reward_rate();
+        assert!(rate == 1 && den == 100, 2);
+        update_performance_statistics(option::some(0), vector[]);
+        poc_commit(&framework);
+        let (active, _, _, _) = get_stake(@0x44);
+        assert!(active == 101, 3);
+        let (poc, rate, den) = get_installed_reward_rate();
+        assert!(!poc && rate == 1 && den == 200, 4);
+        poc_commit(&framework);
+        let (poc, _, _) = get_installed_reward_rate();
+        assert!(poc, 5);
+    }
+
+    #[test(framework = @0x1, user = @0x777)]
+    #[expected_failure(abort_code = 0x30020, location = Self)]
+    fun poc_orphan_pvs_rejected(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        poc_setup(&framework, &user, vector[@0x11, @0x22, @0x33, @0x44], 2);
+        let preview = preview_transition(2, timestamp::now_seconds(), option::none());
+        move_to(&framework, PrecomputedValidatorSet { validator_set: preview.validator_set, is_liveness_fallback: false });
+        try_cache_epoch_plan(2, timestamp::now_seconds());
+    }
+
+    #[test(framework = @0x1, user = @0x777)]
+    #[expected_failure(abort_code = 0x30020, location = Self)]
+    fun poc_plan_epoch_mismatch_rejected(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        poc_setup(&framework, &user, vector[@0x11, @0x22, @0x33, @0x44], 2);
+        assert!(try_cache_epoch_plan(2, timestamp::now_seconds()) == 0, 1);
+        reconfiguration_state::on_reconfig_start();
+        validate_epoch_plan(3);
+    }
+
+    #[test(framework = @0x1, user = @0x777)]
+    #[expected_failure(abort_code = 0x30020, location = Self)]
+    fun poc_install_rejects_wrong_target_epoch(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        poc_setup(&framework, &user, vector[@0x11, @0x22, @0x33, @0x44], 2);
+        poc_begin_for_test();
+        settle_closing_epoch();
+        apply_cached_features(&framework);
+        // 安装入口必须拒绝与账本及冻结计划不一致的链目标。
+        install_epoch_plan(3);
+    }
+
+    #[test(framework = @0x1, user = @0x777)]
+    fun poc_native_cached_fallback_preserves_preview(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        poc_setup(&framework, &user, vector[@0x11, @0x22, @0x33, @0x44], 3);
+        staking_config::update_required_stake(&framework, 1000, 10000);
+        let preview = preview_epoch_transition(2, timestamp::now_seconds());
+        assert!(preview.reason == 0 && !preview.poc_enabled && preview.is_liveness_fallback, 1);
+        poc_begin_for_test();
+        assert!(cached_epoch_preview() == preview, 2);
+        poc_commit(&framework);
+        assert!(*borrow_global<ValidatorSet>(@topo_framework) == preview.validator_set, 3);
+        assert!(event::was_event_emitted(&ValidatorSetLivenessFallback {
+            minimum_stake: 1000,
+            emergency_validator_count: preview.validator_set.active_validators.length(),
+            total_emergency_voting_power: preview.validator_set.total_voting_power,
+        }), 4);
+    }
+    #[test(framework = @0x1, user = @0x777)]
+    fun poc_feature_rate_switch_keeps_closing_context(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        poc_setup(&framework, &user, vector[@0x11, @0x22, @0x33, @0x44], 3);
+        staking_config::update_rewards_config(&framework, fixed_point64::create_from_rational(1, 200),
+            fixed_point64::create_from_rational(0, 1), 86400, fixed_point64::create_from_rational(0, 1));
+        features::change_feature_flags_for_next_epoch(&framework,
+            vector[features::get_periodical_reward_rate_decrease_feature()], vector[]);
+        update_performance_statistics(option::some(0), vector[]);
+        poc_commit(&framework);
+        let (active, _, _, _) = get_stake(@0x44);
+        assert!(active == 101, 1);
+        let (poc, rate, denominator) = get_installed_reward_rate();
+        assert!(!poc && (rate as u256) * 200 <= (denominator as u256)
+            && rate > 0, 2);
+    }
+
+    #[test(framework = @0x1)]
+    fun poc_prepare_accepts_native_periodical_rate(framework: signer) acquires InstalledRewardContext, PendingTransactionFee, TransactionFeeConfig, ValidatorSet {
+        initialize_for_test_custom(&framework, 100, 10000, 3600, true, 1, 100, 25);
+        staking_config::initialize_rewards(&framework, fixed_point64::create_from_rational(1, 2),
+            fixed_point64::create_from_rational(0, 1), 86400, timestamp::now_seconds(),
+            fixed_point64::create_from_rational(0, 1));
+        set_transaction_fee_limit_per_epoch_per_pool(&framework, 50);
+        poc_accounting::prepare(&framework, 1, 2,
+            poc_accounting::new_power_params(100000000, 10, 1000, 4),
+            poc_accounting::new_deployment_limits(5, 5, 5, 8, 50), 25, true);
+        prepare_poc_context(&framework, 1);
+        let (poc, rate, denominator) = get_installed_reward_rate();
+        assert!(!poc && rate == 1 && denominator == 100, 1);
+        features::change_feature_flags_for_testing(&framework,
+            vector[features::get_periodical_reward_rate_decrease_feature()], vector[]);
+        let (rate, denominator) = staking_config::reward_rate();
+        assert!(rate * 2 == denominator, 2);
+    }
+
+    #[test(framework = @0x1, user = @0x777)]
+    #[expected_failure(abort_code = 0x30020, location = Self)]
+    fun poc_readonly_preview_rejects_orphan_pvs(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet {
+        poc_setup(&framework, &user, vector[@0x11, @0x22, @0x33, @0x44], 2);
+        let preview = preview_transition(2, timestamp::now_seconds(), option::none());
+        move_to(&framework, PrecomputedValidatorSet { validator_set: preview.validator_set, is_liveness_fallback: false });
+        preview_epoch_transition(2, timestamp::now_seconds());
+    }
+
+    #[test(framework = @0x1)]
+    #[expected_failure(abort_code = 0x2000c, location = topo_framework::staking_config)]
+    fun poc_prepare_rejects_lockup_that_can_overflow_on_finish(framework: signer) acquires PendingTransactionFee, TransactionFeeConfig, ValidatorSet {
+        initialize_for_test_custom(&framework, 100, 10000, MAX_U64 as u64, true, 1, 100, 25);
+        staking_config::initialize_rewards(&framework, fixed_point64::create_from_rational(1, 100),
+            fixed_point64::create_from_rational(0, 1), 86400, timestamp::now_seconds(),
+            fixed_point64::create_from_rational(0, 1));
+        set_transaction_fee_limit_per_epoch_per_pool(&framework, 50);
+        poc_accounting::prepare(&framework, 1, 2,
+            poc_accounting::new_power_params(100000000, 10, 1000, 4),
+            poc_accounting::new_deployment_limits(5, 5, 5, 8, 50), 25, true);
+        prepare_poc_context(&framework, 1);
+    }
+
+    #[test(framework = @0x1, user = @0x777)]
+    fun poc_maximum_safe_lockup_survives_latest_completion_time(framework: signer, user: signer) acquires AllowedValidators, EpochPlan, InstalledRewardContext, OwnerCapability, PendingTransactionFee, PrecomputedValidatorSet, StakePool, TopoCoinCapabilities, TransactionFeeConfig, ValidatorConfig, ValidatorPerformance, ValidatorSet, VoluntaryLeaves {
+        poc_setup(&framework, &user, vector[@0x11, @0x22, @0x33, @0x44], 2);
+        let max_seconds = (MAX_U64 / 1000000) as u64;
+        let safe_duration = (MAX_U64 as u64) - max_seconds;
+        staking_config::update_recurring_lockup_duration_secs(&framework, safe_duration);
+        timestamp::update_global_time_for_test_secs(4000);
+        assert!(preview_epoch_transition(2, 4000).reason == 0, 1);
+        assert!(try_cache_epoch_plan(2, 4000) == 0, 2);
+        reconfiguration_state::on_reconfig_start();
+        timestamp::update_global_time_for_test_secs(max_seconds);
+        settle_closing_epoch();
+        apply_cached_features(&framework);
+        install_epoch_plan(2);
+        finish_epoch_plan();
+        reconfiguration_state::on_reconfig_finish();
+        assert!(get_lockup_secs(@0x44) == (MAX_U64 as u64), 3);
     }
 }

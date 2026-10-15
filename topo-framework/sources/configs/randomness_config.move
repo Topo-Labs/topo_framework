@@ -1,10 +1,12 @@
 /// Structs and functions for on-chain randomness configurations.
 module topo_framework::randomness_config {
+    use std::type_info;
     use topo_std::copyable_any;
     use topo_std::copyable_any::Any;
     use topo_std::fixed_point64::FixedPoint64;
     use topo_framework::config_buffer;
     use topo_framework::system_addresses;
+    use topo_framework::reconfiguration_state;
 
     friend topo_framework::reconfiguration_with_dkg;
 
@@ -42,7 +44,8 @@ module topo_framework::randomness_config {
 
     /// Initialize the configuration. Used in genesis or governance.
     public fun initialize(framework: &signer, config: RandomnessConfig) {
-        system_addresses::assert_aptos_framework(framework);
+        reconfiguration_state::assert_not_in_progress();
+        system_addresses::assert_topo_framework(framework);
         if (!exists<RandomnessConfig>(@topo_framework)) {
             move_to(framework, config)
         }
@@ -50,13 +53,13 @@ module topo_framework::randomness_config {
 
     /// This can be called by on-chain governance to update on-chain consensus configs for the next epoch.
     public fun set_for_next_epoch(framework: &signer, new_config: RandomnessConfig) {
-        system_addresses::assert_aptos_framework(framework);
+        system_addresses::assert_topo_framework(framework);
         config_buffer::upsert(new_config);
     }
 
     /// Only used in reconfigurations to apply the pending `RandomnessConfig`, if there is any.
     public(friend) fun on_new_epoch(framework: &signer) acquires RandomnessConfig {
-        system_addresses::assert_aptos_framework(framework);
+        system_addresses::assert_topo_framework(framework);
         if (config_buffer::does_exist<RandomnessConfig>()) {
             let new_config = config_buffer::extract_v2<RandomnessConfig>();
             if (exists<RandomnessConfig>(@topo_framework)) {
@@ -74,8 +77,7 @@ module topo_framework::randomness_config {
     public fun enabled(): bool acquires RandomnessConfig {
         if (exists<RandomnessConfig>(@topo_framework)) {
             let config = borrow_global<RandomnessConfig>(@topo_framework);
-            let variant_type_name = *config.variant.type_name().bytes();
-            variant_type_name != b"0x1::randomness_config::ConfigOff"
+            *config.variant.type_name() != type_info::type_name<ConfigOff>()
         } else {
             false
         }

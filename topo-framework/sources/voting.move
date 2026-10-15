@@ -6,7 +6,7 @@
 ///
 /// The voting flow:
 /// 1. The Voting module can be deployed at a known address (e.g. 0x1 for Aptos on-chain governance)
-/// 2. The governance module, e.g. TopoGovernance, can be deployed later and define a GovernanceProposal resource type
+/// 2. The governance module, e.g. AptosGovernance, can be deployed later and define a GovernanceProposal resource type
 /// that can also contain other information such as Capability resource for authorization.
 /// 3. The governance module's owner can then register the ProposalType with Voting. This also hosts the proposal list
 /// (forum) on the calling account.
@@ -35,7 +35,6 @@ module topo_framework::voting {
 
     use topo_framework::account;
     use topo_framework::event::{Self, EventHandle};
-    use topo_framework::permissioned_signer;
     use topo_framework::timestamp;
     use topo_framework::transaction_context;
     use topo_std::from_bcs;
@@ -65,8 +64,8 @@ module topo_framework::voting {
     const ESINGLE_STEP_PROPOSAL_CANNOT_HAVE_NEXT_EXECUTION_HASH: u64 = 11;
     /// Cannot call `is_multi_step_proposal_in_execution()` on single-step proposals.
     const EPROPOSAL_IS_SINGLE_STEP: u64 = 12;
-    /// Cannot call `is_multi_step_proposal_in_execution()` on single-step proposals.
-    const ENO_VOTE_PERMISSION: u64 = 13;
+    /// The permissioned signer feature has been removed.
+    const EPERMISSIONED_SIGNER_REMOVED: u64 = 14;
 
     /// ProposalStateEnum representing proposal state.
     const PROPOSAL_STATE_PENDING: u64 = 0;
@@ -192,23 +191,15 @@ module topo_framework::voting {
         num_votes: u64,
     }
 
+    #[deprecated]
     struct VotePermission has copy, drop, store {}
 
-    /// Permissions
-    inline fun check_vote_permission(s: &signer) {
-        assert!(
-            permissioned_signer::check_permission_exists(s, VotePermission {}),
-            error::permission_denied(ENO_VOTE_PERMISSION),
-        );
-    }
-
-    /// Grant permission to vote on behalf of the master signer.
-    public fun grant_permission(master: &signer, permissioned_signer: &signer) {
-        permissioned_signer::authorize_unlimited(master, permissioned_signer, VotePermission {})
+    #[deprecated]
+    public fun grant_permission(_master: &signer, _permissioned_signer: &signer) {
+        abort error::unavailable(EPERMISSIONED_SIGNER_REMOVED)
     }
 
     public fun register<ProposalType: store>(account: &signer) {
-        check_vote_permission(account);
         let addr = signer::address_of(account);
         assert!(!exists<VotingForum<ProposalType>>(addr), error::already_exists(EVOTING_FORUM_ALREADY_REGISTERED));
 

@@ -18,7 +18,7 @@ module topo_framework::chain_status {
 
     /// Marks that genesis has finished.
     public(friend) fun set_genesis_end(topo_framework: &signer) {
-        system_addresses::assert_aptos_framework(topo_framework);
+        system_addresses::assert_topo_framework(topo_framework);
         move_to(topo_framework, GenesisEndMarker {});
     }
 

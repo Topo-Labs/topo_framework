@@ -32,19 +32,12 @@ spec topo_framework::topo_governance {
         pragma aborts_if_is_partial;
     }
 
-    spec schema AbortsIfPermissionedSigner {
-        use topo_framework::permissioned_signer;
-        s: signer;
-        let perm = GovernancePermission {};
-        aborts_if !permissioned_signer::spec_check_permission_exists(s, perm);
-    }
-
     spec store_signer_cap(
         topo_framework: &signer,
         signer_address: address,
         signer_cap: SignerCapability,
     ) {
-        aborts_if !system_addresses::is_aptos_framework_address(signer::address_of(topo_framework));
+        aborts_if !system_addresses::is_topo_framework_address(signer::address_of(topo_framework));
         aborts_if !system_addresses::is_framework_reserved_address(signer_address);
 
         let signer_caps = global<GovernanceResponsbility>(@topo_framework).signer_caps;
@@ -179,64 +172,92 @@ spec topo_framework::topo_governance {
         aborts_if !exists<GovernanceConfig>(@topo_framework);
     }
 
-    spec has_entirely_voted(voter: address, proposal_id: u64): bool {
+    spec has_entirely_voted(stake_pool: address, proposal_id: u64): bool {
         aborts_if !exists<VotingRecords>(@topo_framework);
     }
 
     /// The same as spec of `create_proposal_v2()`.
     spec create_proposal(
         proposer: &signer,
+        stake_pool: address,
         execution_hash: vector<u8>,
         metadata_location: vector<u8>,
         metadata_hash: vector<u8>,
     ) {
         use topo_framework::chain_status;
-        pragma verify_duration_estimate = 60;
         requires chain_status::is_operating();
         include CreateProposalAbortsIf;
     }
 
     spec create_proposal_v2(
         proposer: &signer,
+        stake_pool: address,
         execution_hash: vector<u8>,
         metadata_location: vector<u8>,
         metadata_hash: vector<u8>,
         is_multi_step_proposal: bool,
     ) {
         use topo_framework::chain_status;
-        pragma verify_duration_estimate = 60;
         requires chain_status::is_operating();
         include CreateProposalAbortsIf;
     }
 
-    /// The proposer now uses its own address as the voting subject.
+    spec create_proposal_v2_impl (
+        proposer: &signer,
+        stake_pool: address,
+        execution_hash: vector<u8>,
+        metadata_location: vector<u8>,
+        metadata_hash: vector<u8>,
+        is_multi_step_proposal: bool,
+    ): u64 {
+        use topo_framework::chain_status;
+        requires chain_status::is_operating();
+        include CreateProposalAbortsIf;
+    }
+
+    /// `stake_pool` must exist StakePool.
+    /// The delegated voter under the resource StakePool of the stake_pool must be the proposer address.
     /// Address @topo_framework must exist GovernanceEvents.
     spec schema CreateProposalAbortsIf {
+        use topo_framework::stake;
+
         proposer: &signer;
+        stake_pool: address;
         execution_hash: vector<u8>;
         metadata_location: vector<u8>;
         metadata_hash: vector<u8>;
 
+        include VotingGetDelegatedVoterAbortsIf { sign: proposer };
         include AbortsIfNotGovernanceConfig;
 
-        let proposer_address = signer::address_of(proposer);
-        let stake_balance = staking_registry::spec_get_effective_power(proposer_address);
+        // verify get_voting_power(stake_pool)
+        include GetVotingPowerAbortsIf { pool_address: stake_pool };
+        let staking_config = global<staking_config::StakingConfig>(@topo_framework);
+        let allow_validator_set_change = stake::spec_poc_enabled() || staking_config.allow_validator_set_change;
+        let stake_pool_res = global<stake::StakePool>(stake_pool);
+        // Three results of get_voting_power(stake_pool)
+        let stake_balance_0 = stake_pool_res.active.value + stake_pool_res.pending_active.value + stake_pool_res.pending_inactive.value;
+        let stake_balance_1 = stake_pool_res.active.value + stake_pool_res.pending_inactive.value;
+        let stake_balance_2 = 0;
         let governance_config = global<GovernanceConfig>(@topo_framework);
         let required_proposer_stake = governance_config.required_proposer_stake;
         /// [high-level-req-2]
-        aborts_if stake_balance < required_proposer_stake;
-        aborts_if stake_balance == 0;
+        // Comparison of the three results of get_voting_power(stake_pool) and required_proposer_stake
+        aborts_if allow_validator_set_change && stake_balance_0 < required_proposer_stake;
+        aborts_if !allow_validator_set_change && stake::spec_is_current_epoch_validator(stake_pool) && stake_balance_1 < required_proposer_stake;
+        aborts_if !allow_validator_set_change && !stake::spec_is_current_epoch_validator(stake_pool) && stake_balance_2 < required_proposer_stake;
 
         aborts_if !exists<timestamp::CurrentTimeMicroseconds>(@topo_framework);
+        let current_time = timestamp::spec_now_seconds();
+        let proposal_expiration = current_time + governance_config.voting_duration_secs;
+        aborts_if stake_pool_res.locked_until_secs <= proposal_expiration;
 
         // verify create_proposal_metadata
         include CreateProposalMetadataAbortsIf;
 
-        let addr =
-            topo_std::type_info::type_of<topo_framework::topo_coin::TopoCoin>().account_address;
-        aborts_if !exists<topo_framework::coin::CoinInfo<topo_framework::topo_coin::TopoCoin>>(addr);
-        let maybe_supply =
-            global<topo_framework::coin::CoinInfo<topo_framework::topo_coin::TopoCoin>>(addr).supply;
+        let addr = topo_std::type_info::type_of<TopoCoin>().account_address;
+        aborts_if !exists<coin::CoinInfo<TopoCoin>>(addr);
+        let maybe_supply = global<coin::CoinInfo<TopoCoin>>(addr).supply;
         let supply = option::borrow(maybe_supply);
         let total_supply = topo_framework::optional_aggregator::optional_aggregator_value(supply);
         let early_resolution_vote_threshold_value = total_supply / 2 + 1;
@@ -258,57 +279,65 @@ spec topo_framework::topo_governance {
         aborts_if !exists<GovernanceEvents>(@topo_framework);
     }
 
-    /// The caller votes with its own address and effective power from staking_registry.
+    spec schema VotingGetDelegatedVoterAbortsIf {
+        stake_pool: address;
+        sign: signer;
+
+        let addr = signer::address_of(sign);
+        let stake_pool_res = global<stake::StakePool>(stake_pool);
+        aborts_if !exists<stake::StakePool>(stake_pool);
+        aborts_if stake_pool_res.delegated_voter != addr;
+    }
+
+    /// stake_pool must exist StakePool.
+    /// The delegated voter under the resource StakePool of the stake_pool must be the voter address.
     /// Address @topo_framework must exist VotingRecords and GovernanceProposal.
     spec vote (
         voter: &signer,
+        stake_pool: address,
         proposal_id: u64,
         should_pass: bool,
     ) {
         use topo_framework::chain_status;
-        pragma verify_duration_estimate = 60;
 
         requires chain_status::is_operating();
         include VoteAbortIf  {
-            stake_pool: signer::address_of(voter),
             voting_power: MAX_U64
         };
     }
 
-    /// The voter uses its own address as the voting subject.
+    /// stake_pool must exist StakePool.
+    /// The delegated voter under the resource StakePool of the stake_pool must be the voter address.
     /// Address @topo_framework must exist VotingRecords and GovernanceProposal.
     /// Address @topo_framework must exist VotingRecordsV2 if partial_governance_voting flag is enabled.
     spec partial_vote (
         voter: &signer,
+        stake_pool: address,
         proposal_id: u64,
         voting_power: u64,
         should_pass: bool,
     ) {
         use topo_framework::chain_status;
-        pragma verify_duration_estimate = 60;
 
         requires chain_status::is_operating();
-        include VoteAbortIf {
-            stake_pool: signer::address_of(voter)
-        };
+        include VoteAbortIf;
     }
 
-    /// The voter uses its own address as the voting subject.
+    /// stake_pool must exist StakePool.
+    /// The delegated voter under the resource StakePool of the stake_pool must be the voter address.
     /// Address @topo_framework must exist VotingRecords and GovernanceProposal.
     /// Address @topo_framework must exist VotingRecordsV2 if partial_governance_voting flag is enabled.
     spec vote_internal (
         voter: &signer,
+        stake_pool: address,
         proposal_id: u64,
         voting_power: u64,
         should_pass: bool,
     ) {
         use topo_framework::chain_status;
-        pragma verify_duration_estimate = 60;
 
         requires chain_status::is_operating();
-        include VoteAbortIf {
-            stake_pool: signer::address_of(voter)
-        };
+        include VoteAbortIf;
     }
 
     spec schema VoteAbortIf {
@@ -318,38 +347,55 @@ spec topo_framework::topo_governance {
         should_pass: bool;
         voting_power: u64;
 
-        aborts_if !exists<VotingRecordsV2>(@topo_framework);
-        aborts_if !exists<VotingRecords>(@topo_framework);
+        include VotingGetDelegatedVoterAbortsIf { sign: voter };
+
         aborts_if !exists<timestamp::CurrentTimeMicroseconds>(@topo_framework);
-        include voting::AbortsIfNotContainProposalID<GovernanceProposal> {
-            voting_forum_address: @topo_framework
-        };
-        let spec_proposal_expiration =
-            voting::spec_get_proposal_expiration_secs<GovernanceProposal>(@topo_framework, proposal_id);
-        aborts_if staking_registry::spec_get_effective_power(stake_pool) == 0;
-        aborts_if timestamp::spec_now_seconds() >= spec_proposal_expiration;
+        let spec_proposal_expiration = voting::spec_get_proposal_expiration_secs<GovernanceProposal>(@topo_framework, proposal_id);
+        let locked_until = global<stake::StakePool>(stake_pool).locked_until_secs;
+        let remain_zero_1_cond = (spec_proposal_expiration >= locked_until || timestamp::spec_now_seconds() >= spec_proposal_expiration);
         let record_key = RecordKey {
-            voter: stake_pool,
+            stake_pool,
             proposal_id,
         };
+        let entirely_voted = spec_has_entirely_voted(stake_pool, proposal_id, record_key);
+        aborts_if !remain_zero_1_cond && !exists<VotingRecords>(@topo_framework);
+        include !remain_zero_1_cond && !entirely_voted ==> GetVotingPowerAbortsIf {
+            pool_address: stake_pool
+        };
+
+        let staking_config = global<staking_config::StakingConfig>(@topo_framework);
+        let spec_voting_power = spec_get_voting_power(stake_pool, staking_config);
         let voting_records_v2 = borrow_global<VotingRecordsV2>(@topo_framework);
         let used_voting_power = if (smart_table::spec_contains(voting_records_v2.votes, record_key)) {
             smart_table::spec_get(voting_records_v2.votes, record_key)
         } else {
             0
         };
+        aborts_if !remain_zero_1_cond && !entirely_voted && used_voting_power > 0 && spec_voting_power < used_voting_power;
+
         let remaining_power = spec_get_remaining_voting_power(stake_pool, proposal_id);
-        let real_voting_power = min(voting_power, remaining_power);
+        let real_voting_power =  min(voting_power, remaining_power);
         aborts_if !(real_voting_power > 0);
+
+        aborts_if !exists<VotingRecords>(@topo_framework);
+        let voting_records = global<VotingRecords>(@topo_framework);
+
+
+        // verify get_voting_power(stake_pool)
+        let allow_validator_set_change = global<staking_config::StakingConfig>(@topo_framework).allow_validator_set_change;
+        let stake_pool_res = global<stake::StakePool>(stake_pool);
+        // Two results of get_voting_power(stake_pool) and the third one is zero.
 
         aborts_if !exists<voting::VotingForum<GovernanceProposal>>(@topo_framework);
         let voting_forum = global<voting::VotingForum<GovernanceProposal>>(@topo_framework);
         let proposal = table::spec_get(voting_forum.proposals, proposal_id);
         aborts_if !table::spec_contains(voting_forum.proposals, proposal_id);
         let proposal_expiration = proposal.expiration_secs;
+        let locked_until_secs = global<stake::StakePool>(stake_pool).locked_until_secs;
+        aborts_if proposal_expiration >= locked_until_secs;
 
         // verify voting::vote
-        aborts_if timestamp::spec_now_seconds() >= proposal_expiration;
+        aborts_if timestamp::now_seconds() >= proposal_expiration;
         aborts_if proposal.is_resolved;
         aborts_if !string::spec_internal_check_utf8(voting::IS_MULTI_STEP_PROPOSAL_IN_EXECUTION_KEY);
         let execution_key = utf8(voting::IS_MULTI_STEP_PROPOSAL_IN_EXECUTION_KEY);
@@ -527,7 +573,7 @@ spec topo_framework::topo_governance {
         use topo_framework::coin::CoinInfo;
         use topo_framework::topo_coin::TopoCoin;
         pragma verify = false; // TODO: set because of timeout (property proved).
-        aborts_if !system_addresses::is_aptos_framework_address(signer::address_of(topo_framework));
+        aborts_if !system_addresses::is_topo_framework_address(signer::address_of(topo_framework));
         include reconfiguration_with_dkg::FinishRequirement {
             framework: topo_framework
         };
@@ -548,42 +594,91 @@ spec topo_framework::topo_governance {
         include GetSignerAbortsIf;
     }
 
-    spec fun spec_get_voting_power(pool_address: address): u64 {
-        staking_registry::spec_get_effective_power(pool_address)
+    /// Address @topo_framework must exist StakingConfig.
+    /// limit addition overflow.
+    /// pool_address must exist in StakePool.
+    spec get_voting_power(pool_address: address): u64 {
+        include GetVotingPowerAbortsIf;
+
+        let staking_config = global<staking_config::StakingConfig>(@topo_framework);
+        let allow_validator_set_change = stake::spec_poc_enabled() || staking_config.allow_validator_set_change;
+        let stake_pool_res = global<stake::StakePool>(pool_address);
+
+        ensures allow_validator_set_change ==> result == stake_pool_res.active.value + stake_pool_res.pending_active.value + stake_pool_res.pending_inactive.value;
+        ensures !allow_validator_set_change ==> if (stake::spec_is_current_epoch_validator(pool_address)) {
+            result == stake_pool_res.active.value + stake_pool_res.pending_inactive.value
+        } else {
+            result == 0
+        };
+        ensures result == spec_get_voting_power(pool_address, staking_config);
     }
 
-    spec get_remaining_voting_power(voter: address, proposal_id: u64): u64 {
+    spec fun spec_get_voting_power(pool_address: address, staking_config: staking_config::StakingConfig): u64 {
+        // PoC 治理按原生本金计算权重，即使委员会禁止成员变更也保持这一规则。
+        let allow_validator_set_change = stake::spec_poc_enabled() || staking_config.allow_validator_set_change;
+        let stake_pool_res = global<stake::StakePool>(pool_address);
+        if (allow_validator_set_change) {
+            stake_pool_res.active.value + stake_pool_res.pending_active.value + stake_pool_res.pending_inactive.value
+        } else if (!allow_validator_set_change && (stake::spec_is_current_epoch_validator(pool_address))) {
+            stake_pool_res.active.value + stake_pool_res.pending_inactive.value
+        } else {
+            0
+        }
+    }
+
+    spec get_remaining_voting_power(stake_pool: address, proposal_id: u64): u64 {
         aborts_if !exists<VotingRecordsV2>(@topo_framework);
-        aborts_if !exists<VotingRecords>(@topo_framework);
         include voting::AbortsIfNotContainProposalID<GovernanceProposal> {
             voting_forum_address: @topo_framework
         };
+        aborts_if !exists<stake::StakePool>(stake_pool);
         aborts_if !exists<timestamp::CurrentTimeMicroseconds>(@topo_framework);
-        ensures result == spec_get_remaining_voting_power(voter, proposal_id);
-    }
-
-    spec fun spec_get_remaining_voting_power(stake_pool: address, proposal_id: u64): u64 {
-        let spec_proposal_expiration =
-            voting::spec_get_proposal_expiration_secs<GovernanceProposal>(@topo_framework, proposal_id);
-        let voting_records_v2 = borrow_global<VotingRecordsV2>(@topo_framework);
+        let spec_proposal_expiration = voting::spec_get_proposal_expiration_secs<GovernanceProposal>(@topo_framework, proposal_id);
+        let locked_until = global<stake::StakePool>(stake_pool).locked_until_secs;
+        let remain_zero_1_cond = (spec_proposal_expiration >= locked_until || timestamp::spec_now_seconds() >= spec_proposal_expiration);
+        ensures remain_zero_1_cond ==> result == 0;
         let record_key = RecordKey {
-            voter: stake_pool,
+            stake_pool,
             proposal_id,
         };
         let entirely_voted = spec_has_entirely_voted(stake_pool, proposal_id, record_key);
-        let voting_power = spec_get_voting_power(stake_pool);
+        aborts_if !remain_zero_1_cond && !exists<VotingRecords>(@topo_framework);
+        include !remain_zero_1_cond && !entirely_voted ==> GetVotingPowerAbortsIf {
+            pool_address: stake_pool
+        };
+        let staking_config = global<staking_config::StakingConfig>(@topo_framework);
+        let voting_power = spec_get_voting_power(stake_pool, staking_config);
+        let voting_records_v2 = borrow_global<VotingRecordsV2>(@topo_framework);
         let used_voting_power = if (smart_table::spec_contains(voting_records_v2.votes, record_key)) {
             smart_table::spec_get(voting_records_v2.votes, record_key)
         } else {
             0
         };
-        if (timestamp::spec_now_seconds() >= spec_proposal_expiration) {
+        aborts_if !remain_zero_1_cond && !entirely_voted && used_voting_power > 0 && voting_power < used_voting_power;
+
+        ensures result == spec_get_remaining_voting_power(stake_pool, proposal_id);
+    }
+
+    spec fun spec_get_remaining_voting_power(stake_pool: address, proposal_id: u64): u64 {
+        let spec_proposal_expiration = voting::spec_get_proposal_expiration_secs<GovernanceProposal>(@topo_framework, proposal_id);
+        let locked_until = global<stake::StakePool>(stake_pool).locked_until_secs;
+        let remain_zero_1_cond = (spec_proposal_expiration >= locked_until || timestamp::spec_now_seconds() >= spec_proposal_expiration);
+        let staking_config = global<staking_config::StakingConfig>(@topo_framework);
+        let voting_records_v2 = borrow_global<VotingRecordsV2>(@topo_framework);
+        let record_key = RecordKey {
+            stake_pool,
+            proposal_id,
+        };
+        let entirely_voted = spec_has_entirely_voted(stake_pool, proposal_id, record_key);
+        let voting_power = spec_get_voting_power(stake_pool, staking_config);
+        let used_voting_power = if (smart_table::spec_contains(voting_records_v2.votes, record_key)) {
+            smart_table::spec_get(voting_records_v2.votes, record_key)
+        } else {
+            0
+        };
+        if (remain_zero_1_cond) {
             0
         } else if (entirely_voted) {
-            0
-        } else if (voting_power == 0) {
-            0
-        } else if (used_voting_power >= voting_power) {
             0
         } else {
             voting_power - used_voting_power
@@ -593,6 +688,19 @@ spec topo_framework::topo_governance {
     spec fun spec_has_entirely_voted(stake_pool: address, proposal_id: u64, record_key: RecordKey): bool {
         let voting_records = global<VotingRecords>(@topo_framework);
         table::spec_contains(voting_records.votes, record_key)
+    }
+
+    spec schema GetVotingPowerAbortsIf {
+        pool_address: address;
+
+        let staking_config = global<staking_config::StakingConfig>(@topo_framework);
+        aborts_if !exists<staking_config::StakingConfig>(@topo_framework);
+        let allow_validator_set_change = stake::spec_poc_enabled() || staking_config.allow_validator_set_change;
+        let stake_pool_res = global<stake::StakePool>(pool_address);
+        aborts_if allow_validator_set_change && (stake_pool_res.active.value + stake_pool_res.pending_active.value + stake_pool_res.pending_inactive.value) > MAX_U64;
+        aborts_if !exists<stake::StakePool>(pool_address);
+        aborts_if !allow_validator_set_change && !exists<stake::ValidatorSet>(@topo_framework);
+        aborts_if !allow_validator_set_change && stake::spec_is_current_epoch_validator(pool_address) && stake_pool_res.active.value + stake_pool_res.pending_inactive.value > MAX_U64;
     }
 
     spec get_signer(signer_address: address): signer {
@@ -637,8 +745,6 @@ spec topo_framework::topo_governance {
         use topo_framework::chain_status;
         requires chain_status::is_operating();
 
-        // TODO: These function passed locally however failed in github CI
-        pragma verify_duration_estimate = 120;
         // verify voting::resolve_proposal_v2
         include VotingIsProposalResolvableAbortsif;
 
@@ -715,11 +821,12 @@ spec topo_framework::topo_governance {
         include VotingInitializationAbortIfs;
     }
 
-    spec assert_proposal_expiration(voter: address, proposal_id: u64) {
+    spec assert_proposal_expiration(stake_pool: address, proposal_id: u64) {
         include VotingInitializationAbortIfs;
         include voting::AbortsIfNotContainProposalID<GovernanceProposal>{voting_forum_address: @topo_framework};
         let proposal_expiration = voting::spec_get_proposal_expiration_secs<GovernanceProposal>(@topo_framework, proposal_id);
-        aborts_if staking_registry::spec_get_effective_power(voter) == 0;
+        aborts_if !stake::stake_pool_exists(stake_pool);
+        aborts_if proposal_expiration >= stake::spec_get_lockup_secs(stake_pool);
         aborts_if !exists<timestamp::CurrentTimeMicroseconds>(@topo_framework);
         aborts_if timestamp::now_seconds() >= proposal_expiration;
     }
@@ -742,4 +849,24 @@ spec topo_framework::topo_governance {
         pragma verify = false;
     }
 
+    spec batch_vote(
+        voter: &signer,
+        stake_pools: vector<address>,
+        proposal_id: u64,
+        should_pass: bool,
+    ) {
+        // TODO: Temporary mockup. Specify the `for_each` statement.
+        pragma verify = false;
+    }
+
+    spec batch_partial_vote(
+        voter: &signer,
+        stake_pools: vector<address>,
+        proposal_id: u64,
+        voting_power: u64,
+        should_pass: bool,
+    ) {
+        // TODO: Temporary mockup. Specify the `for_each` statement.
+        pragma verify = false;
+    }
 }
